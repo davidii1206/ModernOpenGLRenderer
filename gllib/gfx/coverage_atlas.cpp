@@ -1199,7 +1199,13 @@ static void rasterize_atlas_textures(
             }
         }
 
-        // Thickness: for each valid texel, accumulate depth range
+        // Thickness: the local depth extent of the surface within each texel.
+        // The old code used the triangle's vertex depth range (max-min of all
+        // three gd), so a slanted face spanning the patch depth reported that
+        // whole span at every texel on it, over-filling nodes with empty space
+        // and forcing needless subdivision. Sample the triangle's depth at the
+        // texel corners (plus centre) that lie inside it instead: the surface
+        // is planar, so their min/max is the true local span across the texel.
         for (int ti : fp.tris) {
             Vec2 gv[3]; float gd[3];
             for (int e = 0; e < 3; ++e) {
@@ -1215,23 +1221,28 @@ static void rasterize_atlas_textures(
             int y1=std::min(ay+th-1,(int)std::ceil(std::max({fy0,fy1,fy2})));
             float area2=(fx1-fx0)*(fy2-fy0)-(fx2-fx0)*(fy1-fy0);
             if(std::abs(area2)<1e-10f) continue;
+            float inv=1.0f/area2;
             bool cw = area2 < 0.0f;
             for(int py=y0;py<=y1;++py){
                 for(int px=x0;px<=x1;++px){
-                    float ppx=float(px)+0.5f,ppy=float(py)+0.5f;
-                    float e0=(fx1-fx0)*(ppy-fy0)-(ppx-fx0)*(fy1-fy0);
-                    float e1=(fx2-fx1)*(ppy-fy1)-(ppx-fx1)*(fy2-fy1);
-                    float e2=(fx0-fx2)*(ppy-fy2)-(ppx-fx2)*(fy0-fy2);
-                    bool inside = cw ? (e0<=1e-6f&&e1<=1e-6f&&e2<=1e-6f)
-                                     : (e0>=-1e-6f&&e1>=-1e-6f&&e2>=-1e-6f);
-                    if(inside){
-                        size_t idx=size_t(py)*atlas_w+px;
-                        if(atlas_depth[idx]>-1e20f){
-                            float dmin=std::min({gd[0],gd[1],gd[2]});
-                            float dmax=std::max({gd[0],gd[1],gd[2]});
-                            atlas_thickness[idx]=std::max(atlas_thickness[idx], dmax-dmin);
-                        }
+                    size_t idx=size_t(py)*atlas_w+px;
+                    if(atlas_depth[idx]<=-1e20f) continue;
+                    const float sxp[5]={float(px)+0.5f,float(px),float(px+1),float(px+1),float(px)};
+                    const float syp[5]={float(py)+0.5f,float(py),float(py),float(py+1),float(py+1)};
+                    float ldmin=1e30f, ldmax=-1e30f;
+                    for(int c=0;c<5;++c){
+                        float e0=(fx1-fx0)*(syp[c]-fy0)-(sxp[c]-fx0)*(fy1-fy0);
+                        float e1=(fx2-fx1)*(syp[c]-fy1)-(sxp[c]-fx1)*(fy2-fy1);
+                        float e2=(fx0-fx2)*(syp[c]-fy2)-(sxp[c]-fx2)*(fy0-fy2);
+                        bool inside = cw ? (e0<=1e-6f&&e1<=1e-6f&&e2<=1e-6f)
+                                         : (e0>=-1e-6f&&e1>=-1e-6f&&e2>=-1e-6f);
+                        if(!inside) continue;
+                        float w2=e0*inv, w0=e1*inv, w1=1.0f-w0-w2;
+                        float d=w0*gd[0]+w1*gd[1]+w2*gd[2];
+                        ldmin=std::min(ldmin,d); ldmax=std::max(ldmax,d);
                     }
+                    if(ldmax>ldmin)
+                        atlas_thickness[idx]=std::max(atlas_thickness[idx], ldmax-ldmin);
                 }
             }
         }

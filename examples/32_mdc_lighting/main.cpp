@@ -594,12 +594,11 @@ void main() {
                 vec2 proj = vec2(dot(P, pi.basis_v), dot(P, pi.basis_w));
                 vec2 nrm = (proj - pi.proj_min) / pi.proj_size;
                 bool inside = nrm.x >= 0.0 && nrm.y >= 0.0 && nrm.x <= 1.0 && nrm.y <= 1.0;
-                float dm = 0.0, thk = 0.0;
+                float dm = 0.0, dmax = 0.0, thk = 0.0;
                 int L, idx, x0, y0, s;
                 if (inside) {
                     ivec2 txy = ivec2(int(r.x) + int(nrm.x * float(r.z)),
                                       int(r.y) + int(nrm.y * float(r.w)));
-                    float dmax;
                     if (query_node(txy, pid, L, idx, x0, y0, s, dm, dmax, thk)) {
                         dbg_covered++;
                     } else {
@@ -610,7 +609,10 @@ void main() {
                 // A ray that enters the leaf already inside the band (a head-on
                 // ray hits the AABB front face right where the surface sits) never
                 // produces a "before -> in-band" crossing, so accept it directly.
-                if (inside && D >= dm - htol && D <= dm + thk + htol) {
+                // The band is the leaf's own depth extent [dm, dmax]; using a
+                // coarse thickness would over-fill the cell with empty space for
+                // slanted faces whose per-texel depth span spans the whole patch.
+                if (inside && D >= dm - htol && D <= dmax + htol) {
                     best_t = t;
                     best_pid = pid;
                     best_L = L; best_idx = idx;
@@ -619,8 +621,8 @@ void main() {
                     break;
                 }
                 // "before" = the ray's depth is still above the surface band
-                // (D > dmin+thick), i.e. it has not reached the surface yet.
-                bool cur_before = !inside || (D > dm + thk + htol);
+                // (D > dmax), i.e. it has not reached the surface yet.
+                bool cur_before = !inside || (D > dmax + htol);
 
                 // The band crossing happened between the previous and current
                 // sample. Detect it in either direction (front or back face).
@@ -663,7 +665,7 @@ void main() {
                         if (!query_node(txy_f, pid, Lf, idxf, x0f, y0f, sf, dmf, dmxf, thkf)) { if (!dbg_captured) { dbg_captured = true; dbg_reject = 5; miss_nrm_f = nrm_f; miss_L = Lf; } }
                         else {
                             float D_f = dot(ro + rd * th - u_depth_origin, pi.basis_u);
-                            if (D_f < dmf - htol || D_f > dmf + thkf + htol) { if (!dbg_captured) { dbg_captured = true; dbg_reject = 3; miss_nrm_f = nrm_f; miss_L = Lf; } }
+                            if (D_f < dmf - htol || D_f > dmxf + htol) { if (!dbg_captured) { dbg_captured = true; dbg_reject = 3; miss_nrm_f = nrm_f; miss_L = Lf; } }
                             else if (th < best_t) {
                                 best_t = th;
                                 best_pid = pid;
