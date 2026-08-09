@@ -1,0 +1,3 @@
+add_executable(01_hello_triangle main.cpp)
+target_link_libraries(01_hello_triangle PRIVATE gllib)
+target_compile_features(01_hello_triangle PRIVATE cxx_std_20)

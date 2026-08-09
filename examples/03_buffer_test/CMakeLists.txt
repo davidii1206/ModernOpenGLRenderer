@@ -1,0 +1,3 @@
+add_executable(03_buffer_test main.cpp)
+target_link_libraries(03_buffer_test PRIVATE gllib)
+target_compile_features(03_buffer_test PRIVATE cxx_std_20)

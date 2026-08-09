@@ -1,0 +1,27 @@
+# Doxyfile 1.12.0
+
+PROJECT_NAME           = "gllib"
+PROJECT_NUMBER         = 0.1.0
+PROJECT_BRIEF          = "Modern C++ OpenGL 4.6 wrapper library"
+OUTPUT_DIRECTORY       = docs/html
+INPUT                  = gllib/gl gllib/gfx README.md
+RECURSIVE              = YES
+FILE_PATTERNS          = *.hpp
+EXTRACT_ALL            = YES
+EXTRACT_PRIVATE        = NO
+EXTRACT_STATIC         = NO
+EXTRACT_LOCAL_CLASSES  = NO
+HIDE_UNDOC_MEMBERS     = NO
+HIDE_UNDOC_CLASSES     = NO
+SOURCE_BROWSER         = YES
+INLINE_SOURCES         = NO
+STRIP_CODE_COMMENTS    = NO
+GENERATE_TREEVIEW      = YES
+DISABLE_INDEX          = NO
+FULL_SIDEBAR           = YES
+HTML_DYNAMIC_SECTIONS  = YES
+GENERATE_LATEX         = NO
+MACRO_EXPANSION        = YES
+PREDEFINED             = GLLIB_GL_NAMESPACE=1
+WARN_NO_PARAMDOC       = NO
+ALPHABETICAL_INDEX     = YES

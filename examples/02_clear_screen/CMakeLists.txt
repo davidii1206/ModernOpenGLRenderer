@@ -1,0 +1,3 @@
+add_executable(02_clear_screen main.cpp)
+target_link_libraries(02_clear_screen PRIVATE gllib)
+target_compile_features(02_clear_screen PRIVATE cxx_std_20)

@@ -1,0 +1,3 @@
+add_executable(07_mesh_material main.cpp)
+target_link_libraries(07_mesh_material PRIVATE gllib)
+target_compile_features(07_mesh_material PRIVATE cxx_std_20)

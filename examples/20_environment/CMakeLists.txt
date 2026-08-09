@@ -1,0 +1,3 @@
+add_executable(20_environment main.cpp)
+target_link_libraries(20_environment PRIVATE gllib)
+target_compile_features(20_environment PRIVATE cxx_std_20)

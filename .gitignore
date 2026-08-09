@@ -1,0 +1,7 @@
+build/
+.cache/
+__pycache__/
+*.pyc
+docs/html/
+*.swp
+.DS_Store
