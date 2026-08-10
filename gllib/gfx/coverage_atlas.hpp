@@ -26,7 +26,7 @@ struct CoverageAtlasConfig {
     int   mip_leaf_tile   = 1;       // finest mip node size (texels); 1 = per-texel detail
     int   min_patch_size  = 200;     // merge pass target: absorb patches below this
     float epsilon         = 0.001f;  // occlusion test depth tolerance
-    float axis_threshold  = 0.0f;    // min |dot(normal, axis)| for merge candidates
+    float axis_threshold  = 0.5f;    // min |dot(normal, axis)| for merge candidates
     bool  rotate_model_x  = true;    // rotate scene 90° about X (glTF Y-up -> upright)
 };
 
@@ -78,6 +78,7 @@ public:
     struct MipChain {
         int    channels = 0;
         int    leaf_tile = 1;   // finest node size (texels); matches config.mip_leaf_tile
+        int    bytes_per_channel = 1;  // 1 = 8-bit value texel, 2 = 16-bit (depth)
         float  qmin[2] = {0, 0}, qmax[2] = {0, 0};  // per-channel quant range
         std::vector<MipLevel> levels;
     };
@@ -117,6 +118,7 @@ public:
     const MipChain& depth_chain() const { return depth_chain_; }
     const MipChain& thickness_chain() const { return thickness_chain_; }
     const MipChain& uv_chain() const { return uv_chain_; }
+    const MipChain& normal_chain() const { return normal_chain_; }
 
 private:
     CoverageAtlasConfig config_;
@@ -127,7 +129,7 @@ private:
     std::vector<BVHNode>   bvh_nodes_;
     int    atlas_w_ = 0, atlas_h_ = 0;
     float  final_density_ = 0.0f;
-    MipChain depth_chain_, thickness_chain_, uv_chain_;
+    MipChain depth_chain_, thickness_chain_, uv_chain_, normal_chain_;
 };
 
 } // namespace gfx

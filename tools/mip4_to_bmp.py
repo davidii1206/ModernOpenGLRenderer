@@ -70,7 +70,7 @@ def load_mip4(path):
     num_patches = u32()
     qmin = floats(channels)
     qmax = floats(channels)
-    if bpc != 1:
+    if bpc not in (1, 2):
         raise Error(f"unsupported bytes-per-channel {bpc}")
     levels = []
     for _ in range(num_levels):
@@ -83,7 +83,7 @@ def load_mip4(path):
         if mo + ms > len(raw) or do + ds > len(raw):
             raise Error("level data out of bounds")
         levels.append({"w": w, "h": h, "do": do, "ds": ds, "mo": mo, "ms": ms})
-    return dict(version=ver, channels=channels, num_levels=num_levels,
+    return dict(version=ver, channels=channels, bpc=bpc, num_levels=num_levels,
                 leaf_tile=leaf_tile, atlas_w=atlas_w, atlas_h=atlas_h,
                 num_patches=num_patches, qmin=qmin, qmax=qmax, levels=levels, raw=raw)
 
@@ -134,7 +134,7 @@ def read_patch_table(path):
 
 def descend(m, patch_id, x, y, N, stop_at):
     """Walk the chain to the node containing lattice point (x, y); return
-    (leaf_level, leaf_index, raw_bytes, decoded_values, covered)."""
+    (leaf_level, leaf_index, display_bytes, decoded_values, covered)."""
     L = 0
     x0 = y0 = 0
     s = N
@@ -153,17 +153,26 @@ def descend(m, patch_id, x, y, N, stop_at):
         s = hs
         L += 1
     covered = bool(meta & 0x80000000)
-    ch = m["channels"]
-    vals = struct.unpack_from("<%dB" % ch, raw, levels[L]["do"] + idx * ch)
+    ch, bpc = m["channels"], m["bpc"]
+    nbytes = ch * bpc
+    vals = struct.unpack_from("<%dB" % nbytes, raw, levels[L]["do"] + idx * nbytes)
+    disp = []
     dec = []
     for c in range(ch):
         lo, hi = m["qmin"][c], m["qmax"][c]
-        b = vals[c]
-        if b == 0 or not (hi > lo):
-            dec.append(0.0)
+        if bpc == 2:
+            rawval = vals[c * 2] | (vals[c * 2 + 1] << 8)   # little-endian uint16
+            disp.append(rawval >> 8)                        # high byte for display
         else:
-            dec.append(lo + (hi - lo) * (b - 1) / 254.0)
-    return L, idx, vals, dec, covered
+            rawval = vals[c]
+            disp.append(rawval)
+        if rawval == 0 or not (hi > lo):
+            dec.append(0.0)
+        elif bpc == 2:
+            dec.append(lo + (hi - lo) * (rawval - 1) / 65534.0)
+        else:
+            dec.append(lo + (hi - lo) * (rawval - 1) / 254.0)
+    return L, idx, disp, dec, covered
 
 
 def to_byte(v, lo, hi):

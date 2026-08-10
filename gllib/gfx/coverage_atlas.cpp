@@ -68,6 +68,18 @@ static Vec2 project_along(int axis, Vec3 p) {
     }
     return {0, 0};
 }
+
+// Octahedral map of a unit normal into [-1,1]^2 (two 8-bit channels are plenty).
+// Matches octahedral_decode in the ray shader; the sign convention for the
+// z<0 fold is the same on both sides so encode/decode round-trip exactly.
+static Vec2 octahedral_encode(Vec3 n) {
+    n /= (std::abs(n.x) + std::abs(n.y) + std::abs(n.z));
+    if (n.z < 0.0f) {
+        return {(1.0f - std::abs(n.y)) * (n.x >= 0.0f ? 1.0f : -1.0f),
+                (1.0f - std::abs(n.x)) * (n.y >= 0.0f ? 1.0f : -1.0f)};
+    }
+    return {n.x, n.y};
+}
 // Depth is measured from the model's AABB minimum along the projection axis
 // (not from world-space origin), so the stored values are relative to the
 // model itself and land in [0, extent]. All occlusion/thickness tests only use
@@ -424,9 +436,12 @@ static void build_patches(std::vector<Triangle>& tris,
             int ti = bfs.front(); bfs.pop();
             if (visited[ti]) continue;
 
-            // Axis alignment check (§3: dot with chosen axis must exceed threshold)
+            // Axis alignment check (§3: dot with chosen axis must exceed threshold).
+            // 0.5 keeps grazing triangles (up to ~72° off-axis at the old 0.3)
+            // from being swept into a patch whose projection they would compress,
+            // which under-samples their footprint and lets wrong rays register hits.
             float ndot = glm::dot(tris[ti].normal, axis_dirs[axis]);
-            if (ndot < 0.3f) continue;
+            if (ndot < 0.5f) continue;
 
             // Occlusion-free incremental test
             Vec2 gv[3]; float gd[3];
@@ -1059,6 +1074,7 @@ static void weld_vertices(std::vector<Vec3>& positions, std::vector<Vec3>& norma
 static void fill_atlas_holes(std::vector<float>& atlas_depth,
                              std::vector<float>& atlas_thickness,
                              std::vector<float>& atlas_uv,
+                             std::vector<float>& atlas_normal,
                              int atlas_w, int ax, int ay, int tw, int th)
 {
     const size_t n = size_t(tw) * th;
@@ -1095,15 +1111,16 @@ static void fill_atlas_holes(std::vector<float>& atlas_depth,
             for (int x = 0; x < tw; ++x) {
                 size_t i = size_t(y) * tw + x;
                 if (st[i] != 1) continue;
-                float d = 0, t = 0, u = 0, v = 0; int cnt = 0;
+                float d = 0, t = 0, u = 0, v = 0, nx = 0, ny = 0; int cnt = 0;
                 const int dx[4] = {1, -1, 0, 0}, dy[4] = {0, 0, 1, -1};
                 for (int k = 0; k < 4; ++k) {
-                    int nx = x + dx[k], ny = y + dy[k];
-                    if (nx < 0 || ny < 0 || nx >= tw || ny >= th) continue;
-                    size_t j = size_t(ay + ny) * atlas_w + (ax + nx);
+                    int nx_ = x + dx[k], ny_ = y + dy[k];
+                    if (nx_ < 0 || ny_ < 0 || nx_ >= tw || ny_ >= th) continue;
+                    size_t j = size_t(ay + ny_) * atlas_w + (ax + nx_);
                     if (atlas_depth[j] <= -1e20f) continue;
                     d += atlas_depth[j]; t += atlas_thickness[j];
-                    u += atlas_uv[j * 2]; v += atlas_uv[j * 2 + 1]; cnt++;
+                    u += atlas_uv[j * 2]; v += atlas_uv[j * 2 + 1];
+                    nx += atlas_normal[j * 2]; ny += atlas_normal[j * 2 + 1]; cnt++;
                 }
                 if (cnt > 0) { st[i] = 0; fill.push_back(int(i)); }
             }
@@ -1112,15 +1129,16 @@ static void fill_atlas_holes(std::vector<float>& atlas_depth,
             changed = true;
             for (int i : fill) {
                 int x = i % tw, y = i / tw;
-                float d = 0, t = 0, u = 0, v = 0; int cnt = 0;
+                float d = 0, t = 0, u = 0, v = 0, nx = 0, ny = 0; int cnt = 0;
                 const int dx[4] = {1, -1, 0, 0}, dy[4] = {0, 0, 1, -1};
                 for (int k = 0; k < 4; ++k) {
-                    int nx = x + dx[k], ny = y + dy[k];
-                    if (nx < 0 || ny < 0 || nx >= tw || ny >= th) continue;
-                    size_t j = size_t(ay + ny) * atlas_w + (ax + nx);
+                    int nx_ = x + dx[k], ny_ = y + dy[k];
+                    if (nx_ < 0 || ny_ < 0 || nx_ >= tw || ny_ >= th) continue;
+                    size_t j = size_t(ay + ny_) * atlas_w + (ax + nx_);
                     if (atlas_depth[j] <= -1e20f) continue;
                     d += atlas_depth[j]; t += atlas_thickness[j];
-                    u += atlas_uv[j * 2]; v += atlas_uv[j * 2 + 1]; cnt++;
+                    u += atlas_uv[j * 2]; v += atlas_uv[j * 2 + 1];
+                    nx += atlas_normal[j * 2]; ny += atlas_normal[j * 2 + 1]; cnt++;
                 }
                 if (cnt == 0) continue;
                 size_t j = size_t(ay + y) * atlas_w + (ax + x);
@@ -1128,6 +1146,8 @@ static void fill_atlas_holes(std::vector<float>& atlas_depth,
                 atlas_thickness[j] = t / cnt;
                 atlas_uv[j * 2]    = u / cnt;
                 atlas_uv[j * 2 + 1] = v / cnt;
+                atlas_normal[j * 2]    = nx / cnt;
+                atlas_normal[j * 2 + 1] = ny / cnt;
             }
         }
     }
@@ -1137,15 +1157,18 @@ static void rasterize_atlas_textures(
         const std::vector<Patch>& patches,
         const std::vector<Triangle>& tris,
         const std::vector<Vec3>& positions,
+        const std::vector<Vec3>& normals,
         const std::vector<Vec2>& uvs,
         std::vector<float>& atlas_depth,
         std::vector<float>& atlas_thickness,
         std::vector<float>& atlas_uv,
+        std::vector<float>& atlas_normal,
         int atlas_w, int atlas_h)
 {
     atlas_depth.assign(size_t(atlas_w)*atlas_h, -1e30f);
     atlas_thickness.assign(size_t(atlas_w)*atlas_h, 0.0f);
     atlas_uv.assign(size_t(atlas_w)*atlas_h*2, 0.0f);
+    atlas_normal.assign(size_t(atlas_w)*atlas_h*2, 0.0f);
 
     for (auto& fp : patches) {
         if (fp.tex_w <= 0 || fp.tex_h <= 0) continue;
@@ -1158,14 +1181,15 @@ static void rasterize_atlas_textures(
             return {float(ax)+u*tw, float(ay)+v*th};
         };
 
-        // Pass A+C: depth + UV rasterisation (patch triangles only)
+        // Pass A+C: depth + UV + normal rasterisation (patch triangles only)
         for (int ti : fp.tris) {
-            Vec2 gv[3]; float gd[3]; Vec2 guv[3];
+            Vec2 gv[3]; float gd[3]; Vec2 guv[3]; Vec3 gn[3];
             for (int e = 0; e < 3; ++e) {
                 Vec3 pos = positions[tris[ti].v[e]];
                 gv[e] = project_along(fp.axis, pos);
                 gd[e] = depth_along(fp.axis, pos);
                 guv[e] = (tris[ti].v[e] < uvs.size()) ? uvs[tris[ti].v[e]] : Vec2{0,0};
+                gn[e] = (tris[ti].v[e] < normals.size()) ? normals[tris[ti].v[e]] : fp.basis_u;
             }
             Vec2 av[3] = {to_atlas(gv[0]), to_atlas(gv[1]), to_atlas(gv[2])};
             float fx0=av[0].x,fy0=av[0].y,fx1=av[1].x,fy1=av[1].y,fx2=av[2].x,fy2=av[2].y;
@@ -1194,6 +1218,13 @@ static void rasterize_atlas_textures(
                         if(atlas_depth[idx] <= -1e20f || depth < atlas_depth[idx]) atlas_depth[idx]=depth;
                         atlas_uv[idx*2+0]=w0*guv[0].x+w1*guv[1].x+w2*guv[2].x;
                         atlas_uv[idx*2+1]=w0*guv[0].y+w1*guv[1].y+w2*guv[2].y;
+                        // Bake the interpolated (smooth-shaded) vertex normal once,
+                        // octahedral-encoded, so the ray pass can fetch it instead of
+                        // reconstructing it at runtime from noisy depth gradients.
+                        Vec3 n = safe_normalize(w0*gn[0]+w1*gn[1]+w2*gn[2]);
+                        Vec2 oct = octahedral_encode(n);
+                        atlas_normal[idx*2+0]=oct.x;
+                        atlas_normal[idx*2+1]=oct.y;
                     }
                 }
             }
@@ -1248,7 +1279,7 @@ static void rasterize_atlas_textures(
         }
 
         // Close interior coverage cracks so a fine leaf tile has no holes.
-        fill_atlas_holes(atlas_depth, atlas_thickness, atlas_uv,
+        fill_atlas_holes(atlas_depth, atlas_thickness, atlas_uv, atlas_normal,
                          atlas_w, ax, ay, tw, th);
     }
 
@@ -1286,6 +1317,7 @@ struct MipCell {                      // aggregated value of one quadtree node
     float umin = 1e30f, umax = -1e30f;
     float vmin = 1e30f, vmax = -1e30f;
     float uavg = 0.0f, vavg = 0.0f;
+    float nxavg = 0.0f, nyavg = 0.0f;  // octahedral-encoded baked normal (average)
     int   count = 0;
 };
 
@@ -1324,6 +1356,7 @@ static PatchPyramid build_patch_pyramid(
         const std::vector<float>& atlas_depth,
         const std::vector<float>& atlas_thickness,
         const std::vector<float>& atlas_uv,
+        const std::vector<float>& atlas_normal,
         int atlas_w, int leaf_tile)
 {
     int tw = fp.tex_w, th = fp.tex_h;
@@ -1357,12 +1390,14 @@ static PatchPyramid build_patch_pyramid(
                     c.vmax = std::max(c.vmax, vv);
                     c.uavg += uu;
                     c.vavg += vv;
+                    c.nxavg += atlas_normal[idx * 2];
+                    c.nyavg += atlas_normal[idx * 2 + 1];
                     c.count++;
                 }
             }
-            if (c.count) { c.uavg /= float(c.count); c.vavg /= float(c.count); }
-            pyr.levels[0][size_t(j) * n4 + i] = c;
-        }
+            // Keep raw sums (not means) at every level; emit_mip_chain divides
+            // by the texel count so multi-texel nodes average correctly.
+            pyr.levels[0][size_t(j) * n4 + i] = c;        }
     }
 
     for (int k = 0; k + 1 < nl; ++k) {
@@ -1382,8 +1417,10 @@ static PatchPyramid build_patch_pyramid(
                         c.umax = std::max(c.umax, s.umax);
                         c.vmin = std::min(c.vmin, s.vmin);
                         c.vmax = std::max(c.vmax, s.vmax);
-                        c.uavg += s.uavg * float(s.count);
-                        c.vavg += s.vavg * float(s.count);
+                        c.uavg += s.uavg;
+                        c.vavg += s.vavg;
+                        c.nxavg += s.nxavg;
+                        c.nyavg += s.nyavg;
                     }
                 }
                 if (c.count) { c.uavg /= float(c.count); c.vavg /= float(c.count); }
@@ -1448,7 +1485,7 @@ static void build_mip_tree_rec(std::vector<std::vector<MipNodeOut>>& levels,
     }
 }
 
-enum MipChanType { MIP_DEPTH, MIP_THICK, MIP_UV };
+enum MipChanType { MIP_DEPTH, MIP_THICK, MIP_UV, MIP_NORMAL };
 
 static uint8_t mip_qbyte(float v, float lo, float hi) {
     // Map the valid range [lo, hi] onto [1, 255] so byte 0 is reserved for
@@ -1458,11 +1495,21 @@ static uint8_t mip_qbyte(float v, float lo, float hi) {
     return uint8_t(std::clamp(q, 1, 255));
 }
 
+static uint16_t mip_qshort(float v, float lo, float hi) {
+    // 16-bit variant: maps [lo, hi] onto [1, 65535], reserving 0 for empty.
+    float t = (hi > lo) ? (v - lo) / (hi - lo) : 0.0f;
+    int q = int(std::lround(std::clamp(t, 0.0f, 1.0f) * 65534.0f)) + 1;
+    return uint16_t(std::clamp(q, 1, 65535));
+}
+
 static std::array<float, 2> mip_values(MipChanType t, const MipCell& c) {
     switch (t) {
         case MIP_DEPTH: return {c.dmin, c.dmax};
         case MIP_THICK: return {c.thmax, 0.0f};
-        case MIP_UV:    return {c.uavg, c.vavg};
+        case MIP_UV:    return {c.count ? c.uavg / float(c.count) : 0.0f,
+                                c.count ? c.vavg / float(c.count) : 0.0f};
+        case MIP_NORMAL: return {c.count ? c.nxavg / float(c.count) : 0.0f,
+                                c.count ? c.nyavg / float(c.count) : 0.0f};
     }
     return {0, 0};
 }
@@ -1470,10 +1517,11 @@ static std::array<float, 2> mip_values(MipChanType t, const MipCell& c) {
 static void emit_mip_chain(MipChanType type,
                            const std::vector<std::vector<MipNodeOut>>& nodes,
                            const float qmin[2], const float qmax[2],
-                           int leaf_tile, MipChain& out)
+                           int leaf_tile, int bytes_per_channel, MipChain& out)
 {
     out.channels = (type == MIP_THICK) ? 1 : 2;
     out.leaf_tile = leaf_tile;
+    out.bytes_per_channel = bytes_per_channel;
     out.qmin[0] = qmin[0]; out.qmax[0] = qmax[0];
     out.qmin[1] = qmin[1]; out.qmax[1] = qmax[1];
 
@@ -1488,15 +1536,23 @@ static void emit_mip_chain(MipChanType type,
         uint32_t n = uint32_t(nlist.size());
         lev.w = std::min<uint32_t>(n, MIP_MAX_TEXW);
         lev.h = (n + lev.w - 1) / lev.w;
-        lev.data.assign(size_t(n) * out.channels, 0);
+        lev.data.assign(size_t(n) * out.channels * out.bytes_per_channel, 0);
         lev.meta.assign(n, 0);
         for (uint32_t i = 0; i < n; ++i) {
             const MipCell& c = nlist[i].agg;
             if (c.count > 0) {
                 auto v = mip_values(type, c);
-                uint8_t* p = lev.data.data() + size_t(i) * out.channels;
-                p[0] = mip_qbyte(v[0], qmin[0], qmax[0]);
-                if (out.channels == 2) p[1] = mip_qbyte(v[1], qmin[1], qmax[1]);
+                if (bytes_per_channel == 2) {
+                    uint16_t q0 = mip_qshort(v[0], qmin[0], qmax[0]);
+                    uint16_t q1 = mip_qshort(v[1], qmin[1], qmax[1]);
+                    uint8_t* p = lev.data.data() + size_t(i) * out.channels * 2;
+                    p[0] = uint8_t(q0 & 0xFFu); p[1] = uint8_t(q0 >> 8);
+                    p[2] = uint8_t(q1 & 0xFFu); p[3] = uint8_t(q1 >> 8);
+                } else {
+                    uint8_t* p = lev.data.data() + size_t(i) * out.channels;
+                    p[0] = mip_qbyte(v[0], qmin[0], qmax[0]);
+                    if (out.channels == 2) p[1] = mip_qbyte(v[1], qmin[1], qmax[1]);
+                }
             }
 
             lev.meta[i] = (c.count > 0 ? 0x80000000u : 0u) |
@@ -1511,9 +1567,11 @@ static void build_mip_chains(
         const std::vector<float>& atlas_depth,
         const std::vector<float>& atlas_thickness,
         const std::vector<float>& atlas_uv,
+        const std::vector<float>& atlas_normal,
         int atlas_w, int atlas_h,
         float tol_frac, int leaf_tile,
-        MipChain& depth_chain, MipChain& thick_chain, MipChain& uv_chain)
+        MipChain& depth_chain, MipChain& thick_chain, MipChain& uv_chain,
+        MipChain& normal_chain)
 {
     printf("Building adaptive mip chains...\n");
 
@@ -1551,21 +1609,28 @@ static void build_mip_chains(
     for (auto& fp : patches) {
         if (fp.tex_w <= 0 || fp.tex_h <= 0) continue;
         PatchPyramid pyr = build_patch_pyramid(fp, atlas_depth, atlas_thickness,
-                                               atlas_uv, atlas_w, leaf_tile);
+                                               atlas_uv, atlas_normal,
+                                               atlas_w, leaf_tile);
         build_mip_tree_rec(nodes, pyr, tol, 0, 0, 0, pyr.n4 * leaf_tile);
     }
 
-    // Emit the three chains (they share the same tree topology).
+    // Emit the four chains (they share the same tree topology).
     // qmin[i]/qmax[i] = quantisation range for channel i.
+    // The depth chain uses 16-bit values (256x the discrete levels of RG8) so
+    // the runtime gradient/band reconstruction no longer drowns in quantisation
+    // noise on shallow diagonal patches; the others stay 8-bit.
     float dqlo[2] = {gdmin, gdmin};
     float dqhi[2] = {gdmax, gdmax};
     float tqlo[2] = {0.0f, 0.0f};
     float tqhi[2] = {gthmax, gthmax};
     float uvlo[2] = {gumin, gvmin};
     float uvhi[2] = {gumax, gvmax};
-    emit_mip_chain(MIP_DEPTH, nodes, dqlo, dqhi, leaf_tile, depth_chain);
-    emit_mip_chain(MIP_THICK, nodes, tqlo, tqhi, leaf_tile, thick_chain);
-    emit_mip_chain(MIP_UV, nodes, uvlo, uvhi, leaf_tile, uv_chain);
+    float nqlo[2] = {-1.0f, -1.0f};   // octahedral normal coords live in [-1,1]
+    float nqhi[2] = { 1.0f,  1.0f};
+    emit_mip_chain(MIP_DEPTH,  nodes, dqlo, dqhi, leaf_tile, 2, depth_chain);
+    emit_mip_chain(MIP_THICK, nodes, tqlo, tqhi, leaf_tile, 1, thick_chain);
+    emit_mip_chain(MIP_UV,    nodes, uvlo, uvhi, leaf_tile, 1, uv_chain);
+    emit_mip_chain(MIP_NORMAL, nodes, nqlo, nqhi, leaf_tile, 1, normal_chain);
 
     int deepest = 0;
     for (int L = 0; L < (int)nodes.size(); ++L)
@@ -1662,9 +1727,9 @@ static uint64_t write_mip_chain(const char* path, const MipChain& ch,
     if (!f) return 0;
     uint32_t nl = uint32_t(ch.levels.size());
     write_u32(f, 0x4D495034u);                    // "MIP4"
-    write_u32(f, 1u);                             // version
+    write_u32(f, 2u);                             // version
     write_u32(f, uint32_t(ch.channels));
-    write_u32(f, 1u);                             // bytes per channel
+    write_u32(f, uint32_t(ch.bytes_per_channel));  // 1 = 8-bit, 2 = 16-bit (depth)
     write_u32(f, nl);
     write_u32(f, uint32_t(ch.leaf_tile));
     write_u32(f, uint32_t(atlas_w));
@@ -1680,7 +1745,8 @@ static uint64_t write_mip_chain(const char* path, const MipChain& ch,
     for (uint32_t L = 0; L < nl; ++L) {
         uint64_t dn = ch.levels[L].meta.size();
         total_nodes += dn;
-        data_off[L] = off;  data_size[L] = dn * uint64_t(ch.channels); off += data_size[L];
+        uint64_t node_bytes = uint64_t(ch.channels) * uint64_t(ch.bytes_per_channel);
+        data_off[L] = off;  data_size[L] = dn * node_bytes; off += data_size[L];
         meta_off[L] = off;  meta_size[L] = dn * 4;                     off += meta_size[L];
     }
     for (uint32_t L = 0; L < nl; ++L) {
@@ -1718,12 +1784,13 @@ static bool write_atlas_state(const char* path,
                               const std::vector<Patch>& patches,
                               const std::vector<BVHNode>& bvh,
                               int atlas_w, int atlas_h, float density,
-                              const MipChain& depth, const MipChain& thick, const MipChain& uv)
+                              const MipChain& depth, const MipChain& thick,
+                              const MipChain& uv, const MipChain& normal)
 {
     FILE* f = fopen(path, "wb");
     if (!f) { fprintf(stderr, "Cannot write %s\n", path); return false; }
     write_u32(f, 0x41544C53u);       // "ATLS"
-    write_u32(f, 1u);                // version
+    write_u32(f, 2u);                // version (2 adds per-chain bytes_per_channel + normal chain)
     write_f32(f, cfg.texel_density); write_i32(f, cfg.auto_target);
     write_f32(f, cfg.budget_texels); write_i32(f, cfg.min_tex); write_i32(f, cfg.max_tex);
     write_f32(f, cfg.mip_tol_frac);  write_i32(f, cfg.mip_leaf_tile);
@@ -1766,6 +1833,7 @@ static bool write_atlas_state(const char* path,
 
     auto write_chain = [&](const MipChain& ch) {
         write_i32(f, ch.channels); write_i32(f, ch.leaf_tile);
+        write_i32(f, ch.bytes_per_channel);
         fwrite(ch.qmin, 4, 2, f); fwrite(ch.qmax, 4, 2, f);
         write_u32(f, uint32_t(ch.levels.size()));
         for (auto& lv : ch.levels) {
@@ -1776,7 +1844,7 @@ static bool write_atlas_state(const char* path,
             if (!lv.meta.empty()) fwrite(lv.meta.data(), 4, lv.meta.size(), f);
         }
     };
-    write_chain(depth); write_chain(thick); write_chain(uv);
+    write_chain(depth); write_chain(thick); write_chain(uv); write_chain(normal);
     fclose(f);
     printf("  Wrote %s\n", path);
     return true;
@@ -1797,13 +1865,14 @@ static bool read_atlas_state(const char* path,
                              std::vector<Patch>& patches,
                              std::vector<BVHNode>& bvh,
                              int& atlas_w, int& atlas_h, float& density,
-                             MipChain& depth, MipChain& thick, MipChain& uv)
+                             MipChain& depth, MipChain& thick, MipChain& uv,
+                             MipChain& normal)
 {
     FILE* f = fopen(path, "rb");
     if (!f) return false;
     uint32_t magic = 0, version = 0;
     if (!read_u32(f, magic) || magic != 0x41544C53u) { fclose(f); return false; }
-    if (!read_u32(f, version) || version != 1u) { fclose(f); return false; }
+    if (!read_u32(f, version) || version != 2u) { fclose(f); return false; }
 
     auto read_cfg = [&]() -> bool {
         return read_f32(f, cfg.texel_density) && read_i32(f, cfg.auto_target) &&
@@ -1878,6 +1947,7 @@ static bool read_atlas_state(const char* path,
     }
     auto read_chain = [&](MipChain& ch) -> bool {
         if (!read_i32(f, ch.channels) || !read_i32(f, ch.leaf_tile) ||
+            !read_i32(f, ch.bytes_per_channel) ||
             !read_blob(f, ch.qmin, 8) || !read_blob(f, ch.qmax, 8)) return false;
         uint32_t nl = 0;
         if (!read_u32(f, nl)) return false;
@@ -1893,7 +1963,8 @@ static bool read_atlas_state(const char* path,
         }
         return true;
     };
-    if (!read_chain(depth) || !read_chain(thick) || !read_chain(uv)) { fclose(f); return false; }
+    if (!read_chain(depth) || !read_chain(thick) || !read_chain(uv) ||
+        !read_chain(normal)) { fclose(f); return false; }
 
     fclose(f);
     printf("  Read %s\n", path);
@@ -1957,6 +2028,7 @@ bool CoverageAtlas::build(const gfx::Model& model) {
     depth_chain_ = MipChain{};
     thickness_chain_ = MipChain{};
     uv_chain_ = MipChain{};
+    normal_chain_ = MipChain{};
 
     std::vector<Vec3> positions, normals;
     std::vector<Vec2> uvs;
@@ -2125,9 +2197,9 @@ bool CoverageAtlas::build(const gfx::Model& model) {
 
     // --- §8  Atlas texture rasterisation ---
     printf("Rasterising atlas textures...\n");
-    std::vector<float> atlas_depth, atlas_thickness, atlas_uv;
-    rasterize_atlas_textures(final_patches, tris, positions, uvs,
-                              atlas_depth, atlas_thickness, atlas_uv,
+    std::vector<float> atlas_depth, atlas_thickness, atlas_uv, atlas_normal;
+    rasterize_atlas_textures(final_patches, tris, positions, normals, uvs,
+                              atlas_depth, atlas_thickness, atlas_uv, atlas_normal,
                               atlas_w_, atlas_h_);
 
     // --- Statistics ---
@@ -2159,9 +2231,10 @@ bool CoverageAtlas::build(const gfx::Model& model) {
     // --- Mip chains ---
     printf("\nBuilding mip chains...\n");
     build_mip_chains(final_patches, atlas_depth, atlas_thickness, atlas_uv,
+                     atlas_normal,
                      atlas_w_, atlas_h_, config_.mip_tol_frac,
                      config_.mip_leaf_tile,
-                     depth_chain_, thickness_chain_, uv_chain_);
+                     depth_chain_, thickness_chain_, uv_chain_, normal_chain_);
 
     // Publish results.
     positions_ = std::move(positions);
@@ -2199,11 +2272,13 @@ bool CoverageAtlas::write_files(const std::string& dir) const {
                     atlas_w_, atlas_h_, int(patches_.size()));
     write_mip_chain(join("atlas_uv.bin").c_str(), uv_chain_,
                     atlas_w_, atlas_h_, int(patches_.size()));
+    write_mip_chain(join("atlas_normal.bin").c_str(), normal_chain_,
+                    atlas_w_, atlas_h_, int(patches_.size()));
 
     ok &= write_atlas_state(join("atlas_state.bin").c_str(), config_,
                             positions_, normals_, uvs_, triangles_, patches_,
                             bvh_nodes_, atlas_w_, atlas_h_, final_density_,
-                            depth_chain_, thickness_chain_, uv_chain_);
+                            depth_chain_, thickness_chain_, uv_chain_, normal_chain_);
 
     // --- Patch summary ---
     {
@@ -2253,9 +2328,9 @@ bool CoverageAtlas::load_files(const std::string& dir) {
     std::vector<BVHNode> bvh;
     int aw = 0, ah = 0;
     float density = 0.0f;
-    MipChain depth, thick, uv;
+    MipChain depth, thick, uv, normal;
     if (!read_atlas_state(path.c_str(), cfg, positions, normals, uvs, tris, patches,
-                          bvh, aw, ah, density, depth, thick, uv))
+                          bvh, aw, ah, density, depth, thick, uv, normal))
         return false;
 
     config_ = cfg;
@@ -2270,6 +2345,7 @@ bool CoverageAtlas::load_files(const std::string& dir) {
     depth_chain_ = std::move(depth);
     thickness_chain_ = std::move(thick);
     uv_chain_ = std::move(uv);
+    normal_chain_ = std::move(normal);
 
     printf("Loaded cached atlas from %s: %zu patches, %zu triangles, atlas %dx%d @ %.0f texels/unit\n",
            path.c_str(), patches_.size(), triangles_.size(), atlas_w_, atlas_h_, final_density_);

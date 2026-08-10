@@ -201,7 +201,7 @@ static const char* atlas_fs = R"(
 layout(location = 0) out vec4 frag_color;
 
 uniform int u_patch_count;
-uniform int u_chain;             // 0 = UV, 1 = thickness, 2 = depth
+uniform int u_chain;             // 0 = UV, 1 = thickness, 2 = depth, 3 = normal
 uniform int u_debug_meta;        // TEMP: 0=normal, 1=pid, 2=level, 3=idx
 uniform int u_level_off[32];     // meta SSBO offsets per level (shared topology)
 uniform int u_value_off[32];     // value texture offsets per level (selected chain)
@@ -209,10 +209,26 @@ uniform int u_value_off[32];     // value texture offsets per level (selected ch
 layout(std430, binding = 0) readonly buffer PatchBuf { uvec4 rects[]; };
 layout(std430, binding = 1) readonly buffer MetaBuf   { uint  meta[]; };
 
-uniform sampler2D u_values;      // RG8 normalized
+uniform sampler2D u_values;      // RG8 / RG16 normalized
 
 const int LEAF_TILE = 1;
 const int TEX_W = 16384;
+
+float decode_value(float b, float lo, float hi, int bits) {
+    float n = (bits >= 16) ? 65535.0 : 255.0;
+    float d = (bits >= 16) ? 65534.0 : 254.0;
+    return lo + (hi - lo) * (b * n - 1.0) / d;
+}
+
+vec3 octahedral_decode(vec2 f) {
+    vec3 n = vec3(f.x, f.y, 1.0 - abs(f.x) - abs(f.y));
+    if (n.z < 0.0) {
+        float t = -n.z;
+        n.x += (f.x >= 0.0 ? 1.0 : -1.0) * t;
+        n.y += (f.y >= 0.0 ? 1.0 : -1.0) * t;
+    }
+    return normalize(n);
+}
 
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
@@ -264,7 +280,12 @@ void main() {
 
     if (u_chain == 0)
         frag_color = vec4(q, 0.0, 1.0);         // UV: u,v
-    else
+    else if (u_chain == 3) {
+        // Normal: decode the octahedral coords back to a viewable normal.
+        vec2 oct = vec2(decode_value(q.x, -1.0, 1.0, 8),
+                        decode_value(q.y, -1.0, 1.0, 8));
+        frag_color = vec4(octahedral_decode(oct) * 0.5 + 0.5, 1.0);
+    } else
         frag_color = vec4(vec3(q.x), 1.0);      // thickness / depth: channel 0
 }
 )";
@@ -309,11 +330,13 @@ layout(std430, binding = 1) readonly buffer MetaBuf      { uint  meta[]; };
 layout(std430, binding = 2) readonly buffer PatchInfoBuf { PatchInfo patches[]; };
 layout(std430, binding = 3) readonly buffer BvhBuf       { BVHGPU bvh[]; };
 
-uniform sampler2D u_depth_tex;     // depth chain value texture (RG8)
+uniform sampler2D u_depth_tex;     // depth chain value texture (RG16)
 uniform sampler2D u_thick_tex;     // thickness chain value texture (RG8)
+uniform sampler2D u_normal_tex;    // normal chain value texture (RG8, octahedral)
 uniform int  u_level_off[32];      // meta SSBO offsets per level (shared)
 uniform int  u_value_off_depth[32];
 uniform int  u_value_off_thick[32];
+uniform int  u_value_off_normal[32];
 uniform int  u_patch_count;
 uniform mat4 u_vp_inv;
 uniform vec2 u_res;
@@ -328,8 +351,22 @@ uniform int  u_dbg;                // 0=normals, 1=ray dir, 2=root-aabb test
 
 layout(binding = 0, rgba8) uniform image2D u_out;
 
-float decode_value(float b, float lo, float hi) {
-    return lo + (hi - lo) * (b * 255.0 - 1.0) / 254.0;
+float decode_value(float b, float lo, float hi, int bits) {
+    float n = (bits >= 16) ? 65535.0 : 255.0;
+    float d = (bits >= 16) ? 65534.0 : 254.0;
+    return lo + (hi - lo) * (b * n - 1.0) / d;
+}
+
+// Octahedral decode of a unit normal stored in [-1,1]^2 (matches the CPU-side
+// octahedral_encode in coverage_atlas.cpp, including the z<0 fold convention).
+vec3 octahedral_decode(vec2 f) {
+    vec3 n = vec3(f.x, f.y, 1.0 - abs(f.x) - abs(f.y));
+    if (n.z < 0.0) {
+        float t = -n.z;
+        n.x += (f.x >= 0.0 ? 1.0 : -1.0) * t;
+        n.y += (f.y >= 0.0 ? 1.0 : -1.0) * t;
+    }
+    return normalize(n);
 }
 
 bool ray_aabb(vec3 ro, vec3 rd, vec3 amin, vec3 amax,
@@ -385,18 +422,12 @@ bool query_node(ivec2 txy, int pid,
 
     int vo = u_value_off_depth[L] + idx;
     vec2 dq = texelFetch(u_depth_tex, ivec2(vo % TEX_W, vo / TEX_W), 0).rg;
-    dmin = decode_value(dq.x, u_depth_lo, u_depth_hi);
-    dmax = decode_value(dq.y, u_depth_lo, u_depth_hi);
+    dmin = decode_value(dq.x, u_depth_lo, u_depth_hi, 16);
+    dmax = decode_value(dq.y, u_depth_lo, u_depth_hi, 16);
     int vt = u_value_off_thick[L] + idx;
     float tq = texelFetch(u_thick_tex, ivec2(vt % TEX_W, vt / TEX_W), 0).r;
-    thick = decode_value(tq, 0.0, u_thick_max);
+    thick = decode_value(tq, 0.0, u_thick_max, 8);
     return true;
-}
-
-bool query_depth_abs(int ax, int ay, int pid, out float dmin) {
-    int L, idx, x0, y0, s;
-    float dmax, thick;
-    return query_node(ivec2(ax, ay), pid, L, idx, x0, y0, s, dmin, dmax, thick);
 }
 
 void main() {
@@ -517,7 +548,6 @@ void main() {
     float best_t = 1.0e30;
     int best_pid = -1;
     int best_L = 0, best_idx = 0, best_x0 = 0, best_y0 = 0, best_s = 0;
-    float best_dmin = 0.0;
 
     if (u_patch_count == 0 || int(bvh.length()) == 0) {
         imageStore(u_out, p, vec4(0.0));
@@ -566,7 +596,7 @@ void main() {
             if (pi.double_sided == 0u && dD > 0.0) continue;
 
             float D0 = dot(ro - u_depth_origin, pi.basis_u);
-            float qstep = (u_depth_hi - u_depth_lo) / 254.0;
+            float qstep = (u_depth_hi - u_depth_lo) / 65534.0;   // 16-bit depth
             float htol = max(2.0 * qstep, 1.0e-4);   // depth quantisation slack
 
             // ---- Texel-stepped heightfield march (robust at grazing angles) ----
@@ -621,7 +651,6 @@ void main() {
                     best_pid = pid;
                     best_L = L; best_idx = idx;
                     best_x0 = x0; best_y0 = y0; best_s = s;
-                    best_dmin = dm;
                     break;
                 }
                 // "before" = the ray's depth is still above the surface band
@@ -676,7 +705,6 @@ void main() {
                                 best_pid = pid;
                                 best_L = Lf; best_idx = idxf;
                                 best_x0 = x0f; best_y0 = y0f; best_s = sf;
-                                best_dmin = dmf;
                             }
                         }
                     }
@@ -783,60 +811,21 @@ void main() {
         return;
     }
 
-    // ---- Surface normal from the surrounding, connected pixels ----
+    // ---- Surface normal from the baked octahedral normal chain ----
+    // The normal was rasterised once (interpolated vertex normal, octahedral-
+    // encoded) at atlas build time and aggregated per quadtree node, so fetching
+    // it at the resolved node is exact and independent of the view angle /
+    // march step that decided which node the ray landed on. No runtime finite
+    // differencing over quantised depth samples, no neighbour-dependent wobble.
     PatchInfo pi = patches[best_pid];
-    uvec4 r = rects[best_pid];
-    float su = pi.proj_size.x / float(max(r.z, 1u));
-    float sv = pi.proj_size.y / float(max(r.w, 1u));
-    int cx = best_x0 + best_s / 2;
-    int cy = best_y0 + best_s / 2;
-
-    float quant_step = (u_depth_hi - u_depth_lo) / 254.0;
-    float quant_eps = 1.5 * quant_step;
-
-    float dmin_l, dmin_r, dmin_u, dmin_d;
-    bool ok_l = query_depth_abs(int(r.x) + cx - best_s, int(r.y) + cy, best_pid, dmin_l);
-    bool ok_r = query_depth_abs(int(r.x) + cx + best_s, int(r.y) + cy, best_pid, dmin_r);
-    
-    float du = 0.0;
-    if (ok_l && ok_r && abs(dmin_l - best_dmin) < u_connect_tol && abs(dmin_r - best_dmin) < u_connect_tol) {
-        float diff = dmin_r - dmin_l;
-        if (abs(diff) > quant_eps) du = diff / (2.0 * float(best_s) * su);
-    } else if (ok_r && abs(dmin_r - best_dmin) < u_connect_tol) {
-        float diff = dmin_r - best_dmin;
-        if (abs(diff) > quant_eps) du = diff / (float(best_s) * su);
-    } else if (ok_l && abs(dmin_l - best_dmin) < u_connect_tol) {
-        float diff = best_dmin - dmin_l;
-        if (abs(diff) > quant_eps) du = diff / (float(best_s) * su);
-    }
-
-    bool ok_u = query_depth_abs(int(r.x) + cx, int(r.y) + cy - best_s, best_pid, dmin_u);
-    bool ok_d = query_depth_abs(int(r.x) + cx, int(r.y) + cy + best_s, best_pid, dmin_d);
-    
-    float dv = 0.0;
-    if (ok_u && ok_d && abs(dmin_u - best_dmin) < u_connect_tol && abs(dmin_d - best_dmin) < u_connect_tol) {
-        float diff = dmin_d - dmin_u;
-        if (abs(diff) > quant_eps) dv = diff / (2.0 * float(best_s) * sv);
-    } else if (ok_d && abs(dmin_d - best_dmin) < u_connect_tol) {
-        float diff = dmin_d - best_dmin;
-        if (abs(diff) > quant_eps) dv = diff / (float(best_s) * sv);
-    } else if (ok_u && abs(dmin_u - best_dmin) < u_connect_tol) {
-        float diff = best_dmin - dmin_u;
-        if (abs(diff) > quant_eps) dv = diff / (float(best_s) * sv);
-    }
-
-    vec3 n = pi.basis_u;
-    // Bound the gradient so a noisy neighbour sample cannot rotate the normal
-    // past 90 degrees from the patch axis (which would mirror a bad normal
-    // into another bad one, and make it viewer-dependent).
-    du = clamp(du, -1.0, 1.0);
-    dv = clamp(dv, -1.0, 1.0);
-    n -= du * pi.basis_v;
-    n -= dv * pi.basis_w;
-    n = normalize(n);
-    // Single-sided patches already cull their back face earlier, so a correct
-    // reconstruction always faces the viewer; force-flipping here would mirror
-    // gradient noise. Only double-sided patches have a genuine ambiguity.
+    int vo = u_value_off_normal[best_L] + best_idx;
+    vec2 qn = texelFetch(u_normal_tex, ivec2(vo % TEX_W, vo / TEX_W), 0).rg;
+    vec2 oct = vec2(decode_value(qn.x, -1.0, 1.0, 8),
+                    decode_value(qn.y, -1.0, 1.0, 8));
+    vec3 n = octahedral_decode(oct);
+    // Single-sided patches already cull their back face earlier, so the baked
+    // normal always faces the viewer. Only double-sided patches have a genuine
+    // ambiguity between the two sides of the surface.
     if (pi.double_sided != 0u && dot(n, rd) > 0.0) n = -n;
 
     if (u_dbg == 9) {
@@ -875,12 +864,12 @@ struct PatchGPU {
 
 struct AtlasView {
     GLuint rects_ssbo = 0, meta_ssbo = 0;
-    GLuint value_tex[3] = {0, 0, 0};   // UV, thickness, depth
+    GLuint value_tex[4] = {0, 0, 0, 0};   // UV, thickness, depth, normal
     GLuint fbo = 0, view_tex = 0;
     int view_w = 0, view_h = 0;
     int level_count = 0;
     int level_off[32] = {};
-    int value_off[3][32] = {};
+    int value_off[4][32] = {};
 };
 
 // std430 layouts matching the primary-ray compute shader.
@@ -1063,26 +1052,39 @@ static void upload_patch_gpu(const gfx::CoverageAtlas& atlas, PatchGPU& g) {
 
 static void upload_chain_tex(const gfx::CoverageAtlas::MipChain& chain, GLuint tex) {
     const int MAX_W = 16384;
-    std::vector<uint8_t> packed;
+    int bpc = chain.bytes_per_channel;
     size_t ch = size_t(chain.channels);
+    size_t bytes_per_node = ch * size_t(bpc);
+    size_t total_nodes = 0;
+    for (const auto& lv : chain.levels)
+        total_nodes += lv.data.size() / bytes_per_node;
+    size_t texel_bytes = (bpc == 2) ? 4 : 2;   // RG8 texel = 2 B, RG16 = 4 B
+    GLsizei w = MAX_W;
+    GLsizei h = GLsizei((total_nodes + MAX_W - 1) / MAX_W);
+    if (h == 0) h = 1;
+    std::vector<uint8_t> buf(size_t(w) * size_t(h) * texel_bytes, 0);
+    size_t o = 0;
     for (const auto& lv : chain.levels) {
-        size_t n = lv.data.size() / ch;
-        const uint8_t* d = lv.data.data();
-        for (size_t i = 0; i < n; ++i) {
-            packed.push_back(d[i * ch]);
-            packed.push_back(ch == 2 ? d[i * ch + 1] : 0);
+        size_t n = lv.data.size() / bytes_per_node;
+        if (bpc == 2) {
+            // Raw 16-bit pairs (dmin, dmax) already laid out as RG16 texels.
+            std::memcpy(buf.data() + o, lv.data.data(), lv.data.size());
+            o += lv.data.size();
+        } else {
+            for (size_t i = 0; i < n; ++i) {
+                buf[o++] = lv.data[i * ch];
+                buf[o++] = (ch == 2) ? lv.data[i * ch + 1] : 0;
+            }
         }
     }
-    size_t total = packed.size() / 2;
-    GLsizei w = MAX_W;
-    GLsizei h = GLsizei((total + MAX_W - 1) / MAX_W);
-    if (h == 0) h = 1;
-    std::vector<uint8_t> buf(size_t(w) * size_t(h) * 2, 0);
-    std::copy(packed.begin(), packed.end(), buf.begin());
     glBindTexture(GL_TEXTURE_2D, tex);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RG8, w, h, 0,
-                 GL_RG, GL_UNSIGNED_BYTE, buf.data());
+    if (bpc == 2)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RG16, w, h, 0,
+                     GL_RG, GL_UNSIGNED_SHORT, buf.data());
+    else
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RG8, w, h, 0,
+                     GL_RG, GL_UNSIGNED_BYTE, buf.data());
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -1117,17 +1119,20 @@ static void upload_atlas_view(const gfx::CoverageAtlas& atlas, AtlasView& v) {
     glBufferData(GL_SHADER_STORAGE_BUFFER, meta.size() * sizeof(uint32_t),
                  meta.data(), GL_STATIC_DRAW);
 
-    const gfx::CoverageAtlas::MipChain* chains[3] = {&atlas.uv_chain(),
+    const gfx::CoverageAtlas::MipChain* chains[4] = {&atlas.uv_chain(),
                                       &atlas.thickness_chain(),
-                                      &atlas.depth_chain()};
-    for (int c = 0; c < 3; ++c) {
+                                      &atlas.depth_chain(),
+                                      &atlas.normal_chain()};
+    for (int c = 0; c < 4; ++c) {
         if (!v.value_tex[c]) glGenTextures(1, &v.value_tex[c]);
         upload_chain_tex(*chains[c], v.value_tex[c]);
+        // value_off counts texels: each node is one RG texel regardless of bpc.
         uint32_t off = 0;
         for (int L = 0; L < v.level_count && L < 32; ++L) {
             v.value_off[c][L] = int(off);
             off += uint32_t(chains[c]->levels[size_t(L)].data.size() /
-                            size_t(chains[c]->channels));
+                            (size_t(chains[c]->channels) *
+                             size_t(chains[c]->bytes_per_channel)));
         }
     }
 
@@ -1523,7 +1528,7 @@ int main() {
     bool show_patches = false;
     int debug_view = 0;
     const char* chain_env = getenv("ATLAS_CHAIN");
-    int atlas_chain = chain_env ? atoi(chain_env) : 0;   // 0 = UV, 1 = thickness, 2 = depth
+    int atlas_chain = chain_env ? atoi(chain_env) : 0;   // 0 = UV, 1 = thickness, 2 = depth, 3 = normal
     float density_scale = 1.0f;
     float base_density = atlas.config().texel_density;
 
@@ -1740,13 +1745,17 @@ int main() {
             loc = r_loc("u_level_off");  if (loc >= 0) glUniform1iv(loc, 32, atlas_view.level_off);
             loc = r_loc("u_value_off_depth");  if (loc >= 0) glUniform1iv(loc, 32, atlas_view.value_off[2]);
             loc = r_loc("u_value_off_thick");  if (loc >= 0) glUniform1iv(loc, 32, atlas_view.value_off[1]);
+            loc = r_loc("u_value_off_normal"); if (loc >= 0) glUniform1iv(loc, 32, atlas_view.value_off[3]);
             loc = r_loc("u_depth_tex");  if (loc >= 0) ray_prog.uniform1i(loc, 0);
             loc = r_loc("u_thick_tex");  if (loc >= 0) ray_prog.uniform1i(loc, 1);
+            loc = r_loc("u_normal_tex"); if (loc >= 0) ray_prog.uniform1i(loc, 2);
 
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, atlas_view.value_tex[2]);
             glActiveTexture(GL_TEXTURE1);
             glBindTexture(GL_TEXTURE_2D, atlas_view.value_tex[1]);
+            glActiveTexture(GL_TEXTURE2);
+            glBindTexture(GL_TEXTURE_2D, atlas_view.value_tex[3]);
 
             glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, atlas_view.rects_ssbo);
             glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, atlas_view.meta_ssbo);
@@ -1788,8 +1797,8 @@ int main() {
             glBindBuffer(GL_SHADER_STORAGE_BUFFER, ray_pass.bvh_ssbo);
             glGetBufferParameteri64v(GL_SHADER_STORAGE_BUFFER, GL_BUFFER_SIZE, &sz3);
             glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
-            printf("CHECK: u_patch_count=%d u_res=%d,%d rects_ssbo=%lld bvh_ssbo=%lld\n",
-                   upc, ures[0], ures[1], (long long)sz0, (long long)sz3);
+            //printf("CHECK: u_patch_count=%d u_res=%d,%d rects_ssbo=%lld bvh_ssbo=%lld\n",
+            //       upc, ures[0], ures[1], (long long)sz0, (long long)sz3);
 
             if (getenv("RAYDUMP") && frame <= 2) {
                 char path[128];
@@ -2005,7 +2014,7 @@ int main() {
                 printf("LEVELOFF:");
                 for (int L = 0; L < atlas_view.level_count && L < 32; ++L) printf(" %d", atlas_view.level_off[L]);
                 printf("\n");
-                for (int c = 0; c < 3; ++c) {
+                for (int c = 0; c < 4; ++c) {
                     printf("VALUEOFF %d:", c);
                     for (int L = 0; L < atlas_view.level_count && L < 32; ++L) printf(" %d", atlas_view.value_off[c][L]);
                     printf("\n");
@@ -2139,7 +2148,7 @@ int main() {
 
             ImGui::Text("Coverage atlas: %dx%d @ %.0f texels/unit",
                         atlas.atlas_width(), atlas.atlas_height(), atlas.final_density());
-            ImGui::Combo("Atlas texture", &atlas_chain, "UV\0Thickness\0Depth\0");
+            ImGui::Combo("Atlas texture", &atlas_chain, "UV\0Thickness\0Depth\0Normal\0");
             ImGui::SliderFloat("Resolution scale", &density_scale, 0.25f, 4.0f, "%.2fx");
             if (ImGui::Button("Recompute atlas")) {
                 gfx::CoverageAtlasConfig cfg = atlas.config();
