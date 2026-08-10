@@ -27,6 +27,8 @@ struct CoverageAtlasConfig {
     int   min_patch_size  = 200;     // merge pass target: absorb patches below this
     float epsilon         = 0.001f;  // occlusion test depth tolerance
     float axis_threshold  = 0.5f;    // min |dot(normal, axis)| for merge candidates
+    float normal_crease_angle = 30.0f;  // hard-edge threshold (degrees); edges
+                                        // softer than this are smoothed, 0 = flat
     bool  rotate_model_x  = true;    // rotate scene 90° about X (glTF Y-up -> upright)
 };
 

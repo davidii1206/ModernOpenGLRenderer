@@ -223,9 +223,8 @@ float decode_value(float b, float lo, float hi, int bits) {
 vec3 octahedral_decode(vec2 f) {
     vec3 n = vec3(f.x, f.y, 1.0 - abs(f.x) - abs(f.y));
     if (n.z < 0.0) {
-        float t = -n.z;
-        n.x += (f.x >= 0.0 ? 1.0 : -1.0) * t;
-        n.y += (f.y >= 0.0 ? 1.0 : -1.0) * t;
+        n.x = (1.0 - abs(f.y)) * (f.x >= 0.0 ? 1.0 : -1.0);
+        n.y = (1.0 - abs(f.x)) * (f.y >= 0.0 ? 1.0 : -1.0);
     }
     return normalize(n);
 }
@@ -362,9 +361,8 @@ float decode_value(float b, float lo, float hi, int bits) {
 vec3 octahedral_decode(vec2 f) {
     vec3 n = vec3(f.x, f.y, 1.0 - abs(f.x) - abs(f.y));
     if (n.z < 0.0) {
-        float t = -n.z;
-        n.x += (f.x >= 0.0 ? 1.0 : -1.0) * t;
-        n.y += (f.y >= 0.0 ? 1.0 : -1.0) * t;
+        n.x = (1.0 - abs(f.y)) * (f.x >= 0.0 ? 1.0 : -1.0);
+        n.y = (1.0 - abs(f.x)) * (f.y >= 0.0 ? 1.0 : -1.0);
     }
     return normalize(n);
 }
@@ -823,10 +821,11 @@ void main() {
     vec2 oct = vec2(decode_value(qn.x, -1.0, 1.0, 8),
                     decode_value(qn.y, -1.0, 1.0, 8));
     vec3 n = octahedral_decode(oct);
-    // Single-sided patches already cull their back face earlier, so the baked
-    // normal always faces the viewer. Only double-sided patches have a genuine
-    // ambiguity between the two sides of the surface.
-    if (pi.double_sided != 0u && dot(n, rd) > 0.0) n = -n;
+    // Keep the baked normal facing the ray. Double-sided patches are genuinely
+    // ambiguous (backfaces mirror the normal); single-sided patches already
+    // cull the back face, but the flip is a free safety net against the normal
+    // inaccuracies the rasteriser can introduce at silhouette edges.
+    if (dot(n, rd) > 0.0) n = -n;
 
     if (u_dbg == 9) {
         imageStore(u_out, p, vec4(float(best_x0) / 512.0,

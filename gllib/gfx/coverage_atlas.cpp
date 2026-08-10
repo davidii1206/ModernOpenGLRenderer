@@ -38,6 +38,7 @@ constexpr int   BVH_MAX_LEAF       = 1;
 constexpr int   MIP_MAX_LEVELS = 12;
 constexpr int   MIP_MAX_TEXW   = 16384;    // max level texture width
 constexpr uint32_t MIP_LEAF    = 0xFFFFFFFFu;
+constexpr float PI             = 3.14159265358979f;
 
 const Vec3 axis_dirs[6] = {
     {1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1},
@@ -79,6 +80,17 @@ static Vec2 octahedral_encode(Vec3 n) {
                 (1.0f - std::abs(n.x)) * (n.y >= 0.0f ? 1.0f : -1.0f)};
     }
     return {n.x, n.y};
+}
+// Exact inverse of octahedral_encode: folds the z<0 diamond of the normal
+// octahedron back out. Both shader decoders in examples/32_mdc_lighting use
+// this same formula.
+static Vec3 octahedral_decode(Vec2 f) {
+    Vec3 n{f.x, f.y, 1.0f - std::abs(f.x) - std::abs(f.y)};
+    if (n.z < 0.0f) {
+        n.x = (1.0f - std::abs(f.y)) * (f.x >= 0.0f ? 1.0f : -1.0f);
+        n.y = (1.0f - std::abs(f.x)) * (f.y >= 0.0f ? 1.0f : -1.0f);
+    }
+    return safe_normalize(n);
 }
 // Depth is measured from the model's AABB minimum along the projection axis
 // (not from world-space origin), so the stored values are relative to the
@@ -1004,7 +1016,8 @@ static std::vector<BVHNode> build_bvh(const std::vector<Patch>& patches) {
 
 // Weld vertices by position. Triangle soup (e.g. Stanford_Bunny) shares zero
 // vertices, which makes index-based adjacency useless. Deduplicate positions so
-// edges match again. Normals at weld points are averaged; the first UV wins.
+// edges match again; the first UV and normal are kept (normals are recomputed
+// from geometry with a crease filter by recompute_crease_normals afterwards).
 static void weld_vertices(std::vector<Vec3>& positions, std::vector<Vec3>& normals,
                           std::vector<Vec2>& uvs, std::vector<unsigned int>& indices)
 {
@@ -1046,7 +1059,6 @@ static void weld_vertices(std::vector<Vec3>& positions, std::vector<Vec3>& norma
         auto it = weld.find(key);
         if (it != weld.end()) {
             remap[v] = it->second;
-            wnorm[it->second] += normals[v];
         } else {
             unsigned int idx = unsigned(wpos.size());
             weld[key] = idx;
@@ -1062,6 +1074,129 @@ static void weld_vertices(std::vector<Vec3>& positions, std::vector<Vec3>& norma
     positions = std::move(wpos);
     normals = std::move(wnorm);
     uvs = std::move(wuv);
+}
+
+// =========================================== crease-aware normals ===
+
+// Recompute per-corner normals from geometry with a crease-angle filter.
+// glTF assets frequently ship welded, slightly-slanted normals that bake into
+// visible gradients across flat faces (e.g. the Cornell boxes). Recomputing
+// from the triangles gives every flat face exactly its face normal while still
+// smoothing organic surfaces (adjacent faces within `crease_cos` average in).
+//
+// Corners that share a position AND an agreeing normal are welded back into a
+// single vertex; corners on opposite sides of a crease stay split and get their
+// own normal, so a hard edge is truly flat. Run after weld_vertices so triangle
+// soup gains the shared vertices needed for index-based adjacency.
+static void recompute_crease_normals(std::vector<Vec3>& positions,
+                                     std::vector<Vec3>& normals,
+                                     std::vector<Vec2>& uvs,
+                                     std::vector<unsigned int>& indices,
+                                     float crease_cos)
+{
+    const size_t ntri = indices.size() / 3;
+    std::vector<Vec3> face_normals(ntri);
+    for (size_t t = 0; t < ntri; ++t) {
+        Vec3 p0 = positions[indices[t * 3 + 0]];
+        Vec3 p1 = positions[indices[t * 3 + 1]];
+        Vec3 p2 = positions[indices[t * 3 + 2]];
+        face_normals[t] = safe_normalize(glm::cross(p1 - p0, p2 - p0));
+    }
+
+    // Incident faces per vertex (triangle indices).
+    std::vector<std::vector<size_t>> incident(positions.size());
+    for (size_t t = 0; t < ntri; ++t)
+        for (int e = 0; e < 3; ++e)
+            incident[indices[t * 3 + e]].push_back(t);
+
+    // Per-corner normal: mean of the normals of the faces incident to that
+    // vertex that lie within the crease angle of the corner's own face.
+    std::vector<Vec3> corner_normal(ntri * 3);
+    for (size_t t = 0; t < ntri; ++t) {
+        const Vec3& fn = face_normals[t];
+        for (int e = 0; e < 3; ++e) {
+            Vec3 sum{0.0f, 0.0f, 0.0f};
+            for (size_t f : incident[indices[t * 3 + e]])
+                if (glm::dot(face_normals[f], fn) >= crease_cos) sum += face_normals[f];
+            corner_normal[t * 3 + e] = safe_normalize(sum);
+        }
+    }
+
+    // Rebuild the vertex buffers, welding corners that share a position AND an
+    // agreeing normal. Positions are quantised like weld_vertices (they are
+    // already identical after welding); normals are quantised coarsely so that
+    // corners within the crease angle share one vertex.
+    struct CrKey {
+        int64_t q[3], n[3];
+        bool operator==(const CrKey& o) const {
+            return q[0]==o.q[0] && q[1]==o.q[1] && q[2]==o.q[2] &&
+                   n[0]==o.n[0] && n[1]==o.n[1] && n[2]==o.n[2];
+        }
+    };
+    struct CrHash {
+        size_t operator()(const CrKey& k) const {
+            size_t h = std::hash<int64_t>()(k.q[0]);
+            h ^= std::hash<int64_t>()(k.q[1]) * 0x9E3779B97F4A7C15ull;
+            h ^= std::hash<int64_t>()(k.q[2]) * 0xBF58476D1CE4E5B9ull;
+            h ^= std::hash<int64_t>()(k.n[0]) * 0x94D049BB133111EBull;
+            h ^= std::hash<int64_t>()(k.n[1]) * 0x100000001B3ull;
+            h ^= std::hash<int64_t>()(k.n[2]) << 1;
+            return h;
+        }
+    };
+
+    AABB bb;
+    for (auto& p : positions) grow(bb, p);
+    Vec3 ext = extent(bb);
+    float max_span = std::max({ext.x, ext.y, ext.z});
+    float weld_eps = std::max(max_span * 1e-7f, 1e-9f);
+    auto qpos = [&](Vec3 p) {
+        return std::array<int64_t, 3>{std::llround(p.x / weld_eps),
+                                      std::llround(p.y / weld_eps),
+                                      std::llround(p.z / weld_eps)};
+    };
+    auto qn = [](Vec3 n) {
+        return std::array<int64_t, 3>{std::llround(n.x * 511.0),
+                                      std::llround(n.y * 511.0),
+                                      std::llround(n.z * 511.0)};
+    };
+
+    std::unordered_map<CrKey, unsigned int, CrHash> corner_map;
+    corner_map.reserve(positions.size() * 2);
+    std::vector<Vec3> npos, nnorm;
+    std::vector<Vec2> nuv;
+    npos.reserve(positions.size());
+    nnorm.reserve(positions.size());
+    nuv.reserve(positions.size());
+
+    for (size_t t = 0; t < ntri; ++t) {
+        for (int e = 0; e < 3; ++e) {
+            size_t c = t * 3 + e;
+            unsigned int src = indices[c];
+            const Vec3& n = corner_normal[c];
+            CrKey key{};
+            auto pq = qpos(positions[src]);
+            auto nq = qn(n);
+            for (int i = 0; i < 3; ++i) { key.q[i] = pq[i]; key.n[i] = nq[i]; }
+            auto it = corner_map.find(key);
+            if (it != corner_map.end()) {
+                indices[c] = it->second;
+            } else {
+                unsigned int ni = unsigned(npos.size());
+                corner_map[key] = ni;
+                indices[c] = ni;
+                npos.push_back(positions[src]);
+                nnorm.push_back(n);
+                nuv.push_back(uvs[src]);
+            }
+        }
+    }
+    positions = std::move(npos);
+    normals = std::move(nnorm);
+    uvs = std::move(nuv);
+    printf("  Crease-filtered normals (%.0f°): %zu vertices\n",
+           std::acos(std::clamp(crease_cos, -1.0f, 1.0f)) * 180.0f / PI,
+           positions.size());
 }
 
 // =========================================== atlas rasterisation (§8) ==
@@ -1317,7 +1452,9 @@ struct MipCell {                      // aggregated value of one quadtree node
     float umin = 1e30f, umax = -1e30f;
     float vmin = 1e30f, vmax = -1e30f;
     float uavg = 0.0f, vavg = 0.0f;
-    float nxavg = 0.0f, nyavg = 0.0f;  // octahedral-encoded baked normal (average)
+    Vec3  nsum{0.0f, 0.0f, 0.0f};  // sum of 3D baked normals (decode + average in 3D,
+                                   // re-encode only at emit — averaging octahedral
+                                   // coords directly is wrong across the z<0 fold)
     int   count = 0;
 };
 
@@ -1390,8 +1527,8 @@ static PatchPyramid build_patch_pyramid(
                     c.vmax = std::max(c.vmax, vv);
                     c.uavg += uu;
                     c.vavg += vv;
-                    c.nxavg += atlas_normal[idx * 2];
-                    c.nyavg += atlas_normal[idx * 2 + 1];
+                    c.nsum += octahedral_decode({atlas_normal[idx * 2],
+                                                 atlas_normal[idx * 2 + 1]});
                     c.count++;
                 }
             }
@@ -1419,11 +1556,11 @@ static PatchPyramid build_patch_pyramid(
                         c.vmax = std::max(c.vmax, s.vmax);
                         c.uavg += s.uavg;
                         c.vavg += s.vavg;
-                        c.nxavg += s.nxavg;
-                        c.nyavg += s.nyavg;
+                        c.nsum += s.nsum;
                     }
                 }
-                if (c.count) { c.uavg /= float(c.count); c.vavg /= float(c.count); }
+                // Keep raw sums (not means) at every level; mip_values divides
+                // by the texel count so multi-texel nodes average correctly.
                 pyr.levels[k + 1][size_t(j) * wn + i] = c;
             }
         }
@@ -1508,8 +1645,14 @@ static std::array<float, 2> mip_values(MipChanType t, const MipCell& c) {
         case MIP_THICK: return {c.thmax, 0.0f};
         case MIP_UV:    return {c.count ? c.uavg / float(c.count) : 0.0f,
                                 c.count ? c.vavg / float(c.count) : 0.0f};
-        case MIP_NORMAL: return {c.count ? c.nxavg / float(c.count) : 0.0f,
-                                c.count ? c.nyavg / float(c.count) : 0.0f};
+        case MIP_NORMAL: {
+            // Average the 3D normals, then re-encode at emit time so nodes that
+            // straddle the octahedral z<0 fold average correctly.
+            if (c.count <= 0) return {0.0f, 0.0f};
+            Vec3 avg = safe_normalize(c.nsum * (1.0f / float(c.count)));
+            Vec2 oct = octahedral_encode(avg);
+            return {oct.x, oct.y};
+        }
     }
     return {0, 0};
 }
@@ -1790,12 +1933,13 @@ static bool write_atlas_state(const char* path,
     FILE* f = fopen(path, "wb");
     if (!f) { fprintf(stderr, "Cannot write %s\n", path); return false; }
     write_u32(f, 0x41544C53u);       // "ATLS"
-    write_u32(f, 2u);                // version (2 adds per-chain bytes_per_channel + normal chain)
+    write_u32(f, 3u);                // version (3 adds normal_crease_angle)
     write_f32(f, cfg.texel_density); write_i32(f, cfg.auto_target);
     write_f32(f, cfg.budget_texels); write_i32(f, cfg.min_tex); write_i32(f, cfg.max_tex);
     write_f32(f, cfg.mip_tol_frac);  write_i32(f, cfg.mip_leaf_tile);
     write_i32(f, cfg.min_patch_size); write_f32(f, cfg.epsilon);
-    write_f32(f, cfg.axis_threshold); write_u32(f, cfg.rotate_model_x ? 1u : 0u);
+    write_f32(f, cfg.axis_threshold); write_f32(f, cfg.normal_crease_angle);
+    write_u32(f, cfg.rotate_model_x ? 1u : 0u);
     write_i32(f, atlas_w); write_i32(f, atlas_h);
     write_f32(f, density);
 
@@ -1872,14 +2016,15 @@ static bool read_atlas_state(const char* path,
     if (!f) return false;
     uint32_t magic = 0, version = 0;
     if (!read_u32(f, magic) || magic != 0x41544C53u) { fclose(f); return false; }
-    if (!read_u32(f, version) || version != 2u) { fclose(f); return false; }
+    if (!read_u32(f, version) || version != 3u) { fclose(f); return false; }
 
     auto read_cfg = [&]() -> bool {
         return read_f32(f, cfg.texel_density) && read_i32(f, cfg.auto_target) &&
                read_f32(f, cfg.budget_texels) && read_i32(f, cfg.min_tex) &&
                read_i32(f, cfg.max_tex) && read_f32(f, cfg.mip_tol_frac) &&
                read_i32(f, cfg.mip_leaf_tile) && read_i32(f, cfg.min_patch_size) &&
-               read_f32(f, cfg.epsilon) && read_f32(f, cfg.axis_threshold);
+               read_f32(f, cfg.epsilon) && read_f32(f, cfg.axis_threshold) &&
+               read_f32(f, cfg.normal_crease_angle);
     };
     uint32_t rot = 0;
     if (!read_cfg() || !read_u32(f, rot)) { fclose(f); return false; }
@@ -2077,23 +2222,12 @@ bool CoverageAtlas::build(const gfx::Model& model) {
             for (auto& n : lnorm) { float y = n.y, z = n.z; n.y = -z; n.z = y; }
         }
 
-        // Vertex normals may be absent — compute face normals if so.
-        bool has_normals = false;
-        for (auto& n : lnorm)
-            if (glm::dot(n, n) > 1e-10f) { has_normals = true; break; }
-        if (!has_normals) {
-            printf("  No vertex normals — computing face normals\n");
-            for (size_t i = 0; i < lindices.size() / 3; ++i) {
-                Vec3 p0 = lpos[lindices[i*3+0]];
-                Vec3 p1 = lpos[lindices[i*3+1]];
-                Vec3 p2 = lpos[lindices[i*3+2]];
-                Vec3 fn = safe_normalize(glm::cross(p1-p0, p2-p0));
-                lnorm[lindices[i*3+0]] += fn;
-                lnorm[lindices[i*3+1]] += fn;
-                lnorm[lindices[i*3+2]] += fn;
-            }
-            for (auto& n : lnorm) n = safe_normalize(n);
-        }
+        // Recompute normals from geometry with a crease-angle filter. Authored
+        // normals are deliberately ignored: welded glTF normals can be slightly
+        // slanted (the Cornell boxes bake into gradients), while recomputing
+        // with a crease threshold keeps flat faces flat and smooths the rest.
+        float crease_cos = std::cos(config_.normal_crease_angle * PI / 180.0f);
+        recompute_crease_normals(lpos, lnorm, luv, lindices, crease_cos);
 
         // Local triangle data (indices into lpos).
         size_t ltris_count = lindices.size() / 3;
