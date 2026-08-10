@@ -609,10 +609,14 @@ void main() {
                 // A ray that enters the leaf already inside the band (a head-on
                 // ray hits the AABB front face right where the surface sits) never
                 // produces a "before -> in-band" crossing, so accept it directly.
-                // The band is the leaf's own depth extent [dm, dmax]; using a
-                // coarse thickness would over-fill the cell with empty space for
-                // slanted faces whose per-texel depth span spans the whole patch.
-                if (inside && D >= dm - htol && D <= dmax + htol) {
+                // The band is the leaf's own depth extent [dm, dmax], capped by
+                // the per-texel thickness. A node that stopped subdividing as
+                // "flat enough" spans a merged region whose dmax can reach far
+                // past the local surface (exactly at a cube edge), letting a ray
+                // register "inside the band" all the way toward the back face;
+                // the thickness cap keeps the band tight to the local surface.
+                float band_hi = inside ? min(dmax, dm + thk) : 0.0;
+                if (inside && D >= dm - htol && D <= band_hi + htol) {
                     best_t = t;
                     best_pid = pid;
                     best_L = L; best_idx = idx;
@@ -621,8 +625,8 @@ void main() {
                     break;
                 }
                 // "before" = the ray's depth is still above the surface band
-                // (D > dmax), i.e. it has not reached the surface yet.
-                bool cur_before = !inside || (D > dmax + htol);
+                // (D > band_hi), i.e. it has not reached the surface yet.
+                bool cur_before = !inside || (D > band_hi + htol);
 
                 // The band crossing happened between the previous and current
                 // sample. Detect it in either direction (front or back face).
@@ -665,7 +669,8 @@ void main() {
                         if (!query_node(txy_f, pid, Lf, idxf, x0f, y0f, sf, dmf, dmxf, thkf)) { if (!dbg_captured) { dbg_captured = true; dbg_reject = 5; miss_nrm_f = nrm_f; miss_L = Lf; } }
                         else {
                             float D_f = dot(ro + rd * th - u_depth_origin, pi.basis_u);
-                            if (D_f < dmf - htol || D_f > dmxf + htol) { if (!dbg_captured) { dbg_captured = true; dbg_reject = 3; miss_nrm_f = nrm_f; miss_L = Lf; } }
+                            float band_hi_f = min(dmxf, dmf + thkf);
+                            if (D_f < dmf - htol || D_f > band_hi_f + htol) { if (!dbg_captured) { dbg_captured = true; dbg_reject = 3; miss_nrm_f = nrm_f; miss_L = Lf; } }
                             else if (th < best_t) {
                                 best_t = th;
                                 best_pid = pid;
@@ -821,10 +826,18 @@ void main() {
     }
 
     vec3 n = pi.basis_u;
+    // Bound the gradient so a noisy neighbour sample cannot rotate the normal
+    // past 90 degrees from the patch axis (which would mirror a bad normal
+    // into another bad one, and make it viewer-dependent).
+    du = clamp(du, -1.0, 1.0);
+    dv = clamp(dv, -1.0, 1.0);
     n -= du * pi.basis_v;
     n -= dv * pi.basis_w;
     n = normalize(n);
-    if (dot(n, rd) > 0.0) n = -n;
+    // Single-sided patches already cull their back face earlier, so a correct
+    // reconstruction always faces the viewer; force-flipping here would mirror
+    // gradient noise. Only double-sided patches have a genuine ambiguity.
+    if (pi.double_sided != 0u && dot(n, rd) > 0.0) n = -n;
 
     if (u_dbg == 9) {
         imageStore(u_out, p, vec4(float(best_x0) / 512.0,
@@ -1306,18 +1319,51 @@ static bool load_scene(const ModelEntry& entry, gfx::Model& model, SceneState& s
                 entry.name, model.mesh_count(), model.material_count(),
                 model.texture_count(), model.lod_group_count());
 
-    if (!st.atlas.load_files(entry.cache_dir) ||
-        st.atlas.config().mip_leaf_tile != kShaderLeafTile) {
-        if (st.atlas.config().mip_leaf_tile != kShaderLeafTile) {
+    // Per-model texel density: scale to the model's own size so every model
+    // (big or small) lands on a comparable absolute resolution. A fixed
+    // per-unit density leaves a small object (e.g. the bunny) with sub-texel
+    // triangles, whose rasterisation never marks a texel "covered" — then
+    // query_node reports a miss and the ray pass shows a literal gap. The
+    // extent comes from the same LOD0 mesh list the atlas build uses (the
+    // rotate_model_x rotation is isometric and does not change the span).
+    float want_density = 0.0f;
+    {
+        std::vector<int> use = lod0_mesh_list(model);
+        glm::vec3 lo(1e30f), hi(-1e30f);
+        for (int mi : use) {
+            const auto& mesh = model.mesh(size_t(mi));
+            for (size_t v = 0; v < mesh.vertex_count(); ++v) {
+                const float* pos = mesh.vertices()[v].position;
+                glm::vec3 p(pos[0], pos[1], pos[2]);
+                lo = glm::min(lo, p);
+                hi = glm::max(hi, p);
+            }
+        }
+        float span = std::max({hi.x - lo.x, hi.y - lo.y, hi.z - lo.z});
+        if (span > 1e-6f)
+            want_density = float(st.atlas.config().auto_target) / span;
+    }
+
+    bool loaded = st.atlas.load_files(entry.cache_dir);
+    bool leaf_ok = st.atlas.config().mip_leaf_tile == kShaderLeafTile;
+    bool density_ok = want_density <= 0.0f ||
+                      std::fabs(st.atlas.config().texel_density - want_density) < 1e-3f;
+    if (!loaded || !leaf_ok || !density_ok) {
+        if (!loaded) {
+            std::printf("No cached MDC snapshot for %s — building atlas...\n", entry.name);
+        } else if (!leaf_ok) {
             std::printf("Cached MDC snapshot for %s uses leaf_tile=%d but the "
                         "shader needs %d — rebuilding...\n", entry.name,
                         st.atlas.config().mip_leaf_tile, kShaderLeafTile);
-            gfx::CoverageAtlasConfig cfg = st.atlas.config();
-            cfg.mip_leaf_tile = kShaderLeafTile;
-            st.atlas.set_config(cfg);
         } else {
-            std::printf("No cached MDC snapshot for %s — building atlas...\n", entry.name);
+            std::printf("Cached MDC snapshot for %s was built at %.0f texels/unit "
+                        "but the model needs %.0f — rebuilding...\n", entry.name,
+                        st.atlas.config().texel_density, want_density);
         }
+        gfx::CoverageAtlasConfig cfg = st.atlas.config();
+        if (!leaf_ok) cfg.mip_leaf_tile = kShaderLeafTile;
+        if (want_density > 0.0f) cfg.texel_density = want_density;
+        st.atlas.set_config(cfg);
         if (!st.atlas.build(model)) {
             std::fprintf(stderr, "CoverageAtlas build failed\n");
             return false;
@@ -2110,7 +2156,9 @@ int main() {
                     for (const auto& v : atlas.positions())
                         ray_depth_origin = glm::min(ray_depth_origin, v);
                     atlas.write_files(kModels[cur_model].cache_dir);
-                    base_density = atlas.config().texel_density;
+                    // base_density stays the per-model auto density so the
+                    // resolution slider keeps scaling relative to it instead of
+                    // compounding on every recompute.
                     pick = RayHit{};
                     std::printf("Rebuilt atlas: %dx%d @ %.0f texels/unit, %zu patches\n",
                                 atlas.atlas_width(), atlas.atlas_height(),
