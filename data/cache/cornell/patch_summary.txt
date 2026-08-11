@@ -1,0 +1,35 @@
+patches 16
+triangles 32
+assigned 32
+atlas 4041 2028
+density 504.43
+bvh_nodes 31
+mip_levels 11
+mip_nodes 2899816
+mip_level 0 nodes 16 tex 16x1
+mip_level 1 nodes 64 tex 64x1
+mip_level 2 nodes 224 tex 224x1
+mip_level 3 nodes 680 tex 680x1
+mip_level 4 nodes 2368 tex 2368x1
+mip_level 5 nodes 9056 tex 9056x1
+mip_level 6 nodes 32320 tex 16384x2
+mip_level 7 nodes 116104 tex 16384x8
+mip_level 8 nodes 203368 tex 16384x13
+mip_level 9 nodes 796032 tex 16384x49
+mip_level 10 nodes 1739584 tex 16384x107
+patch 0 axis +Y tris 2 tex 1014x1024 atlas (0,0) double_sided 1
+patch 1 axis -Y tris 2 tex 1019x1024 atlas (1014,0) double_sided 1
+patch 3 axis -X tris 2 tex 1004x1024 atlas (2033,0) double_sided 1
+patch 4 axis +X tris 2 tex 1004x1024 atlas (3037,0) double_sided 1
+patch 2 axis +Z tris 2 tex 1019x1004 atlas (0,1024) double_sided 1
+patch 11 axis -X tris 2 tex 606x293 atlas (1019,1024) double_sided 1
+patch 12 axis +X tris 2 tex 606x293 atlas (1625,1024) double_sided 1
+patch 13 axis -Z tris 2 tex 288x606 atlas (2231,1024) double_sided 1
+patch 14 axis +Z tris 2 tex 288x606 atlas (2519,1024) double_sided 1
+patch 10 axis +Y tris 2 tex 379x384 atlas (2807,1024) double_sided 1
+patch 5 axis +Y tris 2 tex 379x379 atlas (3186,1024) double_sided 1
+patch 6 axis +X tris 2 tex 303x293 atlas (3565,1024) double_sided 1
+patch 7 axis -Z tris 2 tex 288x303 atlas (1019,1317) double_sided 1
+patch 8 axis +Z tris 2 tex 293x303 atlas (1307,1317) double_sided 1
+patch 9 axis -X tris 2 tex 303x288 atlas (1600,1317) double_sided 1
+patch 15 axis -Y tris 2 tex 238x192 atlas (1903,1317) double_sided 1

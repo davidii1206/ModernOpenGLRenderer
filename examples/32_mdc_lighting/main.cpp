@@ -616,7 +616,10 @@ void main() {
             float t_prev = tin;
             bool prev_before = false;   // previous sample still in front of the band
             int guard = 0;
-            while (t <= tout && guard < 2048) {
+            // Sample the slab from tin to tout inclusive: the final sample always
+            // lands exactly on the far face, so a surface band sitting at the
+            // AABB exit cannot be skipped by the [t, t+step] marching gap.
+            while (guard < 2048 && t <= tout) {
                 guard++;
                 vec3 P = ro + rd * t;
                 vec2 proj = vec2(dot(P, pi.basis_v), dot(P, pi.basis_w));
@@ -697,7 +700,14 @@ void main() {
                         else {
                             float D_f = dot(ro + rd * th - u_depth_origin, pi.basis_u);
                             float band_hi_f = min(dmxf, dmf + thkf);
-                            if (D_f < dmf - htol || D_f > band_hi_f + htol) { if (!dbg_captured) { dbg_captured = true; dbg_reject = 3; miss_nrm_f = nrm_f; miss_L = Lf; } }
+                            // The band crossing was already detected (prev_before !=
+                            // cur_before); the per-texel depth is quantized, so the
+                            // refined depth can sit a fraction of a march step off
+                            // the local texel's band at texel boundaries on slanted
+                            // patches. Accept within that slack, culling only hits
+                            // that are grossly off the surface band.
+                            float slack = max(htol, 2.0 * abs(dD) * step);
+                            if (D_f < dmf - htol - slack || D_f > band_hi_f + htol + slack) { if (!dbg_captured) { dbg_captured = true; dbg_reject = 3; miss_nrm_f = nrm_f; miss_L = Lf; } }
                             else if (th < best_t) {
                                 best_t = th;
                                 best_pid = pid;
@@ -712,7 +722,9 @@ void main() {
                 prev_before = cur_before;
                 have_prev = true;
                 if (t > best_t) break;
+                if (t >= tout) break;      // the slab exit was just sampled
                 t += step;
+                if (t > tout) t = tout;    // land the final sample on the exit
             }
         } else {
             dbg_pushed = true;
