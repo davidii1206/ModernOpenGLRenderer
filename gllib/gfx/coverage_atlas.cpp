@@ -1349,8 +1349,29 @@ static void rasterize_atlas_textures(
                         float w0=e1*inv;
                         float w1=1.0f-w0-w2;
                         size_t idx=size_t(py)*atlas_w+px;
-                        float depth=w0*gd[0]+w1*gd[1]+w2*gd[2];
-                        if(atlas_depth[idx] <= -1e20f || depth < atlas_depth[idx]) atlas_depth[idx]=depth;
+                        // Conservative front depth: sample the triangle's depth at
+                        // the texel's corners plus centre (the same footprint the
+                        // thickness pass uses) and keep the minimum. A plain centre
+                        // sample sits in the middle of the per-texel depth range,
+                        // so the ray band [dm, dm+thk] would start a half-thickness
+                        // too deep and let rays tunnel through the near half of
+                        // every slanted texel (the periodic moiré on diagonal
+                        // faces). With dm = footprint minimum the band covers the
+                        // true surface range [ldmin, ldmax] exactly.
+                        const float sxp[5]={float(px)+0.5f,float(px),float(px+1),float(px+1),float(px)};
+                        const float syp[5]={float(py)+0.5f,float(py),float(py),float(py+1),float(py+1)};
+                        float ldmin=1e30f;
+                        for(int c=0;c<5;++c){
+                            float ce0=(fx1-fx0)*(syp[c]-fy0)-(sxp[c]-fx0)*(fy1-fy0);
+                            float ce1=(fx2-fx1)*(syp[c]-fy1)-(sxp[c]-fx1)*(fy2-fy1);
+                            float ce2=(fx0-fx2)*(syp[c]-fy2)-(sxp[c]-fx2)*(fy0-fy2);
+                            bool cinside = cw ? (ce0<=1e-6f&&ce1<=1e-6f&&ce2<=1e-6f)
+                                              : (ce0>=-1e-6f&&ce1>=-1e-6f&&ce2>=-1e-6f);
+                            if(!cinside) continue;
+                            float cw2=ce0*inv, cw0=ce1*inv, cw1=1.0f-cw0-cw2;
+                            ldmin=std::min(ldmin, cw0*gd[0]+cw1*gd[1]+cw2*gd[2]);
+                        }
+                        if(atlas_depth[idx] <= -1e20f || ldmin < atlas_depth[idx]) atlas_depth[idx]=ldmin;
                         atlas_uv[idx*2+0]=w0*guv[0].x+w1*guv[1].x+w2*guv[2].x;
                         atlas_uv[idx*2+1]=w0*guv[0].y+w1*guv[1].y+w2*guv[2].y;
                         // Bake the interpolated (smooth-shaded) vertex normal once,
@@ -1517,8 +1538,14 @@ static PatchPyramid build_patch_pyramid(
                     size_t idx = size_t(ay + v) * atlas_w + (ax + u);
                     float d = atlas_depth[idx];
                     if (d <= -1e20f) continue;
+                    // atlas_depth holds the texel's front (footprint-minimum)
+                    // depth; its back edge is front + thickness. The ray band is
+                    // [dmin, min(dmax, dmin + thk)], so dmax must be the true
+                    // back edge of the surface within the node — using the front
+                    // again would collapse the band to a thin sheet and let rays
+                    // tunnel through slanted texels.
                     c.dmin = std::min(c.dmin, d);
-                    c.dmax = std::max(c.dmax, d);
+                    c.dmax = std::max(c.dmax, d + atlas_thickness[idx]);
                     c.thmax = std::max(c.thmax, atlas_thickness[idx]);
                     float uu = atlas_uv[idx * 2], vv = atlas_uv[idx * 2 + 1];
                     c.umin = std::min(c.umin, uu);
@@ -1727,7 +1754,10 @@ static void build_mip_chains(
     for (size_t i = 0; i < n; ++i) {
         float d = atlas_depth[i];
         if (d <= -1e20f) continue;
-        gdmin = std::min(gdmin, d); gdmax = std::max(gdmax, d);
+        // atlas_depth is the per-texel front depth; the depth chain also stores
+        // dmax (the node's back edge), so the quantisation range must span the
+        // back edges (front + thickness), not just the fronts.
+        gdmin = std::min(gdmin, d); gdmax = std::max(gdmax, d + atlas_thickness[i]);
         gthmax = std::max(gthmax, atlas_thickness[i]);
         float u = atlas_uv[i * 2], v = atlas_uv[i * 2 + 1];
         gumin = std::min(gumin, u); gumax = std::max(gumax, u);
