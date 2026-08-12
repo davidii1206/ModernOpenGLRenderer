@@ -304,7 +304,7 @@ layout(local_size_x = 16, local_size_y = 16) in;
 
 const int LEAF_TILE = 1;
 const int MAX_STACK = 32;
-const int MAX_MIP = 16;
+const int MAX_MIP = 12;
 const int SAMPLES = 8;
 
 struct PatchInfo {
