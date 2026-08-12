@@ -1328,60 +1328,87 @@ static void rasterize_atlas_textures(
             }
             Vec2 av[3] = {to_atlas(gv[0]), to_atlas(gv[1]), to_atlas(gv[2])};
             float fx0=av[0].x,fy0=av[0].y,fx1=av[1].x,fy1=av[1].y,fx2=av[2].x,fy2=av[2].y;
-            int x0=std::max(ax,(int)std::floor(std::min({fx0,fx1,fx2})));
-            int x1=std::min(ax+tw-1,(int)std::ceil(std::max({fx0,fx1,fx2})));
-            int y0=std::max(ay,(int)std::floor(std::min({fy0,fy1,fy2})));
-            int y1=std::min(ay+th-1,(int)std::ceil(std::max({fy0,fy1,fy2})));
+            // Visit one texel beyond the vertex bbox so the conservative bias
+            // below can claim a texel whose square grazes the triangle.
+            int x0=std::max(ax,(int)std::floor(std::min({fx0,fx1,fx2}))-1);
+            int x1=std::min(ax+tw-1,(int)std::ceil(std::max({fx0,fx1,fx2}))+1);
+            int y0=std::max(ay,(int)std::floor(std::min({fy0,fy1,fy2}))-1);
+            int y1=std::min(ay+th-1,(int)std::ceil(std::max({fy0,fy1,fy2}))+1);
             float area2=(fx1-fx0)*(fy2-fy0)-(fx2-fx0)*(fy1-fy0);
             if(std::abs(area2)<1e-10f) continue;
             float inv=1.0f/area2;
             bool cw = area2 < 0.0f;
+            // Conservative coverage: over a texel square [px,px+1]x[py,py+1]
+            // an edge function e = A*x+B*y+C ranges e_center ± 0.5*(|A|+|B|),
+            // so the square intersects the triangle's half-plane iff the centre
+            // value is within that bias of the boundary. Claiming every texel
+            // that passes all three biased edge tests guarantees ANY texel whose
+            // footprint overlaps the triangle is covered. The earlier centre +
+            // 4-corner test still dropped thin slivers (a sub-texel triangle,
+            // or a boundary edge cutting a texel) whose overlap avoided all five
+            // sample points — visible as void speckles along patch borders at
+            // low texel densities.
+            float b0=0.5f*(std::abs(fx1-fx0)+std::abs(fy1-fy0));
+            float b1=0.5f*(std::abs(fx2-fx1)+std::abs(fy2-fy1));
+            float b2=0.5f*(std::abs(fx0-fx2)+std::abs(fy0-fy2));
             for(int py=y0;py<=y1;++py){
                 for(int px=x0;px<=x1;++px){
                     float ppx=float(px)+0.5f,ppy=float(py)+0.5f;
                     float e0=(fx1-fx0)*(ppy-fy0)-(ppx-fx0)*(fy1-fy0);
                     float e1=(fx2-fx1)*(ppy-fy1)-(ppx-fx1)*(fy2-fy1);
                     float e2=(fx0-fx2)*(ppy-fy2)-(ppx-fx2)*(fy0-fy2);
-                    bool inside = cw ? (e0<=1e-6f&&e1<=1e-6f&&e2<=1e-6f)
-                                     : (e0>=-1e-6f&&e1>=-1e-6f&&e2>=-1e-6f);
-                    if(inside){
-                        float w2=e0*inv;
-                        float w0=e1*inv;
-                        float w1=1.0f-w0-w2;
-                        size_t idx=size_t(py)*atlas_w+px;
-                        // Conservative front depth: sample the triangle's depth at
-                        // the texel's corners plus centre (the same footprint the
-                        // thickness pass uses) and keep the minimum. A plain centre
-                        // sample sits in the middle of the per-texel depth range,
-                        // so the ray band [dm, dm+thk] would start a half-thickness
-                        // too deep and let rays tunnel through the near half of
-                        // every slanted texel (the periodic moiré on diagonal
-                        // faces). With dm = footprint minimum the band covers the
-                        // true surface range [ldmin, ldmax] exactly.
-                        const float sxp[5]={float(px)+0.5f,float(px),float(px+1),float(px+1),float(px)};
-                        const float syp[5]={float(py)+0.5f,float(py),float(py),float(py+1),float(py+1)};
-                        float ldmin=1e30f;
-                        for(int c=0;c<5;++c){
-                            float ce0=(fx1-fx0)*(syp[c]-fy0)-(sxp[c]-fx0)*(fy1-fy0);
-                            float ce1=(fx2-fx1)*(syp[c]-fy1)-(sxp[c]-fx1)*(fy2-fy1);
-                            float ce2=(fx0-fx2)*(syp[c]-fy2)-(sxp[c]-fx2)*(fy0-fy2);
-                            bool cinside = cw ? (ce0<=1e-6f&&ce1<=1e-6f&&ce2<=1e-6f)
-                                              : (ce0>=-1e-6f&&ce1>=-1e-6f&&ce2>=-1e-6f);
-                            if(!cinside) continue;
-                            float cw2=ce0*inv, cw0=ce1*inv, cw1=1.0f-cw0-cw2;
-                            ldmin=std::min(ldmin, cw0*gd[0]+cw1*gd[1]+cw2*gd[2]);
-                        }
-                        if(atlas_depth[idx] <= -1e20f || ldmin < atlas_depth[idx]) atlas_depth[idx]=ldmin;
-                        atlas_uv[idx*2+0]=w0*guv[0].x+w1*guv[1].x+w2*guv[2].x;
-                        atlas_uv[idx*2+1]=w0*guv[0].y+w1*guv[1].y+w2*guv[2].y;
-                        // Bake the interpolated (smooth-shaded) vertex normal once,
-                        // octahedral-encoded, so the ray pass can fetch it instead of
-                        // reconstructing it at runtime from noisy depth gradients.
-                        Vec3 n = safe_normalize(w0*gn[0]+w1*gn[1]+w2*gn[2]);
-                        Vec2 oct = octahedral_encode(n);
-                        atlas_normal[idx*2+0]=oct.x;
-                        atlas_normal[idx*2+1]=oct.y;
+                    bool covered = cw ? (e0<=b0+1e-6f&&e1<=b1+1e-6f&&e2<=b2+1e-6f)
+                                      : (e0>=-b0-1e-6f&&e1>=-b1-1e-6f&&e2>=-b2-1e-6f);
+                    if(!covered) continue;
+
+                    // Conservative front depth: sample the triangle's depth at
+                    // the texel's corners plus centre (the same footprint the
+                    // thickness pass uses) and keep the minimum. A plain centre
+                    // sample sits in the middle of the per-texel depth range,
+                    // so the ray band [dm, dm+thk] would start a half-thickness
+                    // too deep and let rays tunnel through the near half of
+                    // every slanted texel (the periodic moiré on diagonal
+                    // faces). With dm = footprint minimum the band covers the
+                    // true surface range [ldmin, ldmax] exactly.
+                    const float sxp[5]={ppx,float(px),float(px+1),float(px+1),float(px)};
+                    const float syp[5]={ppy,float(py),float(py),float(py+1),float(py+1)};
+                    bool any_inside=false;
+                    float ldmin=1e30f;
+                    for(int c=0;c<5;++c){
+                        float ce0=(fx1-fx0)*(syp[c]-fy0)-(sxp[c]-fx0)*(fy1-fy0);
+                        float ce1=(fx2-fx1)*(syp[c]-fy1)-(sxp[c]-fx1)*(fy2-fy1);
+                        float ce2=(fx0-fx2)*(syp[c]-fy2)-(sxp[c]-fx2)*(fy0-fy2);
+                        bool cinside = cw ? (ce0<=1e-6f&&ce1<=1e-6f&&ce2<=1e-6f)
+                                          : (ce0>=-1e-6f&&ce1>=-1e-6f&&ce2>=-1e-6f);
+                        if(!cinside) continue;
+                        any_inside = true;
+                        float cw2=ce0*inv, cw0=ce1*inv, cw1=1.0f-cw0-cw2;
+                        ldmin=std::min(ldmin, cw0*gd[0]+cw1*gd[1]+cw2*gd[2]);
                     }
+                    // UV/normal use the unclamped centre-sample weights even
+                    // when the centre itself is outside the triangle — for a
+                    // boundary texel this is a small extrapolation, and it's
+                    // simpler than tracking which corner was the first hit.
+                    float w2=e0*inv;
+                    float w0=e1*inv;
+                    float w1=1.0f-w0-w2;
+                    // A pure sliver overlap avoids all five samples; fall back
+                    // to the plane depth at the centre (the triangle's depth is
+                    // a linear function, so the extrapolation is exact on the
+                    // plane and within a texel of the true surface there).
+                    if(!any_inside) ldmin = w0*gd[0]+w1*gd[1]+w2*gd[2];
+
+                    size_t idx=size_t(py)*atlas_w+px;
+                    if(atlas_depth[idx] <= -1e20f || ldmin < atlas_depth[idx]) atlas_depth[idx]=ldmin;
+                    atlas_uv[idx*2+0]=w0*guv[0].x+w1*guv[1].x+w2*guv[2].x;
+                    atlas_uv[idx*2+1]=w0*guv[0].y+w1*guv[1].y+w2*guv[2].y;
+                    // Bake the interpolated (smooth-shaded) vertex normal once,
+                    // octahedral-encoded, so the ray pass can fetch it instead of
+                    // reconstructing it at runtime from noisy depth gradients.
+                    Vec3 n = safe_normalize(w0*gn[0]+w1*gn[1]+w2*gn[2]);
+                    Vec2 oct = octahedral_encode(n);
+                    atlas_normal[idx*2+0]=oct.x;
+                    atlas_normal[idx*2+1]=oct.y;
                 }
             }
         }
@@ -1402,10 +1429,10 @@ static void rasterize_atlas_textures(
             }
             Vec2 av[3]={to_atlas(gv[0]),to_atlas(gv[1]),to_atlas(gv[2])};
             float fx0=av[0].x,fy0=av[0].y,fx1=av[1].x,fy1=av[1].y,fx2=av[2].x,fy2=av[2].y;
-            int x0=std::max(ax,(int)std::floor(std::min({fx0,fx1,fx2})));
-            int x1=std::min(ax+tw-1,(int)std::ceil(std::max({fx0,fx1,fx2})));
-            int y0=std::max(ay,(int)std::floor(std::min({fy0,fy1,fy2})));
-            int y1=std::min(ay+th-1,(int)std::ceil(std::max({fy0,fy1,fy2})));
+            int x0=std::max(ax,(int)std::floor(std::min({fx0,fx1,fx2}))-1);
+            int x1=std::min(ax+tw-1,(int)std::ceil(std::max({fx0,fx1,fx2}))+1);
+            int y0=std::max(ay,(int)std::floor(std::min({fy0,fy1,fy2}))-1);
+            int y1=std::min(ay+th-1,(int)std::ceil(std::max({fy0,fy1,fy2}))+1);
             float area2=(fx1-fx0)*(fy2-fy0)-(fx2-fx0)*(fy1-fy0);
             if(std::abs(area2)<1e-10f) continue;
             float inv=1.0f/area2;
@@ -1414,6 +1441,17 @@ static void rasterize_atlas_textures(
                 for(int px=x0;px<=x1;++px){
                     size_t idx=size_t(py)*atlas_w+px;
                     if(atlas_depth[idx]<=-1e20f) continue;
+                    // Sample the triangle's plane depth at the texel centre and
+                    // its four corners. The depth is affine on the supporting
+                    // plane, so the barycentric extrapolation is exact even for
+                    // samples outside the triangle. Interior texels have all five
+                    // samples inside, so this reproduces the old per-texel span.
+                    // Border texels (whose square a seam sliver only grazes, so
+                    // one sample may be inside at most) now get the plane's span
+                    // across the whole texel square instead of thickness=0 — the
+                    // collapsed sheet band [dm, dm] let grazing rays tunnel along
+                    // patch borders when the seam was viewed off the patch's own
+                    // dominant axis.
                     const float sxp[5]={float(px)+0.5f,float(px),float(px+1),float(px+1),float(px)};
                     const float syp[5]={float(py)+0.5f,float(py),float(py),float(py+1),float(py+1)};
                     float ldmin=1e30f, ldmax=-1e30f;
@@ -1421,9 +1459,6 @@ static void rasterize_atlas_textures(
                         float e0=(fx1-fx0)*(syp[c]-fy0)-(sxp[c]-fx0)*(fy1-fy0);
                         float e1=(fx2-fx1)*(syp[c]-fy1)-(sxp[c]-fx1)*(fy2-fy1);
                         float e2=(fx0-fx2)*(syp[c]-fy2)-(sxp[c]-fx2)*(fy0-fy2);
-                        bool inside = cw ? (e0<=1e-6f&&e1<=1e-6f&&e2<=1e-6f)
-                                         : (e0>=-1e-6f&&e1>=-1e-6f&&e2>=-1e-6f);
-                        if(!inside) continue;
                         float w2=e0*inv, w0=e1*inv, w1=1.0f-w0-w2;
                         float d=w0*gd[0]+w1*gd[1]+w2*gd[2];
                         ldmin=std::min(ldmin,d); ldmax=std::max(ldmax,d);

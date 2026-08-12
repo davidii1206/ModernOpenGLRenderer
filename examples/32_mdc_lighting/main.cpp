@@ -12,6 +12,7 @@
 // gfx::CoverageAtlas with per-patch colors.
 
 #include <gl/gl.hpp>
+#include <gl/query.hpp>
 #include <gfx/gfx.hpp>
 #include <gfx/gbuffer.hpp>
 #include <gllib/log.hpp>
@@ -23,6 +24,7 @@
 #include <gfx/imgui_overlay.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -294,13 +296,12 @@ void main() {
 // the patch's atlas mip chain (depth + thickness), writing surface normals.
 // ---------------------------------------------------------------------------
 
-static const char* ray_cs = R"(
-#version 460 core
+static const char* ray_common_glsl = R"(
 layout(local_size_x = 16, local_size_y = 16) in;
 
 const int LEAF_TILE = 1;
-const int TEX_W = 16384;
-const int MAX_STACK = 64;
+const int MAX_STACK = 32;
+const int MAX_MIP = 16;
 const int SAMPLES = 8;
 
 struct PatchInfo {
@@ -329,13 +330,17 @@ layout(std430, binding = 1) readonly buffer MetaBuf      { uint  meta[]; };
 layout(std430, binding = 2) readonly buffer PatchInfoBuf { PatchInfo patches[]; };
 layout(std430, binding = 3) readonly buffer BvhBuf       { BVHGPU bvh[]; };
 
-uniform sampler2D u_depth_tex;     // depth chain value texture (RG16)
-uniform sampler2D u_thick_tex;     // thickness chain value texture (RG8)
-uniform sampler2D u_normal_tex;    // normal chain value texture (RG8, octahedral)
+// Combined value buffer texture: one RGBA16UI texel per quadtree node
+//   R = dmin  (16-bit depth)
+//   G = dmax  (16-bit depth)
+//   B = (thick8 << 8) | nrm_x8
+//   A = nrm_y8
+// Depth + thickness + normal all share the quadtree topology, so a single
+// index (u_value_off_dt[L] + idx) fetches everything at once, with no
+// 2D-texel div/mod arithmetic.
+uniform usamplerBuffer u_dt_buf;
 uniform int  u_level_off[32];      // meta SSBO offsets per level (shared)
-uniform int  u_value_off_depth[32];
-uniform int  u_value_off_thick[32];
-uniform int  u_value_off_normal[32];
+uniform int  u_value_off_dt[32];   // value offsets per level (shared topology)
 uniform int  u_patch_count;
 uniform mat4 u_vp_inv;
 uniform vec2 u_res;
@@ -344,11 +349,21 @@ uniform vec3 u_depth_origin;       // g_depth_origin (model AABB min)
 uniform float u_depth_lo;          // depth chain qmin[0]
 uniform float u_depth_hi;          // depth chain qmax[0]
 uniform float u_thick_max;         // thickness chain qmax[0]
-uniform float u_connect_tol;       // normal connectivity tolerance (world units)
-uniform float u_eps;               // slab test epsilon (quantisation slack)
-uniform int  u_dbg;                // 0=normals, 1=ray dir, 2=root-aabb test
+uniform float u_eps;               // slab test epsilon (debug mode 3 only)
+uniform int  u_dbg;                // debug only: 0=normals, 1=ray dir, ...
 
 layout(binding = 0, rgba8) uniform image2D u_out;
+
+// Perf counters are compiled out of the production kernel (lean) unless
+// PERF_ENABLED is defined; the debug kernel keeps them behind the same macro
+// and gates them at runtime with u_perf instead of carrying a uniform branch
+// in the hot path.
+#ifdef PERF_ENABLED
+layout(std430, binding = 4) buffer PerfBuf { uint perf[]; };
+// perf[]: 0=leaf visits, 1=texel queries, 2=march iters, 3=bisect iters,
+//         4=guard-limited rays, 5=rays traced
+uniform int u_perf;    // runtime gate for the debug kernel's counters
+#endif
 
 float decode_value(float b, float lo, float hi, int bits) {
     float n = (bits >= 16) ? 65535.0 : 255.0;
@@ -389,9 +404,25 @@ bool ray_aabb(vec3 ro, vec3 rd, vec3 amin, vec3 amax,
     return t_in <= t_out;
 }
 
+// Per-invocation cache of the last quadtree descent path. Consecutive queries
+// along a ray march land on the same node or a descendant / sibling, so we
+// avoid re-walking the tree from the root on every sample: start from the
+// deepest cached ancestor that contains the queried texel (a scan over the
+// already-cached chain, no memory traffic) and descend only the levels that
+// actually change.
+struct QCache {
+    int pid;             // patch the cached chain belongs to (-1 = invalid)
+    int depth;           // number of valid chain entries
+    int lev[MAX_MIP];    // level of each chain node
+    int id[MAX_MIP];     // node index within that level
+    int x0[MAX_MIP];
+    int y0[MAX_MIP];
+    int s[MAX_MIP];
+};
+
 // Descend the shared quadtree to the finest node covering atlas texel (tx,ty)
 // of patch pid. Returns true if that node is covered (meta bit 0x80000000).
-bool query_node(ivec2 txy, int pid,
+bool query_node(inout QCache qc, ivec2 txy, int pid,
                 out int L, out int idx, out int x0, out int y0, out int s,
                 out float dmin, out float dmax, out float thick) {
     uvec4 r = rects[pid];
@@ -402,10 +433,39 @@ bool query_node(ivec2 txy, int pid,
     int N = 1;
     while (N < maxd) N <<= 1;
 
-    L = 0; x0 = 0; y0 = 0; s = N; idx = pid;
+    // Start from the deepest cached ancestor that contains the texel. The
+    // chain is walked top-down here; each cached entry is just the node rect,
+    // so containment tests never touch the SSBOs.
+    int start_k = -1;
+    if (qc.pid == pid) {
+        for (int k = qc.depth - 1; k >= 0; --k) {
+            int cx0 = qc.x0[k], cy0 = qc.y0[k], cs = qc.s[k];
+            if (x >= cx0 && y >= cy0 && x < cx0 + cs && y < cy0 + cs) {
+                start_k = k;
+                break;
+            }
+        }
+    }
+    if (start_k >= 0) {
+        L = qc.lev[start_k];
+        idx = qc.id[start_k];
+        x0 = qc.x0[start_k];
+        y0 = qc.y0[start_k];
+        s = qc.s[start_k];
+    } else {
+        L = 0; idx = pid; x0 = 0; y0 = 0; s = N;
+        qc.depth = 0;
+    }
+    int qc_top = start_k + 1;
+
     while (true) {
         uint m = meta[u_level_off[L] + idx];
         if ((m & 0x40000000u) == 0u || s <= LEAF_TILE) break;
+        if (qc_top < MAX_MIP) {
+            qc.lev[qc_top] = L; qc.id[qc_top] = idx;
+            qc.x0[qc_top] = x0; qc.y0[qc_top] = y0; qc.s[qc_top] = s;
+            qc_top++;
+        }
         int hs = s >> 1;
         int cx = (x >= x0 + hs) ? 1 : 0;
         int cy = (y >= y0 + hs) ? 1 : 0;
@@ -415,25 +475,292 @@ bool query_node(ivec2 txy, int pid,
         s = hs;
         L += 1;
     }
+    if (qc_top < MAX_MIP) {
+        qc.lev[qc_top] = L; qc.id[qc_top] = idx;
+        qc.x0[qc_top] = x0; qc.y0[qc_top] = y0; qc.s[qc_top] = s;
+        qc_top++;
+    }
+    qc.depth = qc_top;
+    qc.pid = pid;
+
     uint m = meta[u_level_off[L] + idx];
     if ((m & 0x80000000u) == 0u) return false;
+#ifdef PERF_ENABLED
+    atomicAdd(perf[1], 1u);
+#endif
 
-    int vo = u_value_off_depth[L] + idx;
-    vec2 dq = texelFetch(u_depth_tex, ivec2(vo % TEX_W, vo / TEX_W), 0).rg;
-    dmin = decode_value(dq.x, u_depth_lo, u_depth_hi, 16);
-    dmax = decode_value(dq.y, u_depth_lo, u_depth_hi, 16);
-    int vt = u_value_off_thick[L] + idx;
-    float tq = texelFetch(u_thick_tex, ivec2(vt % TEX_W, vt / TEX_W), 0).r;
-    thick = decode_value(tq, 0.0, u_thick_max, 8);
+    int vo = u_value_off_dt[L] + idx;
+    uvec4 q = texelFetch(u_dt_buf, vo);
+    // The buffer texture is integer (RGBA16UI), so texelFetch returns raw
+    // fixed-point codes; decode_value expects the same normalized [0,1] inputs
+    // the old RG16/RG8 textures produced, so scale by 2^bits-1 first.
+    dmin = decode_value(float(q.x) / 65535.0, u_depth_lo, u_depth_hi, 16);
+    dmax = decode_value(float(q.y) / 65535.0, u_depth_lo, u_depth_hi, 16);
+    uint th8 = (q.z >> 8u) & 0xFFu;
+    thick = decode_value(float(th8) / 255.0, 0.0, u_thick_max, 8);
     return true;
 }
+)";
 
+// Production kernel: no debug modes, no runtime perf uniform, far BVH children
+// are never pushed once they are behind the best hit so far.
+static const char* ray_lean_main = R"(
 void main() {
     ivec2 p = ivec2(gl_GlobalInvocationID.xy);
     if (p.x >= int(u_res.x) || p.y >= int(u_res.y)) {
         imageStore(u_out, p, vec4(0.0));
         return;
     }
+#ifdef PERF_ENABLED
+    atomicAdd(perf[5], 1u);
+#endif
+
+    vec2 ndc = vec2(2.0 * (float(p.x) + 0.5) / u_res.x - 1.0,
+                    2.0 * (float(p.y) + 0.5) / u_res.y - 1.0);
+    vec4 cw = u_vp_inv * vec4(ndc, 1.0, 1.0);
+    vec3 wpos = cw.xyz / cw.w;
+    vec3 ro = u_ro;
+    vec3 rd = normalize(wpos - ro);
+
+    float best_t = 1.0e30;
+    int best_pid = -1;
+    int best_L = 0, best_idx = 0, best_x0 = 0, best_y0 = 0, best_s = 0;
+
+    if (u_patch_count == 0 || int(bvh.length()) == 0) {
+        imageStore(u_out, p, vec4(0.0));
+        return;
+    }
+
+    QCache qc;
+    qc.pid = -1;
+    qc.depth = 0;
+
+    int   st_node[MAX_STACK];
+    float st_tin[MAX_STACK];
+    float st_tout[MAX_STACK];
+    int sp = 0;
+
+    float rt0, rt1;
+    if (ray_aabb(ro, rd, bvh[0].amin, bvh[0].amax, rt0, rt1)) {
+        st_node[sp] = 0; st_tin[sp] = rt0; st_tout[sp] = rt1; sp++;
+    }
+
+    while (sp > 0) {
+        sp--;
+        int node = st_node[sp];
+        float tin = st_tin[sp];
+        float tout = st_tout[sp];
+        if (tin > best_t) continue;
+
+        BVHGPU b = bvh[node];
+        if (b.is_leaf != 0u) {
+#ifdef PERF_ENABLED
+            atomicAdd(perf[0], 1u);
+#endif
+            int pid = int(b.val);
+            PatchInfo pi = patches[pid];
+            uvec4 r = rects[pid];
+
+            float dD = dot(rd, pi.basis_u);
+            if (abs(dD) <= 1.0e-6) continue;
+
+            // Single-sided materials cull their back face.
+            if (pi.double_sided == 0u && dD > 0.0) continue;
+
+            float D0 = dot(ro - u_depth_origin, pi.basis_u);
+            float qstep = (u_depth_hi - u_depth_lo) / 65534.0;   // 16-bit depth
+            float htol = max(2.0 * qstep, 1.0e-4);   // depth quantisation slack
+
+            // ---- Texel-stepped heightfield march (robust at grazing angles) ----
+            float tex_s = min(pi.proj_size.x / float(max(r.z, 1u)),
+                              pi.proj_size.y / float(max(r.w, 1u)));
+            vec2 rd_uv = vec2(dot(rd, pi.basis_v), dot(rd, pi.basis_w));
+            float uv_speed = max(length(rd_uv), 1.0e-4);
+            // Loop-invariant fine step (hoisted; the original recomputed this
+            // clamp() on every iteration with identical operands).
+            float base_step = clamp(min(0.5 * tex_s, tex_s / uv_speed),
+                                    1.0e-6, tout - tin);
+
+            float t = tin;
+            bool have_prev = false;
+            float t_prev = tin;
+            bool prev_before = false;   // previous sample still in front of the band
+            int guard = 0;
+            while (guard < 2048 && t <= tout) {
+                guard++;
+#ifdef PERF_ENABLED
+                atomicAdd(perf[2], 1u);
+#endif
+                vec3 P = ro + rd * t;
+                vec2 proj = vec2(dot(P, pi.basis_v), dot(P, pi.basis_w));
+                vec2 nrm = (proj - pi.proj_min) / pi.proj_size;
+                bool inside = nrm.x >= 0.0 && nrm.y >= 0.0 && nrm.x <= 1.0 && nrm.y <= 1.0;
+                float dm = 0.0, dmax = 0.0, thk = 0.0;
+                int L, idx, x0, y0, s;
+                bool covered = false;
+                if (inside) {
+                    ivec2 txy = ivec2(int(r.x) + int(nrm.x * float(r.z)),
+                                      int(r.y) + int(nrm.y * float(r.w)));
+                    covered = query_node(qc, txy, pid, L, idx, x0, y0, s, dm, dmax, thk);
+                    if (!covered) inside = false;
+                }
+                float D = dot(P - u_depth_origin, pi.basis_u);
+                float step = base_step;
+                if (inside && covered && s > LEAF_TILE) {
+                    float stride = clamp(min(0.5 * tex_s * float(s),
+                                             tex_s * float(s) / uv_speed),
+                                         1.0e-6, tout - tin);
+                    if (D - abs(dD) * stride > dmax + htol) step = stride;
+                }
+                float band_hi = inside ? min(dmax, dm + thk) : 0.0;
+                if (inside && D >= dm - htol && D <= band_hi + htol) {
+                    best_t = t;
+                    best_pid = pid;
+                    best_L = L; best_idx = idx;
+                    best_x0 = x0; best_y0 = y0; best_s = s;
+                    break;
+                }
+                bool cur_before = !inside || (D > band_hi + htol);
+
+                if (have_prev && (prev_before != cur_before)) {
+                    float ta = t_prev;
+                    float tb = t;
+                    for (int it = 0; it < 8; ++it) {
+#ifdef PERF_ENABLED
+                        atomicAdd(perf[3], 1u);
+#endif
+                        float tm = (ta + tb) * 0.5;
+                        vec3 Pm = ro + rd * tm;
+                        vec2 proj_m = vec2(dot(Pm, pi.basis_v), dot(Pm, pi.basis_w));
+                        vec2 nrm_m = (proj_m - pi.proj_min) / pi.proj_size;
+                        if (nrm_m.x >= 0.0 && nrm_m.y >= 0.0 && nrm_m.x <= 1.0 && nrm_m.y <= 1.0) {
+                            ivec2 txy_m = ivec2(int(r.x) + int(nrm_m.x * float(r.z)),
+                                                int(r.y) + int(nrm_m.y * float(r.w)));
+                            int Lm, idxm, x0m, y0m, sm;
+                            float dm_m, dmax_m, thk_m;
+                            if (query_node(qc, txy_m, pid, Lm, idxm, x0m, y0m, sm, dm_m, dmax_m, thk_m)) {
+                                float Dm = dot(Pm - u_depth_origin, pi.basis_u);
+                                if (Dm <= dm_m) tb = tm; else ta = tm;
+                                continue;
+                            }
+                        }
+                        // Fell off the patch or hit an uncovered node: keep the
+                        // lower bound so the bracket stays inside the surface.
+                        ta = tm;
+                    }
+                    float th = (ta + tb) * 0.5;
+
+                    // Final acceptance: the refined hit must sit on the surface
+                    // band of the cell it lands in.
+                    vec3 P_f = ro + rd * th;
+                    vec2 proj_f = vec2(dot(P_f, pi.basis_v), dot(P_f, pi.basis_w));
+                    vec2 nrm_f = (proj_f - pi.proj_min) / pi.proj_size;
+                    if (nrm_f.x >= 0.0 && nrm_f.y >= 0.0 && nrm_f.x <= 1.0 && nrm_f.y <= 1.0) {
+                        ivec2 txy_f = ivec2(int(r.x) + int(nrm_f.x * float(r.z)),
+                                            int(r.y) + int(nrm_f.y * float(r.w)));
+                        int Lf, idxf, x0f, y0f, sf;
+                        float dmf, dmxf, thkf;
+                        if (query_node(qc, txy_f, pid, Lf, idxf, x0f, y0f, sf, dmf, dmxf, thkf)) {
+                            float D_f = dot(ro + rd * th - u_depth_origin, pi.basis_u);
+                            float band_hi_f = min(dmxf, dmf + thkf);
+                            float slack = max(htol, 2.0 * abs(dD) * step);
+                            if (D_f >= dmf - htol - slack && D_f <= band_hi_f + htol + slack &&
+                                th < best_t) {
+                                best_t = th;
+                                best_pid = pid;
+                                best_L = Lf; best_idx = idxf;
+                                best_x0 = x0f; best_y0 = y0f; best_s = sf;
+                            }
+                        }
+                    }
+                }
+
+                t_prev = t;
+                prev_before = cur_before;
+                have_prev = true;
+                if (t > best_t) break;
+                if (t >= tout) break;      // the slab exit was just sampled
+                t += step;
+                if (t > tout) t = tout;    // land the final sample on the exit
+            }
+#ifdef PERF_ENABLED
+            if (guard >= 2048) atomicAdd(perf[4], 1u);
+#endif
+        } else {
+            int left = node + 1;
+            int right = node + int(b.val);
+            float t0, t1, t2, t3;
+            bool hit_l = ray_aabb(ro, rd, bvh[left].amin,  bvh[left].amax,  t0, t1);
+            bool hit_r = ray_aabb(ro, rd, bvh[right].amin, bvh[right].amax, t2, t3);
+            // A child whose entry distance is already behind the best hit can
+            // never contain a closer surface, so skip pushing it entirely.
+            if (hit_l && hit_r) {
+                if (t0 <= t2) {
+                    if (t2 <= best_t) {
+                        st_node[sp] = right; st_tin[sp] = t2; st_tout[sp] = t3; sp++;
+                    }
+                    if (t0 <= best_t) {
+                        st_node[sp] = left;  st_tin[sp] = t0; st_tout[sp] = t1; sp++;
+                    }
+                } else {
+                    if (t0 <= best_t) {
+                        st_node[sp] = left;  st_tin[sp] = t0; st_tout[sp] = t1; sp++;
+                    }
+                    if (t2 <= best_t) {
+                        st_node[sp] = right; st_tin[sp] = t2; st_tout[sp] = t3; sp++;
+                    }
+                }
+            } else if (hit_l) {
+                if (t0 <= best_t) {
+                    st_node[sp] = left; st_tin[sp] = t0; st_tout[sp] = t1; sp++;
+                }
+            } else if (hit_r) {
+                if (t2 <= best_t) {
+                    st_node[sp] = right; st_tin[sp] = t2; st_tout[sp] = t3; sp++;
+                }
+            }
+        }
+    }
+
+    if (best_pid < 0) {
+        imageStore(u_out, p, vec4(0.0));
+        return;
+    }
+
+    // ---- Surface normal from the baked octahedral normal chain ----
+    // The normal was rasterised once and aggregated per quadtree node, so
+    // fetching it at the resolved node is exact and view-independent.
+    PatchInfo pi = patches[best_pid];
+    int vo = u_value_off_dt[best_L] + best_idx;
+    uvec4 qn = texelFetch(u_dt_buf, vo);
+    uint nx8 = qn.z & 0xFFu;
+    uint ny8 = qn.w & 0xFFu;
+    vec2 oct = vec2(decode_value(float(nx8) / 255.0, -1.0, 1.0, 8),
+                    decode_value(float(ny8) / 255.0, -1.0, 1.0, 8));
+    vec3 n = octahedral_decode(oct);
+    if (dot(n, rd) > 0.0) n = -n;
+
+    imageStore(u_out, p, vec4(n * 0.5 + 0.5, 1.0));
+}
+)";
+
+// Full diagnostic kernel: keeps every u_dbg mode (0..12) and the runtime
+// perf gate, plus the original un-culled BVH traversal so the debug visual
+// shows the whole visited set.
+static const char* ray_debug_main = R"(
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(u_res.x) || p.y >= int(u_res.y)) {
+        imageStore(u_out, p, vec4(0.0));
+        return;
+    }
+#ifdef PERF_ENABLED
+    if (u_perf != 0) atomicAdd(perf[5], 1u);
+#endif
+
+    QCache qc;
+    qc.pid = -1;
+    qc.depth = 0;
 
     vec2 ndc = vec2(2.0 * (float(p.x) + 0.5) / u_res.x - 1.0,
                     2.0 * (float(p.y) + 0.5) / u_res.y - 1.0);
@@ -479,7 +806,7 @@ void main() {
                                   int(r.y) + int(nrm.y * float(r.w)));
                 int L, idx, x0, y0, s;
                 float dmin, dmax, thick;
-                if (!query_node(txy, pid, L, idx, x0, y0, s, dmin, dmax, thick)) continue;
+                if (!query_node(qc, txy, pid, L, idx, x0, y0, s, dmin, dmax, thick)) continue;
                 any_covered = true;
                 float D = dot(P - u_depth_origin, pi.basis_u);
                 if (D >= dmin - u_eps && D <= dmin + thick) {
@@ -522,7 +849,7 @@ void main() {
                                   int(r.y) + int(nrm.y * float(r.w)));
                 int L, idx, x0, y0, s;
                 float dmin, dmax, thick;
-                if (!query_node(txy, pid, L, idx, x0, y0, s, dmin, dmax, thick)) continue;
+                if (!query_node(qc, txy, pid, L, idx, x0, y0, s, dmin, dmax, thick)) continue;
                 imageStore(u_out, p, vec4(t0 / 5.0,
                                           float(i) / 30.0,
                                           float(pid) / 13.0, 1.0));
@@ -580,6 +907,9 @@ void main() {
         BVHGPU b = bvh[node];
         if (b.is_leaf != 0u) {
             dbg_leaf_visits++;
+#ifdef PERF_ENABLED
+            if (u_perf != 0) atomicAdd(perf[0], 1u);
+#endif
             int pid = int(b.val);
             PatchInfo pi = patches[pid];
             uvec4 r = rects[pid];
@@ -587,65 +917,51 @@ void main() {
             float dD = dot(rd, pi.basis_u);
             if (abs(dD) <= 1.0e-6) continue;
 
-            // Single-sided materials cull their back face. basis_u points along
-            // the patch's surface normals (the clustering axis), so a ray hitting
-            // the front face approaches from the +basis_u side (dD < 0) and a
-            // back-side hit has dD > 0. Double-sided patches accept both sides.
             if (pi.double_sided == 0u && dD > 0.0) continue;
 
             float D0 = dot(ro - u_depth_origin, pi.basis_u);
             float qstep = (u_depth_hi - u_depth_lo) / 65534.0;   // 16-bit depth
             float htol = max(2.0 * qstep, 1.0e-4);   // depth quantisation slack
 
-            // ---- Texel-stepped heightfield march (robust at grazing angles) ----
-            // The old code solved the crossing analytically with th=(dmin-D0)/dD
-            // sampled 16 times over the slab. For grazing rays dD -> 0, which
-            // amplifies the depth-quantisation error by 1/|dD| and can skip a
-            // thin band entirely, making slanted surfaces see-through/noisy.
-            // Instead, advance the projection by at most ~1 texel per step
-            // (like example 27) and bisect the band crossing.
             float tex_s = min(pi.proj_size.x / float(max(r.z, 1u)),
                               pi.proj_size.y / float(max(r.w, 1u)));
             vec2 rd_uv = vec2(dot(rd, pi.basis_v), dot(rd, pi.basis_w));
             float uv_speed = max(length(rd_uv), 1.0e-4);
-            float step = min(0.5 * tex_s, tex_s / uv_speed);
-            step = clamp(step, 1.0e-6, tout - tin);
+            float base_step = clamp(min(0.5 * tex_s, tex_s / uv_speed),
+                                    1.0e-6, tout - tin);
 
             float t = tin;
             bool have_prev = false;
             float t_prev = tin;
-            bool prev_before = false;   // previous sample still in front of the band
+            bool prev_before = false;
             int guard = 0;
-            // Sample the slab from tin to tout inclusive: the final sample always
-            // lands exactly on the far face, so a surface band sitting at the
-            // AABB exit cannot be skipped by the [t, t+step] marching gap.
             while (guard < 2048 && t <= tout) {
                 guard++;
+#ifdef PERF_ENABLED
+                if (u_perf != 0) atomicAdd(perf[2], 1u);
+#endif
                 vec3 P = ro + rd * t;
                 vec2 proj = vec2(dot(P, pi.basis_v), dot(P, pi.basis_w));
                 vec2 nrm = (proj - pi.proj_min) / pi.proj_size;
                 bool inside = nrm.x >= 0.0 && nrm.y >= 0.0 && nrm.x <= 1.0 && nrm.y <= 1.0;
                 float dm = 0.0, dmax = 0.0, thk = 0.0;
                 int L, idx, x0, y0, s;
+                bool covered = false;
                 if (inside) {
                     ivec2 txy = ivec2(int(r.x) + int(nrm.x * float(r.z)),
                                       int(r.y) + int(nrm.y * float(r.w)));
-                    if (query_node(txy, pid, L, idx, x0, y0, s, dm, dmax, thk)) {
-                        dbg_covered++;
-                    } else {
-                        inside = false;
-                    }
+                    covered = query_node(qc, txy, pid, L, idx, x0, y0, s, dm, dmax, thk);
+                    if (covered) dbg_covered++;
+                    if (!covered) inside = false;
                 }
                 float D = dot(P - u_depth_origin, pi.basis_u);
-                // A ray that enters the leaf already inside the band (a head-on
-                // ray hits the AABB front face right where the surface sits) never
-                // produces a "before -> in-band" crossing, so accept it directly.
-                // The band is the leaf's own depth extent [dm, dmax], capped by
-                // the per-texel thickness. A node that stopped subdividing as
-                // "flat enough" spans a merged region whose dmax can reach far
-                // past the local surface (exactly at a cube edge), letting a ray
-                // register "inside the band" all the way toward the back face;
-                // the thickness cap keeps the band tight to the local surface.
+                float step = base_step;
+                if (inside && covered && s > LEAF_TILE) {
+                    float stride = clamp(min(0.5 * tex_s * float(s),
+                                             tex_s * float(s) / uv_speed),
+                                         1.0e-6, tout - tin);
+                    if (D - abs(dD) * stride > dmax + htol) step = stride;
+                }
                 float band_hi = inside ? min(dmax, dm + thk) : 0.0;
                 if (inside && D >= dm - htol && D <= band_hi + htol) {
                     best_t = t;
@@ -654,16 +970,15 @@ void main() {
                     best_x0 = x0; best_y0 = y0; best_s = s;
                     break;
                 }
-                // "before" = the ray's depth is still above the surface band
-                // (D > band_hi), i.e. it has not reached the surface yet.
                 bool cur_before = !inside || (D > band_hi + htol);
 
-                // The band crossing happened between the previous and current
-                // sample. Detect it in either direction (front or back face).
                 if (have_prev && (prev_before != cur_before)) {
                     float ta = t_prev;
                     float tb = t;
                     for (int it = 0; it < 8; ++it) {
+#ifdef PERF_ENABLED
+                        if (u_perf != 0) atomicAdd(perf[3], 1u);
+#endif
                         float tm = (ta + tb) * 0.5;
                         vec3 Pm = ro + rd * tm;
                         vec2 proj_m = vec2(dot(Pm, pi.basis_v), dot(Pm, pi.basis_w));
@@ -673,20 +988,16 @@ void main() {
                                                 int(r.y) + int(nrm_m.y * float(r.w)));
                             int Lm, idxm, x0m, y0m, sm;
                             float dm_m, dmax_m, thk_m;
-                            if (query_node(txy_m, pid, Lm, idxm, x0m, y0m, sm, dm_m, dmax_m, thk_m)) {
+                            if (query_node(qc, txy_m, pid, Lm, idxm, x0m, y0m, sm, dm_m, dmax_m, thk_m)) {
                                 float Dm = dot(Pm - u_depth_origin, pi.basis_u);
                                 if (Dm <= dm_m) tb = tm; else ta = tm;
                                 continue;
                             }
                         }
-                        // Fell off the patch or hit an uncovered node: keep the
-                        // lower bound so the bracket stays inside the surface.
                         ta = tm;
                     }
                     float th = (ta + tb) * 0.5;
 
-                    // Final acceptance: the refined hit must sit on the surface
-                    // band of the cell it lands in.
                     vec3 P_f = ro + rd * th;
                     vec2 proj_f = vec2(dot(P_f, pi.basis_v), dot(P_f, pi.basis_w));
                     vec2 nrm_f = (proj_f - pi.proj_min) / pi.proj_size;
@@ -696,16 +1007,10 @@ void main() {
                                             int(r.y) + int(nrm_f.y * float(r.w)));
                         int Lf, idxf, x0f, y0f, sf;
                         float dmf, dmxf, thkf;
-                        if (!query_node(txy_f, pid, Lf, idxf, x0f, y0f, sf, dmf, dmxf, thkf)) { if (!dbg_captured) { dbg_captured = true; dbg_reject = 5; miss_nrm_f = nrm_f; miss_L = Lf; } }
+                        if (!query_node(qc, txy_f, pid, Lf, idxf, x0f, y0f, sf, dmf, dmxf, thkf)) { if (!dbg_captured) { dbg_captured = true; dbg_reject = 5; miss_nrm_f = nrm_f; miss_L = Lf; } }
                         else {
                             float D_f = dot(ro + rd * th - u_depth_origin, pi.basis_u);
                             float band_hi_f = min(dmxf, dmf + thkf);
-                            // The band crossing was already detected (prev_before !=
-                            // cur_before); the per-texel depth is quantized, so the
-                            // refined depth can sit a fraction of a march step off
-                            // the local texel's band at texel boundaries on slanted
-                            // patches. Accept within that slack, culling only hits
-                            // that are grossly off the surface band.
                             float slack = max(htol, 2.0 * abs(dD) * step);
                             if (D_f < dmf - htol - slack || D_f > band_hi_f + htol + slack) { if (!dbg_captured) { dbg_captured = true; dbg_reject = 3; miss_nrm_f = nrm_f; miss_L = Lf; } }
                             else if (th < best_t) {
@@ -722,10 +1027,13 @@ void main() {
                 prev_before = cur_before;
                 have_prev = true;
                 if (t > best_t) break;
-                if (t >= tout) break;      // the slab exit was just sampled
+                if (t >= tout) break;
                 t += step;
-                if (t > tout) t = tout;    // land the final sample on the exit
+                if (t > tout) t = tout;
             }
+#ifdef PERF_ENABLED
+            if (guard >= 2048 && u_perf != 0) atomicAdd(perf[4], 1u);
+#endif
         } else {
             dbg_pushed = true;
             int left = node + 1;
@@ -734,7 +1042,7 @@ void main() {
             bool hit_l = ray_aabb(ro, rd, bvh[left].amin,  bvh[left].amax,  t0, t1);
             bool hit_r = ray_aabb(ro, rd, bvh[right].amin, bvh[right].amax, t2, t3);
             if (hit_l && hit_r) {
-                if (t0 <= t2) {   // push the farther child first
+                if (t0 <= t2) {
                     st_node[sp] = right; st_tin[sp] = t2; st_tout[sp] = t3; sp++;
                     st_node[sp] = left;  st_tin[sp] = t0; st_tout[sp] = t1; sp++;
                 } else {
@@ -758,17 +1066,12 @@ void main() {
 
     if (best_pid < 0) {
         if (u_dbg == 11) {
-            // Miss causality: R=covered-sample count/30, G=reject reason
-            // (1=range-front, 2=range-behind, 3=final-band, 4=final-out-of-rect,
-            //  5=final-query-false), B=leaf visits/30
             imageStore(u_out, p, vec4(float(dbg_covered) / 30.0,
                                       float(dbg_reject) / 8.0,
                                       float(dbg_leaf_visits) / 30.0, 1.0));
             return;
         }
         if (u_dbg == 12) {
-            // For reject 4/5 misses, dump the final projection and node level:
-            // R=nrm_f.x, G=nrm_f.y, B=final level/30. For other misses: old codes.
             if (dbg_reject == 4 || dbg_reject == 5) {
                 vec2 nf = miss_nrm_f;
                 imageStore(u_out, p, vec4(clamp(nf.x, 0.0, 2.0) / 2.0,
@@ -809,7 +1112,7 @@ void main() {
                                   int(r.y) + int(nrm.y * float(r.w)));
                 int L, idx, x0, y0, s;
                 float dmin, dmax, thick;
-                if (!query_node(txy, pid, L, idx, x0, y0, s, dmin, dmax, thick)) continue;
+                if (!query_node(qc, txy, pid, L, idx, x0, y0, s, dmin, dmax, thick)) continue;
                 float D = dot(P - u_depth_origin, pi.basis_u);
                 imageStore(u_out, p, vec4((dmin - u_depth_lo) / (u_depth_hi - u_depth_lo),
                                           (D - u_depth_lo) / (u_depth_hi - u_depth_lo),
@@ -822,21 +1125,14 @@ void main() {
     }
 
     // ---- Surface normal from the baked octahedral normal chain ----
-    // The normal was rasterised once (interpolated vertex normal, octahedral-
-    // encoded) at atlas build time and aggregated per quadtree node, so fetching
-    // it at the resolved node is exact and independent of the view angle /
-    // march step that decided which node the ray landed on. No runtime finite
-    // differencing over quantised depth samples, no neighbour-dependent wobble.
     PatchInfo pi = patches[best_pid];
-    int vo = u_value_off_normal[best_L] + best_idx;
-    vec2 qn = texelFetch(u_normal_tex, ivec2(vo % TEX_W, vo / TEX_W), 0).rg;
-    vec2 oct = vec2(decode_value(qn.x, -1.0, 1.0, 8),
-                    decode_value(qn.y, -1.0, 1.0, 8));
+    int vo = u_value_off_dt[best_L] + best_idx;
+    uvec4 qn = texelFetch(u_dt_buf, vo);
+    uint nx8 = qn.z & 0xFFu;
+    uint ny8 = qn.w & 0xFFu;
+    vec2 oct = vec2(decode_value(float(nx8) / 255.0, -1.0, 1.0, 8),
+                    decode_value(float(ny8) / 255.0, -1.0, 1.0, 8));
     vec3 n = octahedral_decode(oct);
-    // Keep the baked normal facing the ray. Double-sided patches are genuinely
-    // ambiguous (backfaces mirror the normal); single-sided patches already
-    // cull the back face, but the flip is a free safety net against the normal
-    // inaccuracies the rasteriser can introduce at silhouette edges.
     if (dot(n, rd) > 0.0) n = -n;
 
     if (u_dbg == 9) {
@@ -847,7 +1143,6 @@ void main() {
     }
 
     if (u_dbg == 10) {
-        // TEMP: encode best_pid (R) and best_t (G) for sweep analysis
         imageStore(u_out, p, vec4(float(best_pid + 1) / 64.0,
                                   best_t / 8.0, 1.0, 1.0));
         return;
@@ -876,11 +1171,13 @@ struct PatchGPU {
 struct AtlasView {
     GLuint rects_ssbo = 0, meta_ssbo = 0;
     GLuint value_tex[4] = {0, 0, 0, 0};   // UV, thickness, depth, normal
+    GLuint dt_ssbo = 0, dt_tex = 0;       // combined depth+thick+normal buffer texture
     GLuint fbo = 0, view_tex = 0;
     int view_w = 0, view_h = 0;
     int level_count = 0;
     int level_off[32] = {};
     int value_off[4][32] = {};
+    int value_off_dt[32] = {};            // per-level offsets into the combined buffer
 };
 
 // std430 layouts matching the primary-ray compute shader.
@@ -913,6 +1210,129 @@ struct RayPassGPU {
     GLuint ray_tex = 0;
     int w = 0, h = 0;
 };
+
+// Per-pass GPU/CPU timing with double-buffered GL_TIME_ELAPSED queries.
+// Only one time-elapsed query may be active at once, so passes are timed
+// sequentially (never nested); the frame timer is CPU-only.
+class PassTimer {
+public:
+    explicit PassTimer(const char* name, bool gpu = true)
+        : name_(name), gpu_(gpu), q_(gl::QueryType::time_elapsed),
+          q_prev_(gl::QueryType::time_elapsed) {}
+
+    void begin() {
+        t0_ = std::chrono::steady_clock::now();
+        if (gpu_) q_.begin();
+    }
+    void end() {
+        if (gpu_) q_.end();
+        cpu_ms_ = std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - t0_).count();
+        ran_ = true;
+        if (gpu_) std::swap(q_, q_prev_);
+    }
+    void skip() { ran_ = false; cpu_ms_ = 0.0; }
+
+    // Reads the just-finished frame's query result (never re-begun until the
+    // next frame, so the read cannot block a live query). Samples accumulate
+    // into the current window for the 0.5 s averaged display.
+    void readback() {
+        gpu_ms_ = 0.0;
+        if (ran_) {
+            if (gpu_) gpu_ms_ = double(q_prev_.result()) * 1.0e-6;   // ns -> ms
+            cpu_acc_ += cpu_ms_;
+            gpu_acc_ += gpu_ms_;
+            n_++;
+        }
+        win_cpu_acc_ += cpu_ms_;
+        win_gpu_acc_ += gpu_ms_;
+        win_n_++;
+    }
+
+    // Called every ~0.5 s: averages the accumulated samples into disp_* (what
+    // the ImGui window shows) and appends that average to the history plots.
+    void flush_window() {
+        disp_cpu_ = win_n_ ? win_cpu_acc_ / double(win_n_) : 0.0;
+        disp_gpu_ = win_n_ ? win_gpu_acc_ / double(win_n_) : 0.0;
+        win_cpu_acc_ = win_gpu_acc_ = 0.0;
+        win_n_ = 0;
+        cpu_hist_.push_back(float(disp_cpu_));
+        if (cpu_hist_.size() > kHist) cpu_hist_.erase(cpu_hist_.begin());
+        if (gpu_) {
+            gpu_hist_.push_back(float(disp_gpu_));
+            if (gpu_hist_.size() > kHist) gpu_hist_.erase(gpu_hist_.begin());
+        }
+    }
+
+    const char* name() const { return name_; }
+    bool gpu() const { return gpu_; }
+    double cpu_ms() const { return cpu_ms_; }
+    double gpu_ms() const { return gpu_ms_; }
+    double disp_cpu() const { return disp_cpu_; }
+    double disp_gpu() const { return disp_gpu_; }
+    double avg_cpu() const { return n_ ? cpu_acc_ / double(n_) : 0.0; }
+    double avg_gpu() const { return n_ ? gpu_acc_ / double(n_) : 0.0; }
+    const std::vector<float>& cpu_hist() const { return cpu_hist_; }
+    const std::vector<float>& gpu_hist() const { return gpu_hist_; }
+
+private:
+    static constexpr size_t kHist = 120;
+    const char* name_;
+    bool gpu_;
+    gl::Query q_, q_prev_;
+    std::chrono::steady_clock::time_point t0_;
+    double cpu_ms_ = 0.0, gpu_ms_ = 0.0;
+    double cpu_acc_ = 0.0, gpu_acc_ = 0.0;
+    double win_cpu_acc_ = 0.0, win_gpu_acc_ = 0.0;
+    double disp_cpu_ = 0.0, disp_gpu_ = 0.0;
+    int n_ = 0, win_n_ = 0;
+    bool ran_ = false;
+    std::vector<float> cpu_hist_, gpu_hist_;
+};
+
+// Horizontal stacked bar (segment widths ∝ time) drawn with the ImGui draw list.
+static void imgui_stacked_bar(const ImVec2& pos, const ImVec2& size,
+                              const float* vals, const ImU32* cols, int n) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    float total = 0.0f;
+    for (int i = 0; i < n; ++i) total += vals[i];
+    if (total <= 0.0f) {
+        dl->AddRectFilled(pos, ImVec2(pos.x + size.x, pos.y + size.y),
+                          IM_COL32(40, 40, 40, 255));
+        return;
+    }
+    float x = pos.x;
+    for (int i = 0; i < n; ++i) {
+        float w = size.x * vals[i] / total;
+        if (w > 0.0f)
+            dl->AddRectFilled(ImVec2(x, pos.y), ImVec2(x + w, pos.y + size.y), cols[i]);
+        x += w;
+    }
+    dl->AddRect(pos, ImVec2(pos.x + size.x, pos.y + size.y),
+                IM_COL32(255, 255, 255, 90));
+}
+
+// Two-column legend next to a stacked bar: color swatch + name | ms + share.
+static void imgui_stacked_legend(const char* id, const char* const* names,
+                                 const float* ms, const ImU32* cols, int n, float total) {
+    if (ImGui::BeginTable(id, 2)) {
+        for (int i = 0; i < n; ++i) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImVec4 c = ImGui::ColorConvertU32ToFloat4(cols[i]);
+            ImGui::ColorButton("##sw", c,
+                               ImGuiColorEditFlags_NoTooltip |
+                               ImGuiColorEditFlags_NoInputs |
+                               ImGuiColorEditFlags_NoPicker, ImVec2(10, 10));
+            ImGui::SameLine();
+            ImGui::Text("%s", names[i]);
+            ImGui::TableNextColumn();
+            ImGui::Text("%.3f ms  (%.1f%%)", ms[i],
+                        total > 0.0f ? 100.0f * ms[i] / total : 0.0f);
+        }
+        ImGui::EndTable();
+    }
+}
 
 // The patch atlas axes come from project_along() (see gfx/coverage_atlas.cpp):
 // the projection drops the depth coordinate, so the atlas-u / atlas-v world
@@ -1147,6 +1567,52 @@ static void upload_atlas_view(const gfx::CoverageAtlas& atlas, AtlasView& v) {
         }
     }
 
+    // Combined depth + thickness + normal buffer texture for the ray pass: one
+    // RGBA16UI texel per quadtree node
+    //   R = dmin (16-bit), G = dmax (16-bit), B = (thick8 << 8) | nrm_x8, A = nrm_y8
+    // The three chains share the quadtree topology, so the per-level offsets
+    // equal the depth chain's (value_off[2]) and a single buffer-texture fetch
+    // with no div/mod replaces the two 2D RG texture fetches of the old path.
+    {
+        const auto& dc = atlas.depth_chain();
+        const auto& tc = atlas.thickness_chain();
+        const auto& nc = atlas.normal_chain();
+        std::vector<uint16_t> dt;
+        size_t tot = 0;
+        for (const auto& lv : dc.levels)
+            tot += lv.data.size() / (size_t(dc.channels) * size_t(dc.bytes_per_channel));
+        dt.reserve(tot * 4);
+        for (int L = 0; L < v.level_count && L < 32; ++L) {
+            const auto& dl = dc.levels[size_t(L)];
+            const auto& tl = tc.levels[size_t(L)];
+            const auto& nl = nc.levels[size_t(L)];
+            size_t n = dl.data.size() / (size_t(dc.channels) * size_t(dc.bytes_per_channel));
+            const uint16_t* dp = reinterpret_cast<const uint16_t*>(dl.data.data());
+            for (size_t i = 0; i < n; ++i) {
+                uint16_t dmin = dp[i * 2];
+                uint16_t dmax = dp[i * 2 + 1];
+                uint16_t th = uint16_t(tl.data[i]);
+                uint16_t nx = uint16_t(nl.data[i * 2]);
+                uint16_t ny = uint16_t(nl.data[i * 2 + 1]);
+                dt.push_back(dmin);
+                dt.push_back(dmax);
+                dt.push_back(uint16_t((th << 8) | (nx & 0xFFu)));
+                dt.push_back(ny);
+            }
+        }
+        if (!v.dt_ssbo) glGenBuffers(1, &v.dt_ssbo);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, v.dt_ssbo);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, dt.size() * sizeof(uint16_t),
+                     dt.data(), GL_STATIC_DRAW);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+        if (!v.dt_tex) glGenTextures(1, &v.dt_tex);
+        glBindTexture(GL_TEXTURE_BUFFER, v.dt_tex);
+        glTexBuffer(GL_TEXTURE_BUFFER, GL_RGBA16UI, v.dt_ssbo);
+        glBindTexture(GL_TEXTURE_BUFFER, 0);
+        for (int L = 0; L < v.level_count && L < 32; ++L)
+            v.value_off_dt[L] = v.value_off[2][L];
+    }
+
     if (!v.view_tex) {
         glGenTextures(1, &v.view_tex);
         glGenFramebuffers(1, &v.fbo);
@@ -1179,6 +1645,31 @@ static bool build_program(gl::Program& prog, const char* vs_src, const char* fs_
     prog.attach(fs);
     if (!prog.link()) {
         std::fprintf(stderr, "Program link failed:\n%s\n", prog.info_log().c_str());
+        return false;
+    }
+    return true;
+}
+
+// Assembles a ray compute program from the shared preamble + a body. The perf
+// counters compile in only when `perf` is set (PERF_ENABLED macro), so the
+// hot production path carries no uniform branch.
+static bool build_ray_program(gl::Program& prog, const char* common, const char* body,
+                              bool perf) {
+    std::string src = "#version 460 core\n";
+    if (perf) src += "#define PERF_ENABLED 1\n";
+    src += common;
+    src += "\n";
+    src += body;
+    gl::Shader cs(gl::ShaderType::compute, src);
+    if (!cs.compiled()) {
+        std::fprintf(stderr, "Compute shader compile failed:\n%s\n",
+                     cs.info_log().c_str());
+        return false;
+    }
+    prog.attach(cs);
+    if (!prog.link()) {
+        std::fprintf(stderr, "Compute program link failed:\n%s\n",
+                     prog.info_log().c_str());
         return false;
     }
     return true;
@@ -1484,20 +1975,28 @@ int main() {
     if (!build_program(patch_prog, patch_vs, patch_fs)) return EXIT_FAILURE;
     if (!build_program(atlas_prog, atlas_vs, atlas_fs)) return EXIT_FAILURE;
 
-    // Primary-ray compute pass + its fullscreen display.
-    gl::Shader ray_cs_shader(gl::ShaderType::compute, ray_cs);
-    if (!ray_cs_shader.compiled()) {
-        std::fprintf(stderr, "Compute shader compile failed:\n%s\n",
-                     ray_cs_shader.info_log().c_str());
+    // --- Primary-ray pass + its fullscreen display ---
+    // Two kernels share the preamble: the lean production kernel (no debug
+    // modes, no runtime perf branch) and the full diagnostic kernel. Each is
+    // built with and without perf counters, so the common path is branch-free.
+    const int ray_dbg = ([] {
+        const char* e = getenv("RAYDBG");
+        return e ? atoi(e) : 0;
+    })();
+    const int perf_enabled = getenv("PERF") ? 1 : 0;
+
+    gl::Program ray_lean_prog, ray_lean_perf_prog, ray_debug_prog, ray_debug_perf_prog;
+    if (!build_ray_program(ray_lean_prog, ray_common_glsl, ray_lean_main, false))
         return EXIT_FAILURE;
-    }
-    gl::Program ray_prog;
-    ray_prog.attach(ray_cs_shader);
-    if (!ray_prog.link()) {
-        std::fprintf(stderr, "Compute program link failed:\n%s\n",
-                     ray_prog.info_log().c_str());
+    if (perf_enabled &&
+        !build_ray_program(ray_lean_perf_prog, ray_common_glsl, ray_lean_main, true))
         return EXIT_FAILURE;
-    }
+    if (ray_dbg != 0 &&
+        !build_ray_program(ray_debug_prog, ray_common_glsl, ray_debug_main, false))
+        return EXIT_FAILURE;
+    if (ray_dbg != 0 && perf_enabled &&
+        !build_ray_program(ray_debug_perf_prog, ray_common_glsl, ray_debug_main, true))
+        return EXIT_FAILURE;
     gl::Program ray_disp_prog;
     if (!build_program(ray_disp_prog, light_vs, ray_display_fs)) return EXIT_FAILURE;
 
@@ -1553,12 +2052,35 @@ int main() {
     double press_x = 0.0, press_y = 0.0;
 
     // --- Primary-ray pass ---
+    bool show_atlas = true;       // full MIP-chain reconstruction into the view FBO
     bool show_ray_pass = true;    // fullscreen normal view
     float ray_connect_tol = 0.05f;
     float ray_eps = 0.02f;
-    int ray_dbg = 0;
-    const char* rdbg_env = getenv("RAYDBG");
-    if (rdbg_env) ray_dbg = atoi(rdbg_env);
+
+    // --- Per-pass GPU/CPU timers + optional per-dispatch work counters ---
+    // t_frame spans the whole loop iteration (poll → present) and is CPU-only;
+    // the GPU frame time is the sum of the individual GPU passes.
+    PassTimer t_frame("frame", false);
+    PassTimer t_poll("poll_events", false);    // poll_events + gui.begin_frame
+    PassTimer t_input("camera_input", false);  // orbit/zoom + mouse pick + resize
+    PassTimer t_geo("geometry");
+    PassTimer t_light("lighting");
+    PassTimer t_ray("ray");
+    PassTimer t_ray_disp("ray_display");       // fullscreen quad, only when enabled
+    PassTimer t_atlas("atlas_view");
+    PassTimer t_bvh("bvh_overlay");
+    PassTimer t_imgui("imgui", false);         // building the debug window
+    PassTimer t_present("present", false);     // gui.render + swap_buffers
+
+    GLuint perf_ssbo = 0;
+    GLuint perf_acc[6] = {0, 0, 0, 0, 0, 0};
+    int perf_frames = 0;
+    if (perf_enabled) {
+        glGenBuffers(1, &perf_ssbo);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, perf_ssbo);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, 6 * sizeof(GLuint), nullptr, GL_DYNAMIC_DRAW);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+    }
 
     double prev_x, prev_y;
     window.cursor_position(prev_x, prev_y);
@@ -1569,10 +2091,49 @@ int main() {
     double last = window.time();
     int frame = 0;
 
+    // 0.5 s display window: frame-period samples accumulate into period_* and
+    // are averaged into disp_frame_period when the window elapses.
+    double win_start = window.time();
+    double period_acc = 0.0;
+    int period_n = 0;
+    double disp_frame_period = 0.0;
+
     // TEMP: scripted orbit sweep for grazing-angle diagnostics (SWEEP=<frames>).
     int sweep_total = 0;
     int sweep_frame = 0;
     if (const char* se = getenv("SWEEP")) sweep_total = std::max(1, atoi(se));
+
+    auto print_perf = [&]() {
+        double sum_gpu = t_geo.avg_gpu() + t_light.avg_gpu() + t_ray.avg_gpu() +
+                         t_ray_disp.avg_gpu() + t_atlas.avg_gpu() + t_bvh.avg_gpu();
+        printf("PERF avg over %d frames:\n", frame);
+        auto row = [](const char* n, double g, double c) {
+            printf("  %-11s gpu %7.2f ms  cpu %7.2f ms\n", n, g, c);
+        };
+        row("frame", sum_gpu, t_frame.avg_cpu());
+        row("poll_events", 0.0, t_poll.avg_cpu());
+        row("camera_input", 0.0, t_input.avg_cpu());
+        row("geometry", t_geo.avg_gpu(), t_geo.avg_cpu());
+        row("lighting", t_light.avg_gpu(), t_light.avg_cpu());
+        row("ray", t_ray.avg_gpu(), t_ray.avg_cpu());
+        row("ray_display", t_ray_disp.avg_gpu(), t_ray_disp.avg_cpu());
+        row("atlas_view", t_atlas.avg_gpu(), t_atlas.avg_cpu());
+        row("bvh_overlay", t_bvh.avg_gpu(), t_bvh.avg_cpu());
+        row("imgui", 0.0, t_imgui.avg_cpu());
+        row("present", 0.0, t_present.avg_cpu());
+        if (perf_enabled && perf_frames > 0) {
+            double rays = double(perf_acc[5]);
+            printf("  ray work (accumulated over %d dispatches):\n", perf_frames);
+            printf("    rays / frame         = %.0f\n", rays / double(perf_frames));
+            if (rays > 0.0) {
+                printf("    leaf visits / ray   = %.2f\n", double(perf_acc[0]) / rays);
+                printf("    texel queries / ray = %.2f\n", double(perf_acc[1]) / rays);
+                printf("    march iters / ray   = %.2f\n", double(perf_acc[2]) / rays);
+                printf("    bisect iters / ray  = %.2f\n", double(perf_acc[3]) / rays);
+                printf("    guard exits / ray   = %.4f\n", double(perf_acc[4]) / rays);
+            }
+        }
+    };
 
     while (!window.should_close()) {
         ++frame;
@@ -1580,8 +2141,19 @@ int main() {
         float dt = float(now - last);
         last = now;
 
+        if (frame_times.size() >= 120) frame_times.erase(frame_times.begin());
+        frame_times.push_back(dt * 1000.0f);
+        period_acc += dt * 1000.0f;
+        period_n++;
+
+        // Whole-frame CPU timer: spans poll_events → present. The GPU frame
+        // time is the sum of the individual GPU passes below.
+        t_frame.begin();
+
+        t_poll.begin();
         window.poll_events();
         gui.begin_frame();
+        t_poll.end();
 
         if (sweep_total && sweep_frame >= sweep_total) break;
         if (sweep_total) {
@@ -1591,9 +2163,7 @@ int main() {
             cam.look_at(eye, glm::vec3(0.0f, 1.0f, 0.0f));
         }
 
-        if (frame_times.size() >= 120) frame_times.erase(frame_times.begin());
-        frame_times.push_back(dt * 1000.0f);
-
+        t_input.begin();
         // Orbit (left drag) + zoom (scroll), unless the ImGui window grabs mouse
         if (!gui.wants_mouse()) {
             if (window.mouse_down(gfx::MouseButton::left)) {
@@ -1649,10 +2219,12 @@ int main() {
 
         if (window.framebuffer_width() != gbuf.width() || window.framebuffer_height() != gbuf.height())
             gbuf.create(window.framebuffer_width(), window.framebuffer_height());
+        t_input.end();
 
         glm::mat4 vp = cam.view_projection();
 
         // --- Geometry pass ---
+        t_geo.begin();
         gbuf.bind_for_geometry();
         geo_prog.use();
         auto geo_loc = [&](const char* n) { return geo_prog.uniform_location(n); };
@@ -1687,10 +2259,12 @@ int main() {
 
             model.mesh(size_t(mi)).draw();
         }
+        t_geo.end();
 
         gl::disable(GL_DEPTH_TEST);
 
         // --- Lighting / patch pass ---
+        t_light.begin();
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         gl::viewport(0, 0, window.framebuffer_width(), window.framebuffer_height());
         gl::clear_color(0.03f, 0.03f, 0.05f, 1.0f);
@@ -1721,130 +2295,146 @@ int main() {
             quad_vao.bind();
             gl::draw_elements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, nullptr);
         }
+        t_light.end();
 
         // --- Primary-ray pass: BVH traversal + atlas mip-chain refinement ---
-        {
-            if (!ray_pass.ray_tex || ray_pass.w != window.framebuffer_width() ||
-                ray_pass.h != window.framebuffer_height()) {
-                if (!ray_pass.ray_tex) glGenTextures(1, &ray_pass.ray_tex);
-                ray_pass.w = window.framebuffer_width();
-                ray_pass.h = window.framebuffer_height();
-                glBindTexture(GL_TEXTURE_2D, ray_pass.ray_tex);
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, ray_pass.w, ray_pass.h, 0,
-                             GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-                glBindTexture(GL_TEXTURE_2D, 0);
-            }
-
-            ray_prog.use();
-            auto r_loc = [&](const char* n) { return ray_prog.uniform_location(n); };
-            loc = r_loc("u_vp_inv");
-            if (loc >= 0) ray_prog.uniform_matrix4fv(loc, glm::value_ptr(glm::inverse(vp)));
-            loc = r_loc("u_res");        if (loc >= 0) ray_prog.uniform2f(loc, float(ray_pass.w), float(ray_pass.h));
-            loc = r_loc("u_ro");         if (loc >= 0) ray_prog.uniform3fv(loc, glm::value_ptr(cam.position()));
-            loc = r_loc("u_depth_origin"); if (loc >= 0) ray_prog.uniform3fv(loc, glm::value_ptr(ray_depth_origin));
-            loc = r_loc("u_depth_lo");   if (loc >= 0) ray_prog.uniform1f(loc, ray_depth_lo);
-            loc = r_loc("u_depth_hi");   if (loc >= 0) ray_prog.uniform1f(loc, ray_depth_hi);
-            loc = r_loc("u_thick_max");  if (loc >= 0) ray_prog.uniform1f(loc, ray_thick_max);
-            loc = r_loc("u_connect_tol"); if (loc >= 0) ray_prog.uniform1f(loc, ray_connect_tol);
-            loc = r_loc("u_eps");        if (loc >= 0) ray_prog.uniform1f(loc, ray_eps);
-            loc = r_loc("u_dbg");        if (loc >= 0) ray_prog.uniform1i(loc, ray_dbg);
-            loc = r_loc("u_patch_count"); if (loc >= 0) ray_prog.uniform1i(loc, int(patch_gpu.patch_count));
-            loc = r_loc("u_level_off");  if (loc >= 0) glUniform1iv(loc, 32, atlas_view.level_off);
-            loc = r_loc("u_value_off_depth");  if (loc >= 0) glUniform1iv(loc, 32, atlas_view.value_off[2]);
-            loc = r_loc("u_value_off_thick");  if (loc >= 0) glUniform1iv(loc, 32, atlas_view.value_off[1]);
-            loc = r_loc("u_value_off_normal"); if (loc >= 0) glUniform1iv(loc, 32, atlas_view.value_off[3]);
-            loc = r_loc("u_depth_tex");  if (loc >= 0) ray_prog.uniform1i(loc, 0);
-            loc = r_loc("u_thick_tex");  if (loc >= 0) ray_prog.uniform1i(loc, 1);
-            loc = r_loc("u_normal_tex"); if (loc >= 0) ray_prog.uniform1i(loc, 2);
-
-            glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, atlas_view.value_tex[2]);
-            glActiveTexture(GL_TEXTURE1);
-            glBindTexture(GL_TEXTURE_2D, atlas_view.value_tex[1]);
-            glActiveTexture(GL_TEXTURE2);
-            glBindTexture(GL_TEXTURE_2D, atlas_view.value_tex[3]);
-
-            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, atlas_view.rects_ssbo);
-            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, atlas_view.meta_ssbo);
-            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, ray_pass.patch_info_ssbo);
-            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, ray_pass.bvh_ssbo);
-            glBindImageTexture(0, ray_pass.ray_tex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
-            gl::dispatch_compute((ray_pass.w + 15) / 16, (ray_pass.h + 15) / 16, 1);
-            gl::memory_barrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
-                               GL_TEXTURE_FETCH_BARRIER_BIT);
-            glBindImageTexture(0, 0, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA8);
-
-            // TEMP: dump the ray-pass output for the sweep.
-            if (sweep_total) {
-                char path[128];
-                std::snprintf(path, sizeof(path), "/tmp/opencode/sweep_%03d.ppm", sweep_frame);
-                glBindTexture(GL_TEXTURE_2D, ray_pass.ray_tex);
-                glPixelStorei(GL_PACK_ALIGNMENT, 1);
-                std::vector<uint8_t> px(size_t(ray_pass.w) * ray_pass.h * 3);
-                glGetTexImage(GL_TEXTURE_2D, 0, GL_RGB, GL_UNSIGNED_BYTE, px.data());
-                FILE* f = fopen(path, "wb");
-                fprintf(f, "P6\n%d %d\n255\n", ray_pass.w, ray_pass.h);
-                fwrite(px.data(), 1, px.size(), f);
-                fclose(f);
-                ++sweep_frame;
-                if (sweep_frame >= sweep_total) {
-                    FILE* done = fopen("/tmp/opencode/sweep_done", "wb");
-                    if (done) fclose(done);
+        if (show_ray_pass) {
+                if (!ray_pass.ray_tex || ray_pass.w != window.framebuffer_width() ||
+                    ray_pass.h != window.framebuffer_height()) {
+                    if (!ray_pass.ray_tex) glGenTextures(1, &ray_pass.ray_tex);
+                    ray_pass.w = window.framebuffer_width();
+                    ray_pass.h = window.framebuffer_height();
+                    glBindTexture(GL_TEXTURE_2D, ray_pass.ray_tex);
+                    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, ray_pass.w, ray_pass.h, 0,
+                                 GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                    glBindTexture(GL_TEXTURE_2D, 0);
                 }
-            }
 
-            GLint upc = -1, ures[2] = {0, 0};
-            GLint loc2 = r_loc("u_patch_count");
-            if (loc2 >= 0) glGetUniformiv(ray_prog.handle(), loc2, &upc);
-            loc2 = r_loc("u_res");
-            if (loc2 >= 0) glGetUniformiv(ray_prog.handle(), loc2, ures);
-            GLint64 sz3 = 0, sz0 = 0;
-            glBindBuffer(GL_SHADER_STORAGE_BUFFER, atlas_view.rects_ssbo);
-            glGetBufferParameteri64v(GL_SHADER_STORAGE_BUFFER, GL_BUFFER_SIZE, &sz0);
-            glBindBuffer(GL_SHADER_STORAGE_BUFFER, ray_pass.bvh_ssbo);
-            glGetBufferParameteri64v(GL_SHADER_STORAGE_BUFFER, GL_BUFFER_SIZE, &sz3);
-            glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
-            //printf("CHECK: u_patch_count=%d u_res=%d,%d rects_ssbo=%lld bvh_ssbo=%lld\n",
-            //       upc, ures[0], ures[1], (long long)sz0, (long long)sz3);
+                t_ray.begin();
+                gl::Program* rp;
+                if (ray_dbg != 0)
+                    rp = perf_enabled ? &ray_debug_perf_prog : &ray_debug_prog;
+                else
+                    rp = perf_enabled ? &ray_lean_perf_prog : &ray_lean_prog;
+                rp->use();
+                auto r_loc = [&](const char* n) { return rp->uniform_location(n); };
+                loc = r_loc("u_vp_inv");
+                if (loc >= 0) rp->uniform_matrix4fv(loc, glm::value_ptr(glm::inverse(vp)));
+                loc = r_loc("u_res");        if (loc >= 0) rp->uniform2f(loc, float(ray_pass.w), float(ray_pass.h));
+                loc = r_loc("u_ro");         if (loc >= 0) rp->uniform3fv(loc, glm::value_ptr(cam.position()));
+                loc = r_loc("u_depth_origin"); if (loc >= 0) rp->uniform3fv(loc, glm::value_ptr(ray_depth_origin));
+                loc = r_loc("u_depth_lo");   if (loc >= 0) rp->uniform1f(loc, ray_depth_lo);
+                loc = r_loc("u_depth_hi");   if (loc >= 0) rp->uniform1f(loc, ray_depth_hi);
+                loc = r_loc("u_thick_max");  if (loc >= 0) rp->uniform1f(loc, ray_thick_max);
+                loc = r_loc("u_eps");        if (loc >= 0) rp->uniform1f(loc, ray_eps);
+                loc = r_loc("u_dbg");        if (loc >= 0) rp->uniform1i(loc, ray_dbg);
+                loc = r_loc("u_perf");       if (loc >= 0) rp->uniform1i(loc, perf_enabled);
+                loc = r_loc("u_patch_count"); if (loc >= 0) rp->uniform1i(loc, int(patch_gpu.patch_count));
+                loc = r_loc("u_level_off");  if (loc >= 0) glUniform1iv(loc, 32, atlas_view.level_off);
+                loc = r_loc("u_value_off_dt"); if (loc >= 0) glUniform1iv(loc, 32, atlas_view.value_off_dt);
+                loc = r_loc("u_dt_buf");     if (loc >= 0) rp->uniform1i(loc, 0);
 
-            if (getenv("RAYDUMP") && frame <= 2) {
-                char path[128];
-                std::snprintf(path, sizeof(path), "/tmp/opencode/ray_%d.ppm", frame);
-                std::vector<uint8_t> px(size_t(ray_pass.w) * ray_pass.h * 3);
-                glBindTexture(GL_TEXTURE_2D, ray_pass.ray_tex);
-                glGetTexImage(GL_TEXTURE_2D, 0, GL_RGB, GL_UNSIGNED_BYTE, px.data());
-                FILE* f = fopen(path, "wb");
-                fprintf(f, "P6\n%d %d\n255\n", ray_pass.w, ray_pass.h);
-                fwrite(px.data(), 1, px.size(), f);
-                fclose(f);
-                printf("RAYDUMP: wrote %s\n", path);
-                if (frame == 1) {
-                    std::vector<BvhGPU> bv(atlas.bvh_nodes().size());
-                    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, ray_pass.bvh_ssbo);
-                    glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, atlas.bvh_nodes().size() * sizeof(BvhGPU), bv.data());
-                    FILE* bf = fopen("/tmp/opencode/gpu_bvh.bin", "wb");
-                    fwrite(bv.data(), sizeof(BvhGPU), bv.size(), bf);
-                    fclose(bf);
-                    std::vector<PatchInfoGPU> pi(patch_gpu.patch_count);
-                    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, ray_pass.patch_info_ssbo);
-                    glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, patch_gpu.patch_count * sizeof(PatchInfoGPU), pi.data());
-                    FILE* pf = fopen("/tmp/opencode/gpu_patch.bin", "wb");
-                    fwrite(pi.data(), sizeof(PatchInfoGPU), pi.size(), pf);
-                    fclose(pf);
-                    glm::mat4 vpinv = glm::inverse(vp);
-                    FILE* cf = fopen("/tmp/opencode/gpu_cam.bin", "wb");
-                    fwrite(glm::value_ptr(vpinv), 16, 4, cf);
-                    glm::vec3 cpos = cam.position();
-                    fwrite(glm::value_ptr(cpos), 3, 4, cf);
-                    glm::vec3 dor = ray_depth_origin;
-                    fwrite(glm::value_ptr(dor), 3, 4, cf);
-                    fwrite(&ray_depth_lo, 4, 1, cf);
-                    fwrite(&ray_depth_hi, 4, 1, cf);
-                    fwrite(&ray_thick_max, 4, 1, cf);
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_BUFFER, atlas_view.dt_tex);
+
+                glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, atlas_view.rects_ssbo);
+                glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, atlas_view.meta_ssbo);
+                glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, ray_pass.patch_info_ssbo);
+                glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, ray_pass.bvh_ssbo);
+                if (perf_enabled) {
+                    GLuint z[6] = {0, 0, 0, 0, 0, 0};
+                    glBindBuffer(GL_SHADER_STORAGE_BUFFER, perf_ssbo);
+                    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(z), z);
+                    glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+                    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, perf_ssbo);
+                }
+                glBindImageTexture(0, ray_pass.ray_tex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+                gl::dispatch_compute((ray_pass.w + 15) / 16, (ray_pass.h + 15) / 16, 1);
+                gl::memory_barrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
+                                   GL_TEXTURE_FETCH_BARRIER_BIT |
+                                   GL_SHADER_STORAGE_BARRIER_BIT);
+                glBindImageTexture(0, 0, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA8);
+                if (perf_enabled) {
+                    GLuint pv[6] = {0, 0, 0, 0, 0, 0};
+                    glBindBuffer(GL_SHADER_STORAGE_BUFFER, perf_ssbo);
+                    glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(pv), pv);
+                    glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+                    for (int k = 0; k < 6; ++k) perf_acc[k] += pv[k];
+                    perf_frames++;
+                }
+                t_ray.end();
+
+                // TEMP: dump the ray-pass output for the sweep.
+                if (sweep_total) {
+                    char path[128];
+                    std::snprintf(path, sizeof(path), "/tmp/opencode/sweep_%03d.ppm", sweep_frame);
+                    glBindTexture(GL_TEXTURE_2D, ray_pass.ray_tex);
+                    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+                    std::vector<uint8_t> px(size_t(ray_pass.w) * ray_pass.h * 3);
+                    glGetTexImage(GL_TEXTURE_2D, 0, GL_RGB, GL_UNSIGNED_BYTE, px.data());
+                    FILE* f = fopen(path, "wb");
+                    fprintf(f, "P6\n%d %d\n255\n", ray_pass.w, ray_pass.h);
+                    fwrite(px.data(), 1, px.size(), f);
+                    fclose(f);
+                    ++sweep_frame;
+                    if (sweep_frame >= sweep_total) {
+                        FILE* done = fopen("/tmp/opencode/sweep_done", "wb");
+                        if (done) fclose(done);
+                    }
+                }
+
+                GLint upc = -1, ures[2] = {0, 0};
+                GLint loc2 = r_loc("u_patch_count");
+                if (loc2 >= 0) glGetUniformiv(rp->handle(), loc2, &upc);
+                loc2 = r_loc("u_res");
+                if (loc2 >= 0) glGetUniformiv(rp->handle(), loc2, ures);
+                GLint64 sz3 = 0, sz0 = 0;
+                glBindBuffer(GL_SHADER_STORAGE_BUFFER, atlas_view.rects_ssbo);
+                glGetBufferParameteri64v(GL_SHADER_STORAGE_BUFFER, GL_BUFFER_SIZE, &sz0);
+                glBindBuffer(GL_SHADER_STORAGE_BUFFER, ray_pass.bvh_ssbo);
+                glGetBufferParameteri64v(GL_SHADER_STORAGE_BUFFER, GL_BUFFER_SIZE, &sz3);
+                glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+                //printf("CHECK: u_patch_count=%d u_res=%d,%d rects_ssbo=%lld bvh_ssbo=%lld\n",
+                //       upc, ures[0], ures[1], (long long)sz0, (long long)sz3);
+
+                if (getenv("RAYDUMP") && frame <= 2) {
+                    char path[128];
+                    std::snprintf(path, sizeof(path), "/tmp/opencode/ray_%d.ppm", frame);
+                    std::vector<uint8_t> px(size_t(ray_pass.w) * ray_pass.h * 3);
+                    glBindTexture(GL_TEXTURE_2D, ray_pass.ray_tex);
+                    glGetTexImage(GL_TEXTURE_2D, 0, GL_RGB, GL_UNSIGNED_BYTE, px.data());
+                    FILE* f = fopen(path, "wb");
+                    fprintf(f, "P6\n%d %d\n255\n", ray_pass.w, ray_pass.h);
+                    fwrite(px.data(), 1, px.size(), f);
+                    fclose(f);
+                    printf("RAYDUMP: wrote %s\n", path);
+                    if (frame == 1) {
+                        std::vector<BvhGPU> bv(atlas.bvh_nodes().size());
+                        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, ray_pass.bvh_ssbo);
+                        glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, atlas.bvh_nodes().size() * sizeof(BvhGPU), bv.data());
+                        FILE* bf = fopen("/tmp/opencode/gpu_bvh.bin", "wb");
+                        fwrite(bv.data(), sizeof(BvhGPU), bv.size(), bf);
+                        fclose(bf);
+                        std::vector<PatchInfoGPU> pi(patch_gpu.patch_count);
+                        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, ray_pass.patch_info_ssbo);
+                        glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, patch_gpu.patch_count * sizeof(PatchInfoGPU), pi.data());
+                        FILE* pf = fopen("/tmp/opencode/gpu_patch.bin", "wb");
+                        fwrite(pi.data(), sizeof(PatchInfoGPU), pi.size(), pf);
+                        fclose(pf);
+                        glm::mat4 vpinv = glm::inverse(vp);
+                        FILE* cf = fopen("/tmp/opencode/gpu_cam.bin", "wb");
+                        fwrite(glm::value_ptr(vpinv), 16, 4, cf);
+                        glm::vec3 cpos = cam.position();
+                        fwrite(glm::value_ptr(cpos), 3, 4, cf);
+                        glm::vec3 dor = ray_depth_origin;
+                        fwrite(glm::value_ptr(dor), 3, 4, cf);
+                        fwrite(&ray_depth_lo, 4, 1, cf);
+                        fwrite(&ray_depth_hi, 4, 1, cf);
+                        fwrite(&ray_thick_max, 4, 1, cf);
                     fwrite(&ray_eps, 4, 1, cf);
                     fclose(cf);
                     printf("DUMP: wrote gpu_bvh/gpu_patch/gpu_cam.bin\n");
@@ -1852,19 +2442,24 @@ int main() {
             }
 
             if (show_ray_pass) {
-                gl::disable(GL_DEPTH_TEST);
-                ray_disp_prog.use();
-                loc = ray_disp_prog.uniform_location("u_tex");
-                if (loc >= 0) ray_disp_prog.uniform1i(loc, 0);
-                glActiveTexture(GL_TEXTURE0);
-                glBindTexture(GL_TEXTURE_2D, ray_pass.ray_tex);
-                quad_vao.bind();
-                gl::draw_elements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, nullptr);
-            }
+                t_ray_disp.begin();
+                    gl::disable(GL_DEPTH_TEST);
+                    ray_disp_prog.use();
+                    loc = ray_disp_prog.uniform_location("u_tex");
+                    if (loc >= 0) ray_disp_prog.uniform1i(loc, 0);
+                    glActiveTexture(GL_TEXTURE0);
+                    glBindTexture(GL_TEXTURE_2D, ray_pass.ray_tex);
+                    quad_vao.bind();
+                    gl::draw_elements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, nullptr);
+                    t_ray_disp.end();
+                } else {
+                    t_ray_disp.skip();
+                }
         }
 
         // --- Atlas texture reconstruction (full MIP4 chain walk, into view FBO) ---
-        if (atlas_view.view_tex) {
+        if (show_atlas && atlas_view.view_tex) {
+            t_atlas.begin();
             glBindFramebuffer(GL_FRAMEBUFFER, atlas_view.fbo);
             gl::viewport(0, 0, atlas_view.view_w, atlas_view.view_h);
             glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
@@ -1894,6 +2489,9 @@ int main() {
 
             glBindFramebuffer(GL_FRAMEBUFFER, 0);
             gl::viewport(0, 0, window.framebuffer_width(), window.framebuffer_height());
+            t_atlas.end();
+        } else {
+            t_atlas.skip();
         }
 
         // --- TEMP: dump atlas view texture for debugging ---
@@ -2046,6 +2644,7 @@ int main() {
 
         // --- BVH wireframe overlay ---
         if (show_bvh && !atlas.bvh_nodes().empty()) {
+            t_bvh.begin();
             if (show_bvh_occ) {
                 // The lighting quad overwrote the default FB depth, so restore
                 // the scene depth from the G-buffer to get correct occlusion.
@@ -2079,15 +2678,140 @@ int main() {
             }
             bvh_draw.render(vp);
             gl::disable(GL_DEPTH_TEST);
+            t_bvh.end();
+        } else {
+            t_bvh.skip();
         }
 
+        t_imgui.begin();
         // --- ImGui debug window ---
         {
             ImGui::Begin("MDC Lighting - Debug");
-            ImGui::Text("Frametime: %.3f ms", dt * 1000.0f);
+            ImGui::Text("Frametime (avg 0.5s): %.3f ms", disp_frame_period);
             ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
-            ImGui::PlotLines("ms", frame_times.data(), int(frame_times.size()),
-                             0, nullptr, 0.0f, 40.0f, ImVec2(0, 60));
+            ImGui::PlotLines("frame period ms (raw)", frame_times.data(), int(frame_times.size()),
+                             0, nullptr, 0.0f, 40.0f, ImVec2(0, 50));
+            ImGui::Separator();
+
+            // ---- Frame timing breakdown ----
+            // Order matches the order the segments run in each frame.
+            struct PassRow { const char* name; const PassTimer* t; };
+            const PassRow passes[] = {
+                {"poll events", &t_poll},
+                {"camera input", &t_input},
+                {"geometry", &t_geo},
+                {"lighting", &t_light},
+                {"ray compute", &t_ray},
+                {"ray display", &t_ray_disp},
+                {"atlas view", &t_atlas},
+                {"bvh overlay", &t_bvh},
+                {"imgui build", &t_imgui},
+                {"present", &t_present},
+            };
+            const int kPasses = int(sizeof(passes) / sizeof(passes[0]));
+            const ImU32 pass_cols[kPasses] = {
+                IM_COL32(236, 100, 75, 255),
+                IM_COL32(243, 156, 18, 255),
+                IM_COL32(52, 152, 219, 255),
+                IM_COL32(46, 204, 113, 255),
+                IM_COL32(155, 89, 182, 255),
+                IM_COL32(52, 73, 94, 255),
+                IM_COL32(241, 196, 15, 255),
+                IM_COL32(26, 188, 156, 255),
+                IM_COL32(230, 126, 34, 255),
+                IM_COL32(192, 57, 43, 255),
+            };
+
+            double gpu_sum = 0.0;
+            for (int i = 0; i < kPasses; ++i)
+                if (passes[i].t->gpu()) gpu_sum += passes[i].t->disp_gpu();
+
+            if (ImGui::BeginTable("ftable", 3,
+                                  ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+                ImGui::TableSetupColumn("Pass", ImGuiTableColumnFlags_WidthFixed);
+                ImGui::TableSetupColumn("GPU avg (ms)", ImGuiTableColumnFlags_WidthFixed);
+                ImGui::TableSetupColumn("CPU avg (ms)", ImGuiTableColumnFlags_WidthFixed);
+                ImGui::TableHeadersRow();
+                for (int i = 0; i < kPasses; ++i) {
+                    const PassTimer& t = *passes[i].t;
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%s", passes[i].name);
+                    if (t.gpu()) {
+                        ImGui::TableNextColumn(); ImGui::Text("%.3f", t.disp_gpu());
+                    } else {
+                        ImGui::TableNextColumn(); ImGui::Text("cpu-only");
+                    }
+                    ImGui::TableNextColumn(); ImGui::Text("%.3f", t.disp_cpu());
+                }
+                const ImVec4 total_col(1.0f, 0.82f, 0.3f, 1.0f);
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn(); ImGui::TextColored(total_col, "frame total");
+                ImGui::TableNextColumn(); ImGui::TextColored(total_col, "%.3f", gpu_sum);
+                ImGui::TableNextColumn(); ImGui::TextColored(total_col, "%.3f", t_frame.disp_cpu());
+                ImGui::EndTable();
+            }
+
+            // CPU time stacked bar across every segment of the frame.
+            const char* cpu_names[kPasses];
+            float cpu_vals[kPasses];
+            for (int i = 0; i < kPasses; ++i) {
+                cpu_names[i] = passes[i].name;
+                cpu_vals[i] = float(passes[i].t->disp_cpu());
+            }
+            ImGui::Text("CPU time by segment (frame: %.3f ms):", t_frame.disp_cpu());
+            float bar_w = ImGui::GetContentRegionAvail().x;
+            if (bar_w < 64) bar_w = 256;
+            imgui_stacked_bar(ImGui::GetCursorScreenPos(), ImVec2(bar_w, 16),
+                              cpu_vals, pass_cols, kPasses);
+            ImGui::Dummy(ImVec2(0, 16));
+            imgui_stacked_legend("cpu_legend", cpu_names, cpu_vals, pass_cols, kPasses,
+                                 float(t_frame.disp_cpu()));
+            ImGui::Separator();
+
+            // GPU time stacked bar across the GPU passes only.
+            const char* gpu_names[kPasses];
+            float gpu_vals[kPasses];
+            ImU32 gpu_cols[kPasses];
+            int gn = 0;
+            for (int i = 0; i < kPasses; ++i)
+                if (passes[i].t->gpu()) {
+                    gpu_names[gn] = passes[i].name;
+                    gpu_vals[gn] = float(passes[i].t->disp_gpu());
+                    gpu_cols[gn] = pass_cols[i];
+                    ++gn;
+                }
+            ImGui::Text("GPU time by pass (sum: %.3f ms):", gpu_sum);
+            float gw = ImGui::GetContentRegionAvail().x;
+            if (gw < 64) gw = 256;
+            imgui_stacked_bar(ImGui::GetCursorScreenPos(), ImVec2(gw, 16),
+                              gpu_vals, gpu_cols, gn);
+            ImGui::Dummy(ImVec2(0, 16));
+            imgui_stacked_legend("gpu_legend", gpu_names, gpu_vals, gpu_cols, gn,
+                                 float(gpu_sum));
+            ImGui::Separator();
+
+            if (ImGui::CollapsingHeader("Pass history (120 windowed samples)")) {
+                for (int i = 0; i < kPasses; ++i) {
+                    const PassTimer& t = *passes[i].t;
+                    if (!t.cpu_hist().empty()) {
+                        ImGui::PlotLines(passes[i].name, t.cpu_hist().data(),
+                                         int(t.cpu_hist().size()), 0, nullptr,
+                                         0.0f, 40.0f, ImVec2(0, 26));
+                    }
+                }
+            }
+
+            if (perf_enabled && perf_frames > 0) {
+                double rays = double(perf_acc[5]);
+                if (rays > 0.0) {
+                    ImGui::Text("Ray work / ray: leaf %.1f  texel %.1f  march %.1f  bisect %.1f",
+                                double(perf_acc[0]) / rays, double(perf_acc[1]) / rays,
+                                double(perf_acc[2]) / rays, double(perf_acc[3]) / rays);
+                    ImGui::Text("Guard-limited rays: %.0f / %.0f",
+                                double(perf_acc[4]), rays);
+                }
+            }
             ImGui::Separator();
 
             int cur_model_prev = cur_model;
@@ -2116,6 +2840,7 @@ int main() {
             ImGui::Checkbox("Occlude BVH by scene depth", &show_bvh_occ);
             ImGui::Separator();
 
+            ImGui::Checkbox("Show atlas reconstruction", &show_atlas);
             ImGui::Checkbox("Show primary-ray normals", &show_ray_pass);
             if (show_ray_pass) {
                 ImGui::SliderFloat("Connectivity tol", &ray_connect_tol, 0.001f, 0.2f, "%.3f");
@@ -2205,10 +2930,50 @@ int main() {
             ImGui::Image((ImTextureID)(intptr_t)gbuf.depth_handle(), ImVec2(sz, sz * 0.5f), ImVec2(0, 1), ImVec2(1, 0));
             ImGui::End();
         }
-        gui.render();
+        t_imgui.end();
 
+        t_present.begin();
+        gui.render();
         window.swap_buffers();
+        t_present.end();
+        t_frame.end();
+
+        t_frame.readback();
+        t_poll.readback();
+        t_input.readback();
+        t_geo.readback();
+        t_light.readback();
+        t_ray.readback();
+        t_ray_disp.readback();
+        t_atlas.readback();
+        t_bvh.readback();
+        t_imgui.readback();
+        t_present.readback();
+
+        // Every ~0.5 s, average the accumulated samples into the values the
+        // ImGui window displays so the readout is stable instead of jumping
+        // on every frame.
+        if (window.time() - win_start >= 0.5) {
+            win_start = window.time();
+            disp_frame_period = period_n ? period_acc / double(period_n) : 0.0;
+            period_acc = 0.0;
+            period_n = 0;
+            t_frame.flush_window();
+            t_poll.flush_window();
+            t_input.flush_window();
+            t_geo.flush_window();
+            t_light.flush_window();
+            t_ray.flush_window();
+            t_ray_disp.flush_window();
+            t_atlas.flush_window();
+            t_bvh.flush_window();
+            t_imgui.flush_window();
+            t_present.flush_window();
+        }
+        if (frame % 120 == 0 || (perf_enabled && frame % 5 == 0)) print_perf();
     }
+
+    print_perf();
 
     return EXIT_SUCCESS;
 }
