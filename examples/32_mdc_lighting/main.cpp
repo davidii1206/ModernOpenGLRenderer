@@ -297,6 +297,9 @@ void main() {
 // ---------------------------------------------------------------------------
 
 static const char* ray_common_glsl = R"(
+#ifdef PERF_ENABLED
+#extension GL_ARB_shader_clock : require
+#endif
 layout(local_size_x = 16, local_size_y = 16) in;
 
 const int LEAF_TILE = 1;
@@ -342,9 +345,16 @@ uniform usamplerBuffer u_dt_buf;
 uniform int  u_level_off[32];      // meta SSBO offsets per level (shared)
 uniform int  u_value_off_dt[32];   // value offsets per level (shared topology)
 uniform int  u_patch_count;
-uniform mat4 u_vp_inv;
+uniform mat4 u_vp_inv;           // debug kernel only; lean uses the ray basis
 uniform vec2 u_res;
 uniform vec3 u_ro;
+uniform vec2 u_ndc_scale;        // ndc = u_ndc_scale*p + u_ndc_bias  (p = pixel)
+uniform vec2 u_ndc_bias;
+uniform vec3 u_rd0;              // rd = normalize(u_rd0 + ndc.x*u_rd_dx + ndc.y*u_rd_dy)
+uniform vec3 u_rd_dx;            // exact per-pixel ray basis precomputed on CPU
+uniform vec3 u_rd_dy;
+uniform vec3 u_root_amin;        // BVH root AABB, avoids the bvh[0] SSBO read
+uniform vec3 u_root_amax;
 uniform vec3 u_depth_origin;       // g_depth_origin (model AABB min)
 uniform float u_depth_lo;          // depth chain qmin[0]
 uniform float u_depth_hi;          // depth chain qmax[0]
@@ -362,6 +372,8 @@ layout(binding = 0, rgba8) uniform image2D u_out;
 layout(std430, binding = 4) buffer PerfBuf { uint perf[]; };
 // perf[]: 0=leaf visits, 1=texel queries, 2=march iters, 3=bisect iters,
 //         4=guard-limited rays, 5=rays traced
+//        6=cycles setup, 7=cycles traversal, 8=cycles leaf setup,
+//        9=cycles march loop, 10=cycles bisection, 11=cycles finalize
 uniform int u_perf;    // runtime gate for the debug kernel's counters
 #endif
 
@@ -513,14 +525,12 @@ void main() {
     }
 #ifdef PERF_ENABLED
     atomicAdd(perf[5], 1u);
+    uint t_setup0 = clock2x32ARB().x;
 #endif
 
-    vec2 ndc = vec2(2.0 * (float(p.x) + 0.5) / u_res.x - 1.0,
-                    2.0 * (float(p.y) + 0.5) / u_res.y - 1.0);
-    vec4 cw = u_vp_inv * vec4(ndc, 1.0, 1.0);
-    vec3 wpos = cw.xyz / cw.w;
+    vec2 ndc = u_ndc_scale * vec2(p) + u_ndc_bias;
     vec3 ro = u_ro;
-    vec3 rd = normalize(wpos - ro);
+    vec3 rd = normalize(u_rd0 + ndc.x * u_rd_dx + ndc.y * u_rd_dy);
 
     float best_t = 1.0e30;
     int best_pid = -1;
@@ -541,9 +551,13 @@ void main() {
     int sp = 0;
 
     float rt0, rt1;
-    if (ray_aabb(ro, rd, bvh[0].amin, bvh[0].amax, rt0, rt1)) {
+    if (ray_aabb(ro, rd, u_root_amin, u_root_amax, rt0, rt1)) {
         st_node[sp] = 0; st_tin[sp] = rt0; st_tout[sp] = rt1; sp++;
     }
+#ifdef PERF_ENABLED
+    atomicAdd(perf[6], clock2x32ARB().x - t_setup0);
+    uint t_trav0 = clock2x32ARB().x;
+#endif
 
     while (sp > 0) {
         sp--;
@@ -556,6 +570,8 @@ void main() {
         if (b.is_leaf != 0u) {
 #ifdef PERF_ENABLED
             atomicAdd(perf[0], 1u);
+            uint t_leaf0 = clock2x32ARB().x;
+            atomicAdd(perf[7], t_leaf0 - t_trav0);
 #endif
             int pid = int(b.val);
             PatchInfo pi = patches[pid];
@@ -586,6 +602,10 @@ void main() {
             float t_prev = tin;
             bool prev_before = false;   // previous sample still in front of the band
             int guard = 0;
+#ifdef PERF_ENABLED
+            uint t_march0 = clock2x32ARB().x;
+            atomicAdd(perf[8], t_march0 - t_leaf0);
+#endif
             while (guard < 2048 && t <= tout) {
                 guard++;
 #ifdef PERF_ENABLED
@@ -623,6 +643,9 @@ void main() {
                 bool cur_before = !inside || (D > band_hi + htol);
 
                 if (have_prev && (prev_before != cur_before)) {
+#ifdef PERF_ENABLED
+                    uint t_bisect0 = clock2x32ARB().x;
+#endif
                     float ta = t_prev;
                     float tb = t;
                     for (int it = 0; it < 8; ++it) {
@@ -673,6 +696,9 @@ void main() {
                             }
                         }
                     }
+#ifdef PERF_ENABLED
+                atomicAdd(perf[10], clock2x32ARB().x - t_bisect0);
+#endif
                 }
 
                 t_prev = t;
@@ -684,7 +710,9 @@ void main() {
                 if (t > tout) t = tout;    // land the final sample on the exit
             }
 #ifdef PERF_ENABLED
+            atomicAdd(perf[9], clock2x32ARB().x - t_march0);
             if (guard >= 2048) atomicAdd(perf[4], 1u);
+            t_trav0 = clock2x32ARB().x;
 #endif
         } else {
             int left = node + 1;
@@ -721,6 +749,10 @@ void main() {
             }
         }
     }
+#ifdef PERF_ENABLED
+    atomicAdd(perf[7], clock2x32ARB().x - t_trav0);
+    uint t_final0 = clock2x32ARB().x;
+#endif
 
     if (best_pid < 0) {
         imageStore(u_out, p, vec4(0.0));
@@ -741,6 +773,9 @@ void main() {
     if (dot(n, rd) > 0.0) n = -n;
 
     imageStore(u_out, p, vec4(n * 0.5 + 0.5, 1.0));
+#ifdef PERF_ENABLED
+    atomicAdd(perf[11], clock2x32ARB().x - t_final0);
+#endif
 }
 )";
 
@@ -1288,6 +1323,39 @@ private:
     int n_ = 0, win_n_ = 0;
     bool ran_ = false;
     std::vector<float> cpu_hist_, gpu_hist_;
+};
+
+// Per-phase shader-clock breakdown of the ray kernel, mirrored on PassTimer's
+// 0.5 s display window: readback() per dispatch, flush_window() publishes the
+// averaged cycles/ray values the ImGui window shows so the readout is stable.
+class PhaseAccum {
+public:
+    void readback(const GLuint pv[12]) {
+        for (int k = 0; k < 6; ++k) {
+            cyc_acc_[k] += pv[6 + k];
+            win_cyc_acc_[k] += pv[6 + k];
+        }
+        rays_acc_ += pv[5];
+        win_rays_acc_ += pv[5];
+    }
+
+    void flush_window() {
+        if (win_rays_acc_ > 0.0)
+            for (int k = 0; k < 6; ++k) disp_cyc_[k] = win_cyc_acc_[k] / win_rays_acc_;
+        for (int k = 0; k < 6; ++k) win_cyc_acc_[k] = 0.0;
+        win_rays_acc_ = 0.0;
+    }
+
+    double disp_cyc(int k) const { return disp_cyc_[k]; }
+    double avg_cyc(int k) const {
+        return rays_acc_ > 0.0 ? cyc_acc_[k] / rays_acc_ : 0.0;
+    }
+
+private:
+    double cyc_acc_[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    double win_cyc_acc_[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    double disp_cyc_[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    double rays_acc_ = 0.0, win_rays_acc_ = 0.0;
 };
 
 // Horizontal stacked bar (segment widths ∝ time) drawn with the ImGui draw list.
@@ -2073,12 +2141,13 @@ int main() {
     PassTimer t_present("present", false);     // gui.render + swap_buffers
 
     GLuint perf_ssbo = 0;
-    GLuint perf_acc[6] = {0, 0, 0, 0, 0, 0};
+    GLuint perf_acc[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    PhaseAccum phase_acc;
     int perf_frames = 0;
     if (perf_enabled) {
         glGenBuffers(1, &perf_ssbo);
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, perf_ssbo);
-        glBufferData(GL_SHADER_STORAGE_BUFFER, 6 * sizeof(GLuint), nullptr, GL_DYNAMIC_DRAW);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, 12 * sizeof(GLuint), nullptr, GL_DYNAMIC_DRAW);
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
     }
 
@@ -2131,6 +2200,27 @@ int main() {
                 printf("    march iters / ray   = %.2f\n", double(perf_acc[2]) / rays);
                 printf("    bisect iters / ray  = %.2f\n", double(perf_acc[3]) / rays);
                 printf("    guard exits / ray   = %.4f\n", double(perf_acc[4]) / rays);
+
+                // Per-phase shader-clock cycle buckets (low 32 bits of the
+                // GPU cycle counter, lifetime average), normalised to the
+                // whole-dispatch GPU ms.
+                const char* ph_name[6] = {"setup", "traversal", "leaf_setup",
+                                          "march", "bisect", "finalize"};
+                double ph_cyc[6];
+                for (int k = 0; k < 6; ++k) ph_cyc[k] = phase_acc.avg_cyc(k);
+                double tot_cyc = 0.0;
+                for (int k = 0; k < 6; ++k) tot_cyc += ph_cyc[k];
+                double gpu_ms = t_ray.avg_gpu();
+                if (tot_cyc > 0.0) {
+                    printf("    phase cycles/ray (low32 shader clock):\n");
+                    for (int k = 0; k < 6; ++k)
+                        printf("      %-10s %10.1f  %5.1f%%   ~%.4f ms\n",
+                               ph_name[k], ph_cyc[k],
+                               100.0 * ph_cyc[k] / tot_cyc,
+                               gpu_ms * ph_cyc[k] / tot_cyc);
+                    printf("      (sum %.1f cyc/ray; dispatch %.2f ms; shader clock counts issue cycles, not latency)\n",
+                           tot_cyc, gpu_ms);
+                }
             }
         }
     };
@@ -2322,10 +2412,39 @@ int main() {
                     rp = perf_enabled ? &ray_lean_perf_prog : &ray_lean_prog;
                 rp->use();
                 auto r_loc = [&](const char* n) { return rp->uniform_location(n); };
+                glm::mat4 inv_vp = glm::inverse(vp);
+                glm::vec3 ro = cam.position();
                 loc = r_loc("u_vp_inv");
-                if (loc >= 0) rp->uniform_matrix4fv(loc, glm::value_ptr(glm::inverse(vp)));
+                if (loc >= 0) rp->uniform_matrix4fv(loc, glm::value_ptr(inv_vp));
                 loc = r_loc("u_res");        if (loc >= 0) rp->uniform2f(loc, float(ray_pass.w), float(ray_pass.h));
-                loc = r_loc("u_ro");         if (loc >= 0) rp->uniform3fv(loc, glm::value_ptr(cam.position()));
+                loc = r_loc("u_ro");         if (loc >= 0) rp->uniform3fv(loc, glm::value_ptr(ro));
+                {
+                    // Exact per-pixel ray basis: the unprojected direction to a
+                    // pixel is (col0*ndc.x + col1*ndc.y + col2 + col3).xyz scaled
+                    // by a per-pixel scalar, which normalize() drops, so
+                    // rd = normalize(u_rd0 + ndc.x*u_rd_dx + ndc.y*u_rd_dy) is
+                    // identical to the old mat4 * ndc + perspective-divide.
+                    glm::vec4 c0 = inv_vp[0], c1 = inv_vp[1],
+                              c2 = inv_vp[2], c3 = inv_vp[3];
+                    glm::vec3 rd0 = glm::vec3(c2 + c3) - ro * (c2.w + c3.w);
+                    glm::vec3 rdx = glm::vec3(c0) - ro * c0.w;
+                    glm::vec3 rdy = glm::vec3(c1) - ro * c1.w;
+                    glm::vec2 inv_res = 1.0f / glm::vec2(float(ray_pass.w), float(ray_pass.h));
+                    glm::vec2 ndc_scale = 2.0f * inv_res;
+                    glm::vec2 ndc_bias = inv_res - 1.0f;
+                    loc = r_loc("u_ndc_scale"); if (loc >= 0) rp->uniform2f(loc, ndc_scale.x, ndc_scale.y);
+                    loc = r_loc("u_ndc_bias");  if (loc >= 0) rp->uniform2f(loc, ndc_bias.x, ndc_bias.y);
+                    loc = r_loc("u_rd0");       if (loc >= 0) rp->uniform3fv(loc, glm::value_ptr(rd0));
+                    loc = r_loc("u_rd_dx");     if (loc >= 0) rp->uniform3fv(loc, glm::value_ptr(rdx));
+                    loc = r_loc("u_rd_dy");     if (loc >= 0) rp->uniform3fv(loc, glm::value_ptr(rdy));
+                    const auto& bn = atlas.bvh_nodes();
+                    if (!bn.empty()) {
+                        loc = r_loc("u_root_amin");
+                        if (loc >= 0) rp->uniform3f(loc, bn[0].aabb_min.x, bn[0].aabb_min.y, bn[0].aabb_min.z);
+                        loc = r_loc("u_root_amax");
+                        if (loc >= 0) rp->uniform3f(loc, bn[0].aabb_max.x, bn[0].aabb_max.y, bn[0].aabb_max.z);
+                    }
+                }
                 loc = r_loc("u_depth_origin"); if (loc >= 0) rp->uniform3fv(loc, glm::value_ptr(ray_depth_origin));
                 loc = r_loc("u_depth_lo");   if (loc >= 0) rp->uniform1f(loc, ray_depth_lo);
                 loc = r_loc("u_depth_hi");   if (loc >= 0) rp->uniform1f(loc, ray_depth_hi);
@@ -2346,7 +2465,7 @@ int main() {
                 glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, ray_pass.patch_info_ssbo);
                 glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, ray_pass.bvh_ssbo);
                 if (perf_enabled) {
-                    GLuint z[6] = {0, 0, 0, 0, 0, 0};
+                    GLuint z[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
                     glBindBuffer(GL_SHADER_STORAGE_BUFFER, perf_ssbo);
                     glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(z), z);
                     glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
@@ -2359,11 +2478,12 @@ int main() {
                                    GL_SHADER_STORAGE_BARRIER_BIT);
                 glBindImageTexture(0, 0, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA8);
                 if (perf_enabled) {
-                    GLuint pv[6] = {0, 0, 0, 0, 0, 0};
+                    GLuint pv[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
                     glBindBuffer(GL_SHADER_STORAGE_BUFFER, perf_ssbo);
                     glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(pv), pv);
                     glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
-                    for (int k = 0; k < 6; ++k) perf_acc[k] += pv[k];
+                    for (int k = 0; k < 12; ++k) perf_acc[k] += pv[k];
+                    phase_acc.readback(pv);
                     perf_frames++;
                 }
                 t_ray.end();
@@ -2810,6 +2930,37 @@ int main() {
                                 double(perf_acc[2]) / rays, double(perf_acc[3]) / rays);
                     ImGui::Text("Guard-limited rays: %.0f / %.0f",
                                 double(perf_acc[4]), rays);
+
+                    // Per-phase shader-clock cycles (0.5 s windowed average,
+                    // mirrors the PERF console dump).
+                    static const char* ph_names[6] = {"setup", "traversal",
+                                                      "leaf_setup", "march",
+                                                      "bisect", "finalize"};
+                    const ImU32 ph_cols[6] = {
+                        IM_COL32(52, 152, 219, 255),
+                        IM_COL32(243, 156, 18, 255),
+                        IM_COL32(46, 204, 113, 255),
+                        IM_COL32(236, 100, 75, 255),
+                        IM_COL32(155, 89, 182, 255),
+                        IM_COL32(241, 196, 15, 255),
+                    };
+                    float ph_ms[6] = {0, 0, 0, 0, 0, 0};
+                    double tot_cyc = 0.0;
+                    for (int k = 0; k < 6; ++k) tot_cyc += phase_acc.disp_cyc(k);
+                    if (tot_cyc > 0.0) {
+                        double gpu_ms = t_ray.disp_gpu();
+                        for (int k = 0; k < 6; ++k)
+                            ph_ms[k] = float(gpu_ms * phase_acc.disp_cyc(k) / tot_cyc);
+                        ImGui::Text("Ray shader cycles by phase (dispatch: %.3f ms):",
+                                    gpu_ms);
+                        float bw = ImGui::GetContentRegionAvail().x;
+                        if (bw < 64) bw = 256;
+                        imgui_stacked_bar(ImGui::GetCursorScreenPos(), ImVec2(bw, 16),
+                                          ph_ms, ph_cols, 6);
+                        ImGui::Dummy(ImVec2(0, 16));
+                        imgui_stacked_legend("ray_phase_legend", ph_names, ph_ms, ph_cols,
+                                             6, float(gpu_ms));
+                    }
                 }
             }
             ImGui::Separator();
@@ -2969,6 +3120,7 @@ int main() {
             t_bvh.flush_window();
             t_imgui.flush_window();
             t_present.flush_window();
+            phase_acc.flush_window();
         }
         if (frame % 120 == 0 || (perf_enabled && frame % 5 == 0)) print_perf();
     }
