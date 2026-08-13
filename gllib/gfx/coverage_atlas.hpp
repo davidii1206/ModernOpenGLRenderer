@@ -122,6 +122,12 @@ public:
     const MipChain& uv_chain() const { return uv_chain_; }
     const MipChain& normal_chain() const { return normal_chain_; }
 
+    // Per-texel coverage mask (atlas_w*atlas_h bytes): 1 where the texel is
+    // covered by a surface, 0 elsewhere. The GPU query uses it to resolve the
+    // exact texel's coverage after an early (depth-converged) descent stop,
+    // where the coarse node's aggregate only knows "some texel covered".
+    const std::vector<uint8_t>& coverage() const { return coverage_; }
+
 private:
     CoverageAtlasConfig config_;
     std::vector<glm::vec3> positions_, normals_;
@@ -132,6 +138,7 @@ private:
     int    atlas_w_ = 0, atlas_h_ = 0;
     float  final_density_ = 0.0f;
     MipChain depth_chain_, thickness_chain_, uv_chain_, normal_chain_;
+    std::vector<uint8_t> coverage_;
 };
 
 } // namespace gfx

@@ -1993,12 +1993,13 @@ static bool write_atlas_state(const char* path,
                               const std::vector<BVHNode>& bvh,
                               int atlas_w, int atlas_h, float density,
                               const MipChain& depth, const MipChain& thick,
-                              const MipChain& uv, const MipChain& normal)
+                              const MipChain& uv, const MipChain& normal,
+                              const std::vector<uint8_t>& coverage)
 {
     FILE* f = fopen(path, "wb");
     if (!f) { fprintf(stderr, "Cannot write %s\n", path); return false; }
     write_u32(f, 0x41544C53u);       // "ATLS"
-    write_u32(f, 3u);                // version (3 adds normal_crease_angle)
+    write_u32(f, 4u);                // version (4 adds the per-texel coverage mask)
     write_f32(f, cfg.texel_density); write_i32(f, cfg.auto_target);
     write_f32(f, cfg.budget_texels); write_i32(f, cfg.min_tex); write_i32(f, cfg.max_tex);
     write_f32(f, cfg.mip_tol_frac);  write_i32(f, cfg.mip_leaf_tile);
@@ -2054,6 +2055,8 @@ static bool write_atlas_state(const char* path,
         }
     };
     write_chain(depth); write_chain(thick); write_chain(uv); write_chain(normal);
+    write_u64(f, coverage.size());
+    if (!coverage.empty()) fwrite(coverage.data(), 1, coverage.size(), f);
     fclose(f);
     printf("  Wrote %s\n", path);
     return true;
@@ -2075,13 +2078,13 @@ static bool read_atlas_state(const char* path,
                              std::vector<BVHNode>& bvh,
                              int& atlas_w, int& atlas_h, float& density,
                              MipChain& depth, MipChain& thick, MipChain& uv,
-                             MipChain& normal)
+                             MipChain& normal, std::vector<uint8_t>& coverage)
 {
     FILE* f = fopen(path, "rb");
     if (!f) return false;
     uint32_t magic = 0, version = 0;
     if (!read_u32(f, magic) || magic != 0x41544C53u) { fclose(f); return false; }
-    if (!read_u32(f, version) || version != 3u) { fclose(f); return false; }
+    if (!read_u32(f, version) || version != 4u) { fclose(f); return false; }
 
     auto read_cfg = [&]() -> bool {
         return read_f32(f, cfg.texel_density) && read_i32(f, cfg.auto_target) &&
@@ -2175,6 +2178,12 @@ static bool read_atlas_state(const char* path,
     };
     if (!read_chain(depth) || !read_chain(thick) || !read_chain(uv) ||
         !read_chain(normal)) { fclose(f); return false; }
+    uint64_t csize = 0;
+    if (!read_u64(f, csize)) { fclose(f); return false; }
+    coverage.resize(size_t(csize));
+    if (csize > 0 && !read_blob(f, coverage.data(), coverage.size())) {
+        fclose(f); return false;
+    }
 
     fclose(f);
     printf("  Read %s\n", path);
@@ -2435,6 +2444,12 @@ bool CoverageAtlas::build(const gfx::Model& model) {
                      config_.mip_leaf_tile,
                      depth_chain_, thickness_chain_, uv_chain_, normal_chain_);
 
+    // Per-texel coverage mask: a texel is covered iff it holds a depth value
+    // (same sentinel the pyramid and the tree build use).
+    coverage_.assign(size_t(atlas_w_) * atlas_h_, 0);
+    for (size_t i = 0; i < coverage_.size(); ++i)
+        if (atlas_depth[i] > -1e20f) coverage_[i] = 1;
+
     // Publish results.
     positions_ = std::move(positions);
     normals_   = std::move(normals);
@@ -2477,7 +2492,8 @@ bool CoverageAtlas::write_files(const std::string& dir) const {
     ok &= write_atlas_state(join("atlas_state.bin").c_str(), config_,
                             positions_, normals_, uvs_, triangles_, patches_,
                             bvh_nodes_, atlas_w_, atlas_h_, final_density_,
-                            depth_chain_, thickness_chain_, uv_chain_, normal_chain_);
+                            depth_chain_, thickness_chain_, uv_chain_, normal_chain_,
+                            coverage_);
 
     // --- Patch summary ---
     {
@@ -2528,8 +2544,9 @@ bool CoverageAtlas::load_files(const std::string& dir) {
     int aw = 0, ah = 0;
     float density = 0.0f;
     MipChain depth, thick, uv, normal;
+    std::vector<uint8_t> coverage;
     if (!read_atlas_state(path.c_str(), cfg, positions, normals, uvs, tris, patches,
-                          bvh, aw, ah, density, depth, thick, uv, normal))
+                          bvh, aw, ah, density, depth, thick, uv, normal, coverage))
         return false;
 
     config_ = cfg;
@@ -2545,6 +2562,7 @@ bool CoverageAtlas::load_files(const std::string& dir) {
     thickness_chain_ = std::move(thick);
     uv_chain_ = std::move(uv);
     normal_chain_ = std::move(normal);
+    coverage_ = std::move(coverage);
 
     printf("Loaded cached atlas from %s: %zu patches, %zu triangles, atlas %dx%d @ %.0f texels/unit\n",
            path.c_str(), patches_.size(), triangles_.size(), atlas_w_, atlas_h_, final_density_);

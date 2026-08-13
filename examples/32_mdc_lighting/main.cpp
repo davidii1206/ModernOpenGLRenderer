@@ -305,6 +305,11 @@ layout(local_size_x = 16, local_size_y = 16) in;
 const int LEAF_TILE = 1;
 const int MAX_STACK = 32;
 const int MAX_MIP = 12;
+// A node whose 16-bit depth span (dmax-dmin) is within this many codes is
+// depth-flat: its aggregate dmin/dmax/thick are within the marching band slack
+// of every texel it contains, so the descent can stop there. Flat walls and
+// silhouettes resolve in one fetch; curved/creased regions keep descending.
+const int FLAT_STOP_CODES = 4;
 const int SAMPLES = 8;
 
 struct PatchInfo {
@@ -333,15 +338,21 @@ layout(std430, binding = 1) readonly buffer MetaBuf      { uint  meta[]; };
 layout(std430, binding = 2) readonly buffer PatchInfoBuf { PatchInfo patches[]; };
 layout(std430, binding = 3) readonly buffer BvhBuf       { BVHGPU bvh[]; };
 
-// Combined value buffer texture: one RGBA16UI texel per quadtree node
-//   R = dmin  (16-bit depth)
-//   G = dmax  (16-bit depth)
-//   B = (thick8 << 8) | nrm_x8
-//   A = nrm_y8
-// Depth + thickness + normal all share the quadtree topology, so a single
-// index (u_value_off_dt[L] + idx) fetches everything at once, with no
-// 2D-texel div/mod arithmetic.
-uniform usamplerBuffer u_dt_buf;
+// Per-texel coverage mask packed 4 bytes per uint. u_cover_texel() resolves
+// the exact texel's coverage in one read so the descent may stop at a coarse
+// depth-converged node without losing the empty-texel distinction.
+layout(std430, binding = 5) readonly buffer CoverBuf { uint cover[]; };
+uniform int u_atlas_w;
+
+// Merged meta+values buffer texture: one RGBA32UI texel per quadtree node.
+// Meta and the depth/thick/normal values share the quadtree topology, so one
+// index (u_value_off_dt[L] + idx) fetches the traversal metadata AND the
+// values in a single texelFetch (replacing the old meta SSBO read + RGBA16UI
+// value read):
+//   R = meta32  (0x80000000 covered, 0x40000000 has children, low30 = child)
+//   G = (dmin16 << 16) | dmax16
+//   B = (thick8 << 24) | (nrm_x8 << 8) | nrm_y8
+uniform usamplerBuffer u_dtm_buf;
 uniform int  u_level_off[32];      // meta SSBO offsets per level (shared)
 uniform int  u_value_off_dt[32];   // value offsets per level (shared topology)
 uniform int  u_patch_count;
@@ -394,16 +405,15 @@ vec3 octahedral_decode(vec2 f) {
     return normalize(n);
 }
 
-bool ray_aabb(vec3 ro, vec3 rd, vec3 amin, vec3 amax,
+bool ray_aabb(vec3 ro, vec3 rd, vec3 rd_inv, vec3 amin, vec3 amax,
               out float t_in, out float t_out) {
     t_in = -1.0e30;
     t_out = 1.0e30;
     for (int c = 0; c < 3; ++c) {
-        float o = ro[c], d = rd[c], lo = amin[c], hi = amax[c];
+        float o = ro[c], d = rd[c], inv = rd_inv[c], lo = amin[c], hi = amax[c];
         if (abs(d) < 1.0e-9) {
             if (o < lo || o > hi) return false;
         } else {
-            float inv = 1.0 / d;
             float t1 = (lo - o) * inv;
             float t2 = (hi - o) * inv;
             if (t1 > t2) { float tmp = t1; t1 = t2; t2 = tmp; }
@@ -434,6 +444,12 @@ struct QCache {
 
 // Descend the shared quadtree to the finest node covering atlas texel (tx,ty)
 // of patch pid. Returns true if that node is covered (meta bit 0x80000000).
+// Coverage of the atlas texel (tx,ty) from the byte-packed mask.
+bool u_cover_texel(ivec2 txy) {
+    uint idx = uint(txy.y) * uint(u_atlas_w) + uint(txy.x);
+    return ((cover[idx >> 2u] >> ((idx & 3u) << 3u)) & 0xFFu) != 0u;
+}
+
 bool query_node(inout QCache qc, ivec2 txy, int pid,
                 out int L, out int idx, out int x0, out int y0, out int s,
                 out float dmin, out float dmax, out float thick) {
@@ -470,9 +486,23 @@ bool query_node(inout QCache qc, ivec2 txy, int pid,
     }
     int qc_top = start_k + 1;
 
+    // A single texelFetch per node returns both the traversal metadata (R)
+    // and the values (G/B), so the old path's final-node meta re-read and the
+    // separate value fetch collapse into the same load. The descent also stops
+    // as soon as the node's depth span (dmax-dmin) is within the marching band
+    // slack: depth-flat regions (walls, flat silhouettes) resolve at a coarse
+    // node in one fetch, while curved/creased regions keep descending.
+    uvec4 q;
     while (true) {
-        uint m = meta[u_level_off[L] + idx];
+        q = texelFetch(u_dtm_buf, u_value_off_dt[L] + idx);
+        uint m = q.r;
         if ((m & 0x40000000u) == 0u || s <= LEAF_TILE) break;
+        // Depth-flat early stop: the node's aggregate depth band is within the
+        // marching slack of every texel it contains, so its dmin/dmax/thick
+        // (and, for a flat region, its aggregate normal) are usable directly.
+        uint dmin16 = (q.g >> 16u) & 0xFFFFu;
+        uint dmax16 = q.g & 0xFFFFu;
+        if (dmax16 - dmin16 <= uint(FLAT_STOP_CODES)) break;
         if (qc_top < MAX_MIP) {
             qc.lev[qc_top] = L; qc.id[qc_top] = idx;
             qc.x0[qc_top] = x0; qc.y0[qc_top] = y0; qc.s[qc_top] = s;
@@ -495,22 +525,83 @@ bool query_node(inout QCache qc, ivec2 txy, int pid,
     qc.depth = qc_top;
     qc.pid = pid;
 
-    uint m = meta[u_level_off[L] + idx];
-    if ((m & 0x80000000u) == 0u) return false;
+    // The aggregate meta bit only says "some texel in this node is covered".
+    // A coarse early-stopped node needs the per-texel coverage mask; a leaf
+    // (s == LEAF_TILE) is exactly one texel, so its bit is already exact.
+    if ((q.r & 0x80000000u) == 0u) return false;
+    if (s > LEAF_TILE && !u_cover_texel(txy)) return false;
 #ifdef PERF_ENABLED
     atomicAdd(perf[1], 1u);
 #endif
 
-    int vo = u_value_off_dt[L] + idx;
-    uvec4 q = texelFetch(u_dt_buf, vo);
-    // The buffer texture is integer (RGBA16UI), so texelFetch returns raw
-    // fixed-point codes; decode_value expects the same normalized [0,1] inputs
-    // the old RG16/RG8 textures produced, so scale by 2^bits-1 first.
-    dmin = decode_value(float(q.x) / 65535.0, u_depth_lo, u_depth_hi, 16);
-    dmax = decode_value(float(q.y) / 65535.0, u_depth_lo, u_depth_hi, 16);
-    uint th8 = (q.z >> 8u) & 0xFFu;
+    // Integer buffer texture: decode_value expects the same normalized [0,1]
+    // inputs the old RG16/RG8 textures produced, so scale by 2^bits-1 first.
+    dmin = decode_value(float((q.g >> 16u) & 0xFFFFu) / 65535.0, u_depth_lo, u_depth_hi, 16);
+    dmax = decode_value(float(q.g & 0xFFFFu) / 65535.0, u_depth_lo, u_depth_hi, 16);
+    uint th8 = (q.b >> 24u) & 0xFFu;
     thick = decode_value(float(th8) / 255.0, 0.0, u_thick_max, 8);
     return true;
+}
+
+// Fast re-query for points near a node that was just descended (used by the
+// bisection refinement). Three paths, in order:
+//   1. the texel sits inside the "hot" node of a neighbouring sample — resume
+//      the descent from it (zero memory when the hot node is already a leaf);
+//   2. otherwise walk the cache chain read-only, resuming from the deepest
+//      frozen ancestor that contains the texel (the cache is left untouched so
+//      every midpoint query starts from the same warm chain);
+//   3. otherwise fall back to the full query_node.
+bool query_hot(inout QCache qc, ivec2 txy, int pid,
+               int hL, int hidx, int hx0, int hy0, int hs, bool hv,
+               out int L, out int idx, out int x0, out int y0, out int s,
+               out float dmin, out float dmax, out float thick) {
+    int qL = 0, qidx = 0, qx0 = 0, qy0 = 0, qs = 0;
+    bool have = false;
+    if (hv && txy.x >= hx0 && txy.y >= hy0 && txy.x < hx0 + hs && txy.y < hy0 + hs) {
+        qL = hL; qidx = hidx; qx0 = hx0; qy0 = hy0; qs = hs;
+        have = true;
+    } else if (qc.pid == pid) {
+        for (int k = qc.depth - 1; k >= 0; --k) {
+            int cx0 = qc.x0[k], cy0 = qc.y0[k], cs = qc.s[k];
+            if (txy.x >= cx0 && txy.y >= cy0 && txy.x < cx0 + cs && txy.y < cy0 + cs) {
+                qL = qc.lev[k]; qidx = qc.id[k]; qx0 = cx0; qy0 = cy0; qs = cs;
+                have = true;
+                break;
+            }
+        }
+    }
+    if (have) {
+        L = qL; idx = qidx; x0 = qx0; y0 = qy0; s = qs;
+        uvec4 q;
+        if (s > LEAF_TILE) {
+            while (true) {
+                q = texelFetch(u_dtm_buf, u_value_off_dt[L] + idx);
+                uint m = q.r;
+                if ((m & 0x40000000u) == 0u || s <= LEAF_TILE) break;
+                uint dmin16 = (q.g >> 16u) & 0xFFFFu;
+                uint dmax16 = q.g & 0xFFFFu;
+                if (dmax16 - dmin16 <= uint(FLAT_STOP_CODES)) break;
+                int hss = s >> 1;
+                int cx = (txy.x >= x0 + hss) ? 1 : 0;
+                int cy = (txy.y >= y0 + hss) ? 1 : 0;
+                idx = int(m & 0x3FFFFFFFu) + cy * 2 + cx;
+                x0 += cx * hss; y0 += cy * hss; s = hss; L += 1;
+            }
+            if ((q.r & 0x80000000u) == 0u) return false;
+            if (s > LEAF_TILE && !u_cover_texel(txy)) return false;
+        } else {
+            q = texelFetch(u_dtm_buf, u_value_off_dt[L] + idx);
+        }
+#ifdef PERF_ENABLED
+        atomicAdd(perf[1], 1u);
+#endif
+        dmin = decode_value(float((q.g >> 16u) & 0xFFFFu) / 65535.0, u_depth_lo, u_depth_hi, 16);
+        dmax = decode_value(float(q.g & 0xFFFFu) / 65535.0, u_depth_lo, u_depth_hi, 16);
+        uint th8 = (q.b >> 24u) & 0xFFu;
+        thick = decode_value(float(th8) / 255.0, 0.0, u_thick_max, 8);
+        return true;
+    }
+    return query_node(qc, txy, pid, L, idx, x0, y0, s, dmin, dmax, thick);
 }
 )";
 
@@ -531,6 +622,7 @@ void main() {
     vec2 ndc = u_ndc_scale * vec2(p) + u_ndc_bias;
     vec3 ro = u_ro;
     vec3 rd = normalize(u_rd0 + ndc.x * u_rd_dx + ndc.y * u_rd_dy);
+    vec3 rd_inv = 1.0 / rd;
 
     float best_t = 1.0e30;
     int best_pid = -1;
@@ -551,7 +643,7 @@ void main() {
     int sp = 0;
 
     float rt0, rt1;
-    if (ray_aabb(ro, rd, u_root_amin, u_root_amax, rt0, rt1)) {
+    if (ray_aabb(ro, rd, rd_inv, u_root_amin, u_root_amax, rt0, rt1)) {
         st_node[sp] = 0; st_tin[sp] = rt0; st_tout[sp] = rt1; sp++;
     }
 #ifdef PERF_ENABLED
@@ -560,28 +652,32 @@ void main() {
 #endif
 
     while (sp > 0) {
+#ifdef PERF_ENABLED
+        t_trav0 = clock2x32ARB().x;
+#endif
         sp--;
         int node = st_node[sp];
         float tin = st_tin[sp];
         float tout = st_tout[sp];
-        if (tin > best_t) continue;
+        for (;;) {
+            if (tin > best_t) break;
 
-        BVHGPU b = bvh[node];
-        if (b.is_leaf != 0u) {
+            BVHGPU b = bvh[node];
+            if (b.is_leaf != 0u) {
 #ifdef PERF_ENABLED
-            atomicAdd(perf[0], 1u);
-            uint t_leaf0 = clock2x32ARB().x;
-            atomicAdd(perf[7], t_leaf0 - t_trav0);
+                atomicAdd(perf[0], 1u);
+                uint t_leaf0 = clock2x32ARB().x;
+                atomicAdd(perf[7], t_leaf0 - t_trav0);
 #endif
             int pid = int(b.val);
             PatchInfo pi = patches[pid];
             uvec4 r = rects[pid];
 
             float dD = dot(rd, pi.basis_u);
-            if (abs(dD) <= 1.0e-6) continue;
+            if (abs(dD) <= 1.0e-6) break;
 
             // Single-sided materials cull their back face.
-            if (pi.double_sided == 0u && dD > 0.0) continue;
+            if (pi.double_sided == 0u && dD > 0.0) break;
 
             float D0 = dot(ro - u_depth_origin, pi.basis_u);
             float qstep = (u_depth_hi - u_depth_lo) / 65534.0;   // 16-bit depth
@@ -601,6 +697,8 @@ void main() {
             bool have_prev = false;
             float t_prev = tin;
             bool prev_before = false;   // previous sample still in front of the band
+            int pL = 0, pidx = 0, px0 = 0, py0 = 0, ps = 0;
+            bool pvalid = false;   // previous covered sample's query node (bisect reuse)
             int guard = 0;
 #ifdef PERF_ENABLED
             uint t_march0 = clock2x32ARB().x;
@@ -648,6 +746,8 @@ void main() {
 #endif
                     float ta = t_prev;
                     float tb = t;
+                    int rL = 0, ridx = 0, rx0 = 0, ry0 = 0, rs = 0;
+                    bool rvalid = false;   // last successful midpoint query node
                     for (int it = 0; it < 8; ++it) {
 #ifdef PERF_ENABLED
                         atomicAdd(perf[3], 1u);
@@ -661,7 +761,21 @@ void main() {
                                                 int(r.y) + int(nrm_m.y * float(r.w)));
                             int Lm, idxm, x0m, y0m, sm;
                             float dm_m, dmax_m, thk_m;
-                            if (query_node(qc, txy_m, pid, Lm, idxm, x0m, y0m, sm, dm_m, dmax_m, thk_m)) {
+                            // Reuse the already-descended node of a bracket
+                            // endpoint (current or previous sample) instead of
+                            // re-walking the quadtree for every midpoint.
+                            int hL = L, hidx = idx, hx0 = x0, hy0 = y0, hs = s;
+                            bool hv = covered &&
+                                      txy_m.x >= hx0 && txy_m.y >= hy0 &&
+                                      txy_m.x < hx0 + hs && txy_m.y < hy0 + hs;
+                            if (!hv && pvalid &&
+                                txy_m.x >= px0 && txy_m.y >= py0 &&
+                                txy_m.x < px0 + ps && txy_m.y < py0 + ps) {
+                                hL = pL; hidx = pidx; hx0 = px0; hy0 = py0; hs = ps; hv = true;
+                            }
+                            if (query_hot(qc, txy_m, pid, hL, hidx, hx0, hy0, hs, hv,
+                                          Lm, idxm, x0m, y0m, sm, dm_m, dmax_m, thk_m)) {
+                                rL = Lm; ridx = idxm; rx0 = x0m; ry0 = y0m; rs = sm; rvalid = true;
                                 float Dm = dot(Pm - u_depth_origin, pi.basis_u);
                                 if (Dm <= dm_m) tb = tm; else ta = tm;
                                 continue;
@@ -683,7 +797,25 @@ void main() {
                                             int(r.y) + int(nrm_f.y * float(r.w)));
                         int Lf, idxf, x0f, y0f, sf;
                         float dmf, dmxf, thkf;
-                        if (query_node(qc, txy_f, pid, Lf, idxf, x0f, y0f, sf, dmf, dmxf, thkf)) {
+                        // Final query: reuse the last bisect midpoint's node (or
+                        // a bracket endpoint) before falling back to a descent.
+                        int hfL = rL, hfidx = ridx, hfx0 = rx0, hfy0 = ry0, hfs = rs;
+                        bool hfv = rvalid &&
+                                   txy_f.x >= hfx0 && txy_f.y >= hfy0 &&
+                                   txy_f.x < hfx0 + hfs && txy_f.y < hfy0 + hfs;
+                        if (!hfv) {
+                            hfL = L; hfidx = idx; hfx0 = x0; hfy0 = y0; hfs = s;
+                            hfv = covered &&
+                                  txy_f.x >= hfx0 && txy_f.y >= hfy0 &&
+                                  txy_f.x < hfx0 + hfs && txy_f.y < hfy0 + hfs;
+                        }
+                        if (!hfv && pvalid &&
+                            txy_f.x >= px0 && txy_f.y >= py0 &&
+                            txy_f.x < px0 + ps && txy_f.y < py0 + ps) {
+                            hfL = pL; hfidx = pidx; hfx0 = px0; hfy0 = py0; hfs = ps; hfv = true;
+                        }
+                        if (query_hot(qc, txy_f, pid, hfL, hfidx, hfx0, hfy0, hfs, hfv,
+                                      Lf, idxf, x0f, y0f, sf, dmf, dmxf, thkf)) {
                             float D_f = dot(ro + rd * th - u_depth_origin, pi.basis_u);
                             float band_hi_f = min(dmxf, dmf + thkf);
                             float slack = max(htol, 2.0 * abs(dD) * step);
@@ -704,6 +836,10 @@ void main() {
                 t_prev = t;
                 prev_before = cur_before;
                 have_prev = true;
+                pvalid = covered;
+                if (covered) {
+                    pL = L; pidx = idx; px0 = x0; py0 = y0; ps = s;
+                }
                 if (t > best_t) break;
                 if (t >= tout) break;      // the slab exit was just sampled
                 t += step;
@@ -712,41 +848,42 @@ void main() {
 #ifdef PERF_ENABLED
             atomicAdd(perf[9], clock2x32ARB().x - t_march0);
             if (guard >= 2048) atomicAdd(perf[4], 1u);
-            t_trav0 = clock2x32ARB().x;
 #endif
+            break;
         } else {
             int left = node + 1;
             int right = node + int(b.val);
             float t0, t1, t2, t3;
-            bool hit_l = ray_aabb(ro, rd, bvh[left].amin,  bvh[left].amax,  t0, t1);
-            bool hit_r = ray_aabb(ro, rd, bvh[right].amin, bvh[right].amax, t2, t3);
-            // A child whose entry distance is already behind the best hit can
-            // never contain a closer surface, so skip pushing it entirely.
+            bool hit_l = ray_aabb(ro, rd, rd_inv, bvh[left].amin,  bvh[left].amax,  t0, t1);
+            bool hit_r = ray_aabb(ro, rd, rd_inv, bvh[right].amin, bvh[right].amax, t2, t3);
+            // Descend into the near child inline and push only the far child,
+            // so each level costs one push/pop round-trip instead of two.
+            int near_n = -1, far_n = -1;
+            float near_t = 0.0, near_x = 0.0, far_t = 0.0, far_x = 0.0;
+            bool has_near = false, has_far = false;
             if (hit_l && hit_r) {
                 if (t0 <= t2) {
-                    if (t2 <= best_t) {
-                        st_node[sp] = right; st_tin[sp] = t2; st_tout[sp] = t3; sp++;
-                    }
-                    if (t0 <= best_t) {
-                        st_node[sp] = left;  st_tin[sp] = t0; st_tout[sp] = t1; sp++;
-                    }
+                    near_n = left;  near_t = t0; near_x = t1;
+                    far_n  = right; far_t  = t2; far_x  = t3;
                 } else {
-                    if (t0 <= best_t) {
-                        st_node[sp] = left;  st_tin[sp] = t0; st_tout[sp] = t1; sp++;
-                    }
-                    if (t2 <= best_t) {
-                        st_node[sp] = right; st_tin[sp] = t2; st_tout[sp] = t3; sp++;
-                    }
+                    near_n = right; near_t = t2; near_x = t3;
+                    far_n  = left;  far_t  = t0; far_x  = t1;
                 }
+                has_near = true;
+                has_far = true;
             } else if (hit_l) {
-                if (t0 <= best_t) {
-                    st_node[sp] = left; st_tin[sp] = t0; st_tout[sp] = t1; sp++;
-                }
+                near_n = left; near_t = t0; near_x = t1; has_near = true;
             } else if (hit_r) {
-                if (t2 <= best_t) {
-                    st_node[sp] = right; st_tin[sp] = t2; st_tout[sp] = t3; sp++;
-                }
+                near_n = right; near_t = t2; near_x = t3; has_near = true;
             }
+            // A child whose entry distance is already behind the best hit can
+            // never contain a closer surface, so skip it entirely.
+            if (has_far && far_t <= best_t) {
+                st_node[sp] = far_n; st_tin[sp] = far_t; st_tout[sp] = far_x; sp++;
+            }
+            if (!has_near || near_t > best_t) break;
+            node = near_n; tin = near_t; tout = near_x;
+        }
         }
     }
 #ifdef PERF_ENABLED
@@ -764,9 +901,9 @@ void main() {
     // fetching it at the resolved node is exact and view-independent.
     PatchInfo pi = patches[best_pid];
     int vo = u_value_off_dt[best_L] + best_idx;
-    uvec4 qn = texelFetch(u_dt_buf, vo);
-    uint nx8 = qn.z & 0xFFu;
-    uint ny8 = qn.w & 0xFFu;
+    uvec4 qn = texelFetch(u_dtm_buf, vo);
+    uint nx8 = (qn.b >> 8u) & 0xFFu;
+    uint ny8 = qn.b & 0xFFu;
     vec2 oct = vec2(decode_value(float(nx8) / 255.0, -1.0, 1.0, 8),
                     decode_value(float(ny8) / 255.0, -1.0, 1.0, 8));
     vec3 n = octahedral_decode(oct);
@@ -803,6 +940,7 @@ void main() {
     vec3 wpos = cw.xyz / cw.w;
     vec3 ro = u_ro;
     vec3 rd = normalize(wpos - ro);
+    vec3 rd_inv = 1.0 / rd;
 
     if (u_dbg == 1) {
         imageStore(u_out, p, vec4(rd * 0.5 + 0.5, 1.0));
@@ -811,7 +949,7 @@ void main() {
     if (u_dbg == 2) {
         float t0, t1;
         bool hit = (bvh.length() > 0) &&
-                   ray_aabb(ro, rd, bvh[0].amin, bvh[0].amax, t0, t1);
+                   ray_aabb(ro, rd, rd_inv, bvh[0].amin, bvh[0].amax, t0, t1);
         imageStore(u_out, p, hit ? vec4(0.2, 0.9, 0.2, 1.0) : vec4(0.0));
         return;
     }
@@ -824,7 +962,7 @@ void main() {
             if (bvh[i].is_leaf == 0u) continue;
             int pid = int(bvh[i].val);
             float t0, t1;
-            if (!ray_aabb(ro, rd, bvh[i].amin, bvh[i].amax, t0, t1)) continue;
+            if (!ray_aabb(ro, rd, rd_inv, bvh[i].amin, bvh[i].amax, t0, t1)) continue;
             PatchInfo pi = patches[pid];
             float D0 = dot(ro - u_depth_origin, pi.basis_u);
             float dD = dot(rd, pi.basis_u);
@@ -870,7 +1008,7 @@ void main() {
             if (bvh[i].is_leaf == 0u) continue;
             int pid = int(bvh[i].val);
             float t0, t1;
-            if (!ray_aabb(ro, rd, bvh[i].amin, bvh[i].amax, t0, t1)) continue;
+            if (!ray_aabb(ro, rd, rd_inv, bvh[i].amin, bvh[i].amax, t0, t1)) continue;
             PatchInfo pi = patches[pid];
             float step = max((t1 - t0) / float(SAMPLES), 0.0);
             for (int k = 0; k < SAMPLES; ++k) {
@@ -928,7 +1066,7 @@ void main() {
     int sp = 0;
 
     float rt0, rt1;
-    if (ray_aabb(ro, rd, bvh[0].amin, bvh[0].amax, rt0, rt1)) {
+    if (ray_aabb(ro, rd, rd_inv, bvh[0].amin, bvh[0].amax, rt0, rt1)) {
         st_node[sp] = 0; st_tin[sp] = rt0; st_tout[sp] = rt1; sp++;
     }
 
@@ -1074,8 +1212,8 @@ void main() {
             int left = node + 1;
             int right = node + int(b.val);
             float t0, t1, t2, t3;
-            bool hit_l = ray_aabb(ro, rd, bvh[left].amin,  bvh[left].amax,  t0, t1);
-            bool hit_r = ray_aabb(ro, rd, bvh[right].amin, bvh[right].amax, t2, t3);
+            bool hit_l = ray_aabb(ro, rd, rd_inv, bvh[left].amin,  bvh[left].amax,  t0, t1);
+            bool hit_r = ray_aabb(ro, rd, rd_inv, bvh[right].amin, bvh[right].amax, t2, t3);
             if (hit_l && hit_r) {
                 if (t0 <= t2) {
                     st_node[sp] = right; st_tin[sp] = t2; st_tout[sp] = t3; sp++;
@@ -1130,7 +1268,7 @@ void main() {
             if (bvh[i].is_leaf == 0u) continue;
             int pid = int(bvh[i].val);
             float t0, t1;
-            if (!ray_aabb(ro, rd, bvh[i].amin, bvh[i].amax, t0, t1)) continue;
+            if (!ray_aabb(ro, rd, rd_inv, bvh[i].amin, bvh[i].amax, t0, t1)) continue;
             PatchInfo pi = patches[pid];
             float D0 = dot(ro - u_depth_origin, pi.basis_u);
             float dD = dot(rd, pi.basis_u);
@@ -1162,9 +1300,9 @@ void main() {
     // ---- Surface normal from the baked octahedral normal chain ----
     PatchInfo pi = patches[best_pid];
     int vo = u_value_off_dt[best_L] + best_idx;
-    uvec4 qn = texelFetch(u_dt_buf, vo);
-    uint nx8 = qn.z & 0xFFu;
-    uint ny8 = qn.w & 0xFFu;
+    uvec4 qn = texelFetch(u_dtm_buf, vo);
+    uint nx8 = (qn.b >> 8u) & 0xFFu;
+    uint ny8 = qn.b & 0xFFu;
     vec2 oct = vec2(decode_value(float(nx8) / 255.0, -1.0, 1.0, 8),
                     decode_value(float(ny8) / 255.0, -1.0, 1.0, 8));
     vec3 n = octahedral_decode(oct);
@@ -1206,13 +1344,14 @@ struct PatchGPU {
 struct AtlasView {
     GLuint rects_ssbo = 0, meta_ssbo = 0;
     GLuint value_tex[4] = {0, 0, 0, 0};   // UV, thickness, depth, normal
-    GLuint dt_ssbo = 0, dt_tex = 0;       // combined depth+thick+normal buffer texture
+    GLuint dtm_ssbo = 0, dtm_tex = 0;     // merged meta+depth+thick+normal buffer texture
+    GLuint cover_ssbo = 0;                // packed per-texel coverage mask (binding 5)
     GLuint fbo = 0, view_tex = 0;
     int view_w = 0, view_h = 0;
     int level_count = 0;
     int level_off[32] = {};
     int value_off[4][32] = {};
-    int value_off_dt[32] = {};            // per-level offsets into the combined buffer
+    int value_off_dt[32] = {};            // per-level offsets into the merged buffer
 };
 
 // std430 layouts matching the primary-ray compute shader.
@@ -1635,50 +1774,65 @@ static void upload_atlas_view(const gfx::CoverageAtlas& atlas, AtlasView& v) {
         }
     }
 
-    // Combined depth + thickness + normal buffer texture for the ray pass: one
-    // RGBA16UI texel per quadtree node
-    //   R = dmin (16-bit), G = dmax (16-bit), B = (thick8 << 8) | nrm_x8, A = nrm_y8
-    // The three chains share the quadtree topology, so the per-level offsets
-    // equal the depth chain's (value_off[2]) and a single buffer-texture fetch
-    // with no div/mod replaces the two 2D RG texture fetches of the old path.
+    // Merged meta + depth + thickness + normal buffer texture for the ray
+    // pass: one RGBA32UI texel per quadtree node
+    //   R = meta32, G = (dmin16 << 16) | dmax16, B = (thick8 << 24) | (nrmx8 << 8) | nrm_y8
+    // All four chains share the quadtree topology, so the per-level offsets
+    // equal the depth chain's (value_off[2]) and every descent/finalize step
+    // becomes a single texelFetch instead of an SSBO meta read + value fetch.
     {
         const auto& dc = atlas.depth_chain();
         const auto& tc = atlas.thickness_chain();
         const auto& nc = atlas.normal_chain();
-        std::vector<uint16_t> dt;
+        std::vector<glm::uvec4> dtm;
         size_t tot = 0;
         for (const auto& lv : dc.levels)
             tot += lv.data.size() / (size_t(dc.channels) * size_t(dc.bytes_per_channel));
-        dt.reserve(tot * 4);
+        dtm.reserve(tot);
         for (int L = 0; L < v.level_count && L < 32; ++L) {
             const auto& dl = dc.levels[size_t(L)];
             const auto& tl = tc.levels[size_t(L)];
             const auto& nl = nc.levels[size_t(L)];
+            const auto& ml = ref.levels[size_t(L)];
             size_t n = dl.data.size() / (size_t(dc.channels) * size_t(dc.bytes_per_channel));
             const uint16_t* dp = reinterpret_cast<const uint16_t*>(dl.data.data());
             for (size_t i = 0; i < n; ++i) {
                 uint16_t dmin = dp[i * 2];
                 uint16_t dmax = dp[i * 2 + 1];
-                uint16_t th = uint16_t(tl.data[i]);
-                uint16_t nx = uint16_t(nl.data[i * 2]);
-                uint16_t ny = uint16_t(nl.data[i * 2 + 1]);
-                dt.push_back(dmin);
-                dt.push_back(dmax);
-                dt.push_back(uint16_t((th << 8) | (nx & 0xFFu)));
-                dt.push_back(ny);
+                uint8_t th = uint8_t(tl.data[i]);
+                uint8_t nx = uint8_t(nl.data[i * 2]);
+                uint8_t ny = uint8_t(nl.data[i * 2 + 1]);
+                dtm.push_back(glm::uvec4(
+                    ml.meta[i],
+                    (uint32_t(dmin) << 16) | uint32_t(dmax),
+                    (uint32_t(th) << 24) | (uint32_t(nx) << 8) | uint32_t(ny),
+                    0u));
             }
         }
-        if (!v.dt_ssbo) glGenBuffers(1, &v.dt_ssbo);
-        glBindBuffer(GL_SHADER_STORAGE_BUFFER, v.dt_ssbo);
-        glBufferData(GL_SHADER_STORAGE_BUFFER, dt.size() * sizeof(uint16_t),
-                     dt.data(), GL_STATIC_DRAW);
+        if (!v.dtm_ssbo) glGenBuffers(1, &v.dtm_ssbo);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, v.dtm_ssbo);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, dtm.size() * sizeof(glm::uvec4),
+                     dtm.data(), GL_STATIC_DRAW);
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
-        if (!v.dt_tex) glGenTextures(1, &v.dt_tex);
-        glBindTexture(GL_TEXTURE_BUFFER, v.dt_tex);
-        glTexBuffer(GL_TEXTURE_BUFFER, GL_RGBA16UI, v.dt_ssbo);
+        if (!v.dtm_tex) glGenTextures(1, &v.dtm_tex);
+        glBindTexture(GL_TEXTURE_BUFFER, v.dtm_tex);
+        glTexBuffer(GL_TEXTURE_BUFFER, GL_RGBA32UI, v.dtm_ssbo);
         glBindTexture(GL_TEXTURE_BUFFER, 0);
         for (int L = 0; L < v.level_count && L < 32; ++L)
             v.value_off_dt[L] = v.value_off[2][L];
+    }
+
+    // Per-texel coverage mask, packed 4 bytes per uint (binding 5 in the ray
+    // shader). Resolves the exact texel's coverage after an early descent stop.
+    {
+        const auto& cov = atlas.coverage();
+        std::vector<uint32_t> packed((cov.size() + 3) / 4, 0u);
+        for (size_t i = 0; i < cov.size(); ++i)
+            packed[i >> 2] |= uint32_t(cov[i]) << ((i & 3u) << 3u);
+        if (!v.cover_ssbo) glGenBuffers(1, &v.cover_ssbo);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, v.cover_ssbo);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, packed.size() * sizeof(uint32_t),
+                     packed.data(), GL_STATIC_DRAW);
     }
 
     if (!v.view_tex) {
@@ -2455,15 +2609,17 @@ int main() {
                 loc = r_loc("u_patch_count"); if (loc >= 0) rp->uniform1i(loc, int(patch_gpu.patch_count));
                 loc = r_loc("u_level_off");  if (loc >= 0) glUniform1iv(loc, 32, atlas_view.level_off);
                 loc = r_loc("u_value_off_dt"); if (loc >= 0) glUniform1iv(loc, 32, atlas_view.value_off_dt);
-                loc = r_loc("u_dt_buf");     if (loc >= 0) rp->uniform1i(loc, 0);
+                loc = r_loc("u_dtm_buf");    if (loc >= 0) rp->uniform1i(loc, 0);
 
                 glActiveTexture(GL_TEXTURE0);
-                glBindTexture(GL_TEXTURE_BUFFER, atlas_view.dt_tex);
+                glBindTexture(GL_TEXTURE_BUFFER, atlas_view.dtm_tex);
 
                 glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, atlas_view.rects_ssbo);
                 glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, atlas_view.meta_ssbo);
                 glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, ray_pass.patch_info_ssbo);
                 glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, ray_pass.bvh_ssbo);
+                glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, atlas_view.cover_ssbo);
+                loc = r_loc("u_atlas_w"); if (loc >= 0) rp->uniform1i(loc, atlas_view.view_w);
                 if (perf_enabled) {
                     GLuint z[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
                     glBindBuffer(GL_SHADER_STORAGE_BUFFER, perf_ssbo);
