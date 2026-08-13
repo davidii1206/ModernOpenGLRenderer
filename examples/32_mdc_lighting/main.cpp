@@ -300,11 +300,22 @@ static const char* ray_common_glsl = R"(
 #ifdef PERF_ENABLED
 #extension GL_ARB_shader_clock : require
 #endif
-layout(local_size_x = 16, local_size_y = 16) in;
+// 8x8 = 64 threads/group instead of 16x16 = 256: this kernel is register- and
+// divergence-heavy (big local arrays + per-ray quadtree walks), so a smaller
+// group gives the scheduler finer granularity to interleave work while one
+// group stalls on memory, and a single divergent group can't occupy the SM.
+layout(local_size_x = 8, local_size_y = 8) in;
 
 const int LEAF_TILE = 1;
-const int MAX_STACK = 32;
-const int MAX_MIP = 12;
+// Sizes of the two per-invocation local arrays (BVH traversal stack and the
+// quadtree descent cache). Both live in registers/scratch, so oversized arrays
+// are the dominant register-pressure / spill cost. Verified with the max-stack
+// and max-depth counters (perf[12]/perf[13]) that these bounds are never hit:
+// the SAH tree over ~16 patches is ~5 deep, and the descent stops early on
+// depth-flat nodes (FLAT_STOP_CODES), so the worst-case atlas depth is well
+// below the old MAX_MIP = 12.
+const int MAX_STACK = 16;
+const int MAX_MIP = 7;
 // A node whose 16-bit depth span (dmax-dmin) is within this many codes is
 // depth-flat: its aggregate dmin/dmax/thick are within the marching band slack
 // of every texel it contains, so the descent can stop there. Flat walls and
@@ -385,6 +396,7 @@ layout(std430, binding = 4) buffer PerfBuf { uint perf[]; };
 //         4=guard-limited rays, 5=rays traced
 //        6=cycles setup, 7=cycles traversal, 8=cycles leaf setup,
 //        9=cycles march loop, 10=cycles bisection, 11=cycles finalize
+//        12=max BVH stack depth (sp after push), 13=max quadtree level reached
 uniform int u_perf;    // runtime gate for the debug kernel's counters
 #endif
 
@@ -435,11 +447,11 @@ bool ray_aabb(vec3 ro, vec3 rd, vec3 rd_inv, vec3 amin, vec3 amax,
 struct QCache {
     int pid;             // patch the cached chain belongs to (-1 = invalid)
     int depth;           // number of valid chain entries
+    int sz;              // root lattice size N; node size at level L is N >> L
     int lev[MAX_MIP];    // level of each chain node
     int id[MAX_MIP];     // node index within that level
     int x0[MAX_MIP];
     int y0[MAX_MIP];
-    int s[MAX_MIP];
 };
 
 // Descend the shared quadtree to the finest node covering atlas texel (tx,ty)
@@ -460,14 +472,16 @@ bool query_node(inout QCache qc, ivec2 txy, int pid,
     int maxd = int(max(r.z, r.w));
     int N = 1;
     while (N < maxd) N <<= 1;
+    qc.sz = N;
 
     // Start from the deepest cached ancestor that contains the texel. The
     // chain is walked top-down here; each cached entry is just the node rect,
-    // so containment tests never touch the SSBOs.
+    // so containment tests never touch the SSBOs. The cached node size is
+    // derived from the level (s = N >> lev), so it is not stored.
     int start_k = -1;
     if (qc.pid == pid) {
         for (int k = qc.depth - 1; k >= 0; --k) {
-            int cx0 = qc.x0[k], cy0 = qc.y0[k], cs = qc.s[k];
+            int cx0 = qc.x0[k], cy0 = qc.y0[k], cs = qc.sz >> qc.lev[k];
             if (x >= cx0 && y >= cy0 && x < cx0 + cs && y < cy0 + cs) {
                 start_k = k;
                 break;
@@ -479,7 +493,7 @@ bool query_node(inout QCache qc, ivec2 txy, int pid,
         idx = qc.id[start_k];
         x0 = qc.x0[start_k];
         y0 = qc.y0[start_k];
-        s = qc.s[start_k];
+        s = qc.sz >> qc.lev[start_k];
     } else {
         L = 0; idx = pid; x0 = 0; y0 = 0; s = N;
         qc.depth = 0;
@@ -505,7 +519,7 @@ bool query_node(inout QCache qc, ivec2 txy, int pid,
         if (dmax16 - dmin16 <= uint(FLAT_STOP_CODES)) break;
         if (qc_top < MAX_MIP) {
             qc.lev[qc_top] = L; qc.id[qc_top] = idx;
-            qc.x0[qc_top] = x0; qc.y0[qc_top] = y0; qc.s[qc_top] = s;
+            qc.x0[qc_top] = x0; qc.y0[qc_top] = y0;
             qc_top++;
         }
         int hs = s >> 1;
@@ -517,9 +531,12 @@ bool query_node(inout QCache qc, ivec2 txy, int pid,
         s = hs;
         L += 1;
     }
+#ifdef PERF_ENABLED
+    atomicMax(perf[13], uint(L));   // deepest level the descent reached
+#endif
     if (qc_top < MAX_MIP) {
         qc.lev[qc_top] = L; qc.id[qc_top] = idx;
-        qc.x0[qc_top] = x0; qc.y0[qc_top] = y0; qc.s[qc_top] = s;
+        qc.x0[qc_top] = x0; qc.y0[qc_top] = y0;
         qc_top++;
     }
     qc.depth = qc_top;
@@ -562,7 +579,7 @@ bool query_hot(inout QCache qc, ivec2 txy, int pid,
         have = true;
     } else if (qc.pid == pid) {
         for (int k = qc.depth - 1; k >= 0; --k) {
-            int cx0 = qc.x0[k], cy0 = qc.y0[k], cs = qc.s[k];
+            int cx0 = qc.x0[k], cy0 = qc.y0[k], cs = qc.sz >> qc.lev[k];
             if (txy.x >= cx0 && txy.y >= cy0 && txy.x < cx0 + cs && txy.y < cy0 + cs) {
                 qL = qc.lev[k]; qidx = qc.id[k]; qx0 = cx0; qy0 = cy0; qs = cs;
                 have = true;
@@ -587,6 +604,9 @@ bool query_hot(inout QCache qc, ivec2 txy, int pid,
                 idx = int(m & 0x3FFFFFFFu) + cy * 2 + cx;
                 x0 += cx * hss; y0 += cy * hss; s = hss; L += 1;
             }
+#ifdef PERF_ENABLED
+            atomicMax(perf[13], uint(L));
+#endif
             if ((q.r & 0x80000000u) == 0u) return false;
             if (s > LEAF_TILE && !u_cover_texel(txy)) return false;
         } else {
@@ -645,8 +665,14 @@ void main() {
     float rt0, rt1;
     if (ray_aabb(ro, rd, rd_inv, u_root_amin, u_root_amax, rt0, rt1)) {
         st_node[sp] = 0; st_tin[sp] = rt0; st_tout[sp] = rt1; sp++;
+        // Nothing beyond the root slab exit can contain a hit, so seed best_t
+        // with it instead of +inf. Miss rays now get the far-child prune
+        // (far_t <= best_t) for their whole traversal instead of only after
+        // they find a surface, which is the cheap-but-common case here.
+        best_t = rt1;
     }
 #ifdef PERF_ENABLED
+    atomicMax(perf[12], uint(sp));
     atomicAdd(perf[6], clock2x32ARB().x - t_setup0);
     uint t_trav0 = clock2x32ARB().x;
 #endif
@@ -880,6 +906,9 @@ void main() {
             // never contain a closer surface, so skip it entirely.
             if (has_far && far_t <= best_t) {
                 st_node[sp] = far_n; st_tin[sp] = far_t; st_tout[sp] = far_x; sp++;
+#ifdef PERF_ENABLED
+                atomicMax(perf[12], uint(sp));
+#endif
             }
             if (!has_near || near_t > best_t) break;
             node = near_n; tin = near_t; tout = near_x;
@@ -2295,13 +2324,13 @@ int main() {
     PassTimer t_present("present", false);     // gui.render + swap_buffers
 
     GLuint perf_ssbo = 0;
-    GLuint perf_acc[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    GLuint perf_acc[14] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     PhaseAccum phase_acc;
     int perf_frames = 0;
     if (perf_enabled) {
         glGenBuffers(1, &perf_ssbo);
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, perf_ssbo);
-        glBufferData(GL_SHADER_STORAGE_BUFFER, 12 * sizeof(GLuint), nullptr, GL_DYNAMIC_DRAW);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, 14 * sizeof(GLuint), nullptr, GL_DYNAMIC_DRAW);
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
     }
 
@@ -2354,6 +2383,8 @@ int main() {
                 printf("    march iters / ray   = %.2f\n", double(perf_acc[2]) / rays);
                 printf("    bisect iters / ray  = %.2f\n", double(perf_acc[3]) / rays);
                 printf("    guard exits / ray   = %.4f\n", double(perf_acc[4]) / rays);
+                printf("    max BVH stack depth = %u   (MAX_STACK=16)\n", perf_acc[12]);
+                printf("    max quadtree level  = %u   (MAX_MIP=7)\n", perf_acc[13]);
 
                 // Per-phase shader-clock cycle buckets (low 32 bits of the
                 // GPU cycle counter, lifetime average), normalised to the
@@ -2621,24 +2652,27 @@ int main() {
                 glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, atlas_view.cover_ssbo);
                 loc = r_loc("u_atlas_w"); if (loc >= 0) rp->uniform1i(loc, atlas_view.view_w);
                 if (perf_enabled) {
-                    GLuint z[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+                    GLuint z[14] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
                     glBindBuffer(GL_SHADER_STORAGE_BUFFER, perf_ssbo);
                     glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(z), z);
                     glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
                     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, perf_ssbo);
                 }
                 glBindImageTexture(0, ray_pass.ray_tex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
-                gl::dispatch_compute((ray_pass.w + 15) / 16, (ray_pass.h + 15) / 16, 1);
+                gl::dispatch_compute((ray_pass.w + 7) / 8, (ray_pass.h + 7) / 8, 1);
                 gl::memory_barrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
                                    GL_TEXTURE_FETCH_BARRIER_BIT |
                                    GL_SHADER_STORAGE_BARRIER_BIT);
                 glBindImageTexture(0, 0, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA8);
                 if (perf_enabled) {
-                    GLuint pv[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+                    GLuint pv[14] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
                     glBindBuffer(GL_SHADER_STORAGE_BUFFER, perf_ssbo);
                     glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(pv), pv);
                     glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
                     for (int k = 0; k < 12; ++k) perf_acc[k] += pv[k];
+                    // Max-tracked counters: keep the per-frame maximum.
+                    perf_acc[12] = std::max(perf_acc[12], pv[12]);
+                    perf_acc[13] = std::max(perf_acc[13], pv[13]);
                     phase_acc.readback(pv);
                     perf_frames++;
                 }
