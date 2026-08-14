@@ -2039,6 +2039,7 @@ struct SceneState {
     std::vector<int> lod0_meshes;   // meshes the geometry pass draws
     glm::vec3 cam_target{0.0f, 1.0f, 0.0f};
     float     cam_dist = 3.8f;
+    glm::vec3 model_aabb_min{0.0f}, model_aabb_max{0.0f};  // global model bounds
 };
 
 // Mirrors CoverageAtlas::build(): every mesh not inside a LOD group, plus each
@@ -2149,6 +2150,8 @@ static bool load_scene(const ModelEntry& entry, gfx::Model& model, SceneState& s
         st.cam_target = (lo + hi) * 0.5f;
         float extent = glm::length(hi - lo);
         st.cam_dist = 0.5f * extent + 3.0f;
+        st.model_aabb_min = lo;
+        st.model_aabb_max = hi;
     }
     std::printf("Scene ready: %zu patches, %zu triangles, atlas %dx%d @ %.0f texels/unit\n",
                 st.atlas.patches().size(), st.atlas.triangles().size(),
@@ -3227,6 +3230,20 @@ int main() {
                         atlas.atlas_width(), atlas.atlas_height(), atlas.final_density());
             ImGui::Combo("Atlas texture", &atlas_chain, "UV\0Thickness\0Depth\0Normal\0");
             ImGui::SliderFloat("Resolution scale", &density_scale, 0.25f, 4.0f, "%.2fx");
+            // Each atlas texel is one cube cell of 1/texels_per_unit world
+            // units, so the scale slider's real meaning is a voxel grid count
+            // across the model's axes. Show it as such (prospective value the
+            // slider would apply on "Recompute atlas").
+            {
+                glm::vec3 span = st.model_aabb_max - st.model_aabb_min;
+                float longest = std::max(span.x, std::max(span.y, span.z));
+                float est = base_density * density_scale;
+                if (longest > 0.0f && est > 0.0f) {
+                    ImGui::Text("Voxel grid: %.0f x %.0f x %.0f  (~%.0f^3, voxel %.4f u)",
+                                span.x * est, span.y * est, span.z * est, longest * est,
+                                1.0f / est);
+                }
+            }
             if (ImGui::Button("Recompute atlas")) {
                 gfx::CoverageAtlasConfig cfg = atlas.config();
                 cfg.texel_density = base_density * density_scale;

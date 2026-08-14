@@ -2,6 +2,11 @@
 
 namespace gl {
 
+Buffer::Buffer()
+    : Buffer(BufferType::shader, BufferUsage::dynamic_draw)
+{
+}
+
 Buffer::Buffer(BufferType type, BufferUsage usage)
     : type_(type), usage_(usage)
 {

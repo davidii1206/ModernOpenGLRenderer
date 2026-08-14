@@ -22,7 +22,7 @@ struct CoverageAtlasConfig {
     float budget_texels   = 64.0e6f; // global atlas texel budget (caps density)
     int   min_tex         = 4;       // min patch texture size (texels)
     int   max_tex         = 1024;    // max patch texture size (texels)
-    float mip_tol_frac    = 0.004f;  // mip subdivide tolerance (fraction of global range)
+    float mip_tol_frac    = 0.001f;  // mip subdivide tolerance (fraction of global range)
     int   mip_leaf_tile   = 1;       // finest mip node size (texels); 1 = per-texel detail
     int   min_patch_size  = 200;     // merge pass target: absorb patches below this
     float epsilon         = 0.001f;  // occlusion test depth tolerance

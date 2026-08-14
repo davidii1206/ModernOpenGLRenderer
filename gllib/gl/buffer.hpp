@@ -25,6 +25,7 @@ enum class BufferUsage : GLenum {
 
 class Buffer {
 public:
+    Buffer();
     Buffer(BufferType type, BufferUsage usage = BufferUsage::static_draw);
     ~Buffer();
 
