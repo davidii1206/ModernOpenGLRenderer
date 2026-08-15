@@ -1,29 +1,31 @@
 // Example 35 — SSRC: Screen Space Radiance Cascades (radiance cascades GI).
 //
-// The scene is a classic Cornell box whose only light is the emissive ceiling
-// rectangle. Since an emissive surface is representable as geometry, there is
-// no analytic direct-lighting pass at all: the cascades resolve the area
-// light's direct contribution and all bounces in a single trace. (Delta lights
-// — point/directional — can't be intersected by marching and would need a
-// separate forward pass, but this example has none.)
+// A hierarchical screen-space radiance field is built from the G-buffer. Each
+// cascade level c has:
+//   probe spacing : spacing0 * 2^c   (px)   -> 4x fewer probes per level
+//   angular grid  : N0 * 2^c per side         -> 4x more directions per level
+//   ray interval  : [t0*4^(c-1), t0*4^c]      -> non-overlapping, ratio 4
+// Ray count per probe and probe count per level cancel, so every cascade does
+// roughly the same amount of work.
 //
-// A hierarchical radiance field is built in screen space: the G-buffer's
-// surface radiance (here just emission) is the finest "source" field, and
-// coarser cascades ray-march a fixed number of directions over progressively
-// larger distance intervals, falling back (merging) to the next coarser
-// cascade on a miss. A gather pass reconstructs diffuse irradiance at every
-// pixel by summing each cascade's stored radiance over its directions,
-// cosine-weighted over the upper hemisphere.
+// A probe ray is traced by marching in screen space between the projected start
+// and end of its interval, comparing marched view depth against the depth
+// buffer (thickness heuristic). Directions form a spherical grid around each
+// probe (full azimuth x polar bands off the scene-facing axis), so probes reach
+// scene content above, below, and beside them. On a hit the ray reads the
+// outgoing radiance of that surface: emission plus the previous frame's
+// indirect GI (temporal feedback), which makes bounces accumulate across
+// frames. On a miss it merges at the probe's own position with the next coarser
+// cascade (quadrilinear in space x angle), representing everything beyond this
+// interval. Cascades are built coarsest-to-finest so each merge reads an
+// already-resolved coarser level; the coarsest falls back to 0 (no sky). The
+// final gather reads the resolved cascade 0 and computes the cosine-weighted
+// hemisphere integral, storing the indirect term in a history buffer that feeds
+// the next frame's build.
 //
-// Layout per cascade: directions are packed along X, probes along Y.
-//   texel (d * gridW + px, py)  =  radiance at probe (px,py) for direction d.
-// Level 0 is not stored: it is the source radiance field sampled directly.
-//
-// Pipeline:
-//   geometry pass  -> 6 MRT G-buffer at "ssrc" resolution
-//   cascade build  -> coarsest-to-finest compute, one dispatch per cascade
-//   gather pass    -> compute, integrates all cascades into a HDR target
-//   display pass   -> fullscreen triangle, exposure + tonemap + gamma
+// The Cornell box has only an emissive ceiling light, so no point light or
+// forward pass is needed: the emission buffer is the entire light source, and
+// RC resolves both its "direct" illumination and bounces via the same trace.
 
 #include <gl/gl.hpp>
 #include <gfx/gfx.hpp>
@@ -42,7 +44,7 @@
 #include <vector>
 
 namespace {
-constexpr int MAX_CASCADES = 10;
+constexpr int MAX_CASCADES = 8;
 
 // ===========================================================================
 // Shaders
@@ -76,9 +78,8 @@ in vec3 v_normal;
 layout(location = 0) out vec4 out_albedo;
 layout(location = 1) out vec4 out_normal;
 layout(location = 2) out vec4 out_position;
-layout(location = 3) out vec4 out_surface;
-layout(location = 4) out vec4 out_emissive;
-layout(location = 5) out float out_depth;
+layout(location = 3) out vec4 out_source;
+layout(location = 4) out float out_depth;
 
 uniform vec3 u_albedo;
 uniform vec3 u_emissive;
@@ -96,25 +97,14 @@ vec2 octahedral(vec3 n) {
 
 void main() {
     vec3 N = normalize(v_normal);
-    vec3 albedo = u_albedo;
-    vec3 emissive = u_emissive * u_emissive_scale;
+    vec3 view_n = normalize(mat3(u_view) * N);
+    vec3 view_p = (u_view * vec4(v_pos, 1.0)).xyz;
 
-    // There is no point/directional light in this example: the only light
-    // source is the emissive ceiling rectangle, which is representable as
-    // geometry. The "radiance leaving this surface" buffer is therefore just
-    // emission here; the cascades resolve direct AND indirect light from the
-    // area light in a single trace (delta lights can't be hit by marching and
-    // would need a separate analytic pass).
-    vec3 radiance = emissive;
-
-    out_albedo   = vec4(albedo, 1.0);
-    out_normal   = vec4(octahedral(N), 0.0, 1.0);
-    out_position = vec4(v_pos, 1.0);
-    out_surface  = vec4(radiance, 1.0);
-    out_emissive = vec4(emissive, 1.0);
-
-    vec4 view_p = u_view * vec4(v_pos, 1.0);
-    out_depth = -view_p.z;
+    out_albedo   = vec4(u_albedo, 1.0);
+    out_normal   = vec4(octahedral(view_n), 0.0, 1.0);
+    out_position = vec4(view_p, 1.0);
+    out_source   = vec4(u_emissive * u_emissive_scale, 1.0);
+    out_depth    = -view_p.z;
 }
 )";
 
@@ -122,184 +112,181 @@ const char* build_cs = R"(
 #version 460 core
 layout(local_size_x = 8, local_size_y = 8) in;
 
-layout(binding = 0) uniform sampler2D u_pos_tex;
-layout(binding = 1) uniform sampler2D u_normal_tex;
-layout(binding = 2) uniform sampler2D u_surface_tex;
-layout(r32f, binding = 3) uniform readonly image2D u_depth_tex;
+layout(binding = 0) uniform sampler2D u_pos_tex;     // view-space position, a = surface
+layout(binding = 1) uniform sampler2D u_depth_tex;   // R32F linear view depth
+layout(binding = 2) uniform sampler2D u_source_tex;  // outgoing radiance (emission)
+layout(binding = 3) uniform sampler2D u_gi_tex;      // previous frame's indirect GI (feedback)
 layout(rgba16f, binding = 4) uniform writeonly image2D u_out;
-layout(binding = 5) uniform sampler2D u_next_tex;
+layout(binding = 5) uniform sampler2D u_next_tex;    // coarser cascade atlas
 
-uniform mat4 u_view_proj;
-uniform mat4 u_view;
-uniform int u_ssrc_w;
-uniform int u_ssrc_h;
+uniform mat4 u_proj;
+uniform vec2 u_res;
 uniform float u_far;
+uniform float u_feedback;
 
-uniform int u_grid_w;        // current cascade probe grid
-uniform int u_rays;          // current cascade rays per dimension
-uniform float u_spacing;     // current cascade probe spacing (px)
-uniform int u_next_rays;     // coarser cascade rays per dimension
-uniform float u_next_spacing;// coarser cascade probe spacing (px)
-uniform int u_next_grid_w;
-uniform int u_next_tex_w;
-uniform int u_next_tex_h;
-uniform float u_interval_start;
-uniform float u_interval_end;
-uniform int u_has_next;
-uniform vec3 u_ambient_color;
-uniform float u_ambient_intensity;
-uniform float u_ray_bias;
+uniform int   u_N;             // angular grid side for this cascade
+uniform float u_spacing;       // probe spacing (px at ssrc res)
+uniform int   u_probes_x;
+uniform int   u_probes_y;
+uniform int   u_tex_w;
+uniform int   u_tex_h;
+uniform float u_t0;            // interval start
+uniform float u_t1;            // interval end
+uniform int   u_has_next;
+uniform int   u_next_N;
+uniform float u_next_spacing;
+uniform int   u_next_probes_x;
+uniform int   u_next_probes_y;
 uniform float u_thickness;
-uniform int u_steps;
-uniform float u_seed;
+uniform float u_skip_px;
+uniform float u_step_px;
 
-const float PI = 3.14159265359;
+// Spherical direction grid nested per cascade, spanning the FULL sphere:
+// phi in [0,2pi) with N cells, theta in [0,pi] with N bands. Doubling N halves
+// both angular steps, so the 2x2 coarser angular block nests exactly under
+// cell (ai, aj). Covering the full sphere lets surfaces facing the camera
+// receive light (their incoming hemisphere includes +z directions).
+vec3 dir_from_angle(int ai, int aj, int N) {
+    float phi = (float(ai) + 0.5) / float(N) * 6.2831853;
+    float theta = (float(aj) + 0.5) / float(N) * 3.1415927;
+    float s = sin(theta);
+    return normalize(vec3(s * cos(phi), s * sin(phi), cos(theta)));
+}
 
-vec3 oct_decode(vec2 e) {
-    e = e * 2.0 - 1.0;
-    vec3 n = vec3(e, 1.0);
-    n.z = 1.0 - abs(n.x) - abs(n.y);
-    if (n.z < 0.0) {
-        n.xy = (1.0 - abs(n.yx)) * mix(vec2(-1.0), vec2(1.0), step(0.0, n.xy));
+vec2 uv_from_view(vec3 p) {
+    vec4 clip = u_proj * vec4(p, 1.0);
+    return clip.xy / clip.w * 0.5 + 0.5;
+}
+
+// Quadrilinear (bilinear space x bilinear angle) sample of the coarser cascade
+// at the current probe position. Angular cells map to the coarser grid such
+// that for doubled N cell (ai, aj) lands on the center of the 2x2 block.
+vec3 sample_next(vec2 pos, int ai, int aj) {
+    vec2 fp = pos / u_next_spacing - 0.5;
+    vec2 p0 = floor(fp);
+    vec2 f = fp - p0;
+    vec2 fa = (vec2(float(ai), float(aj)) + 0.5) * (float(u_next_N) / float(u_N)) - 0.5;
+    vec2 a0 = floor(fa);
+    vec2 af = fa - a0;
+    vec3 acc = vec3(0.0);
+    for (int dx = 0; dx < 2; ++dx)
+    for (int dy = 0; dy < 2; ++dy)
+    for (int ax = 0; ax < 2; ++ax)
+    for (int ay = 0; ay < 2; ++ay) {
+        ivec2 pi = clamp(ivec2(p0) + ivec2(dx, dy),
+                         ivec2(0), ivec2(u_next_probes_x - 1, u_next_probes_y - 1));
+        ivec2 ai = clamp(ivec2(a0) + ivec2(ax, ay),
+                         ivec2(0), ivec2(u_next_N - 1));
+        vec3 v = texelFetch(u_next_tex,
+                            ivec2(pi.x * u_next_N + ai.x, pi.y * u_next_N + ai.y), 0).rgb;
+        float w = ((dx == 0) ? (1.0 - f.x) : f.x)
+                * ((dy == 0) ? (1.0 - f.y) : f.y)
+                * ((ax == 0) ? (1.0 - af.x) : af.x)
+                * ((ay == 0) ? (1.0 - af.y) : af.y);
+        acc += v * w;
     }
-    return normalize(n);
+    return acc;
 }
 
-float ig_noise(vec2 p, float seed) {
-    vec2 q = p + seed * vec2(0.123, 0.456);
-    return fract(52.9829189 * fract(0.06711056 * q.x + 0.00583715 * q.y));
-}
+// March the ray from u_t0 to u_t1 (view-space distances) in screen space.
+bool march(vec3 origin, vec3 dir, out vec3 rad, out vec2 hit_uv) {
+    vec3 s = origin + dir * u_t0;
+    vec3 e = origin + dir * u_t1;
+    vec2 s_uv = uv_from_view(s);
+    vec2 e_uv = uv_from_view(e);
+    vec2 d_uv = e_uv - s_uv;
+    float len = length(d_uv * u_res);
+    if (len < 1e-5) return false;
 
-vec2 concentric_disk(vec2 p) {
-    float a = 2.0 * p.x - 1.0;
-    float b = 2.0 * p.y - 1.0;
-    float r, phi;
-    if (a > -b) {
-        if (a > b)      { r = a; phi = (PI / 4.0) * (b / max(a, 1e-6)); }
-        else            { r = b; phi = (PI / 4.0) * (2.0 - a / max(b, 1e-6)); }
-    } else {
-        if (a < b)      { r = -a; phi = (PI / 4.0) * (4.0 + b / max(a, 1e-6)); }
-        else            { r = -b; phi = (PI / 4.0) * (6.0 - a / max(b, 1e-6)); }
-    }
-    return r * vec2(cos(phi), sin(phi));
-}
+    int steps = clamp(int(ceil(len / u_step_px)), 2, 256);
+    float start = clamp(u_skip_px / max(len, 1e-6), 0.0, 0.85);
+    float inv_d0 = 1.0 / max(-s.z, 1e-6);
+    float inv_d1 = 1.0 / max(-e.z, 1e-6);
+    float prev_ray_d = -s.z;
 
-vec3 dir_world(int d, vec3 t, vec3 b, vec3 n) {
-    int r = u_rays;
-    int dx = d % r;
-    int dy = d / r;
-    vec2 disk = concentric_disk((vec2(dx, dy) + 0.5) / float(r));
-    vec3 dir = t * disk.x + b * disk.y + n * sqrt(max(1.0 - dot(disk, disk), 0.0));
-    return normalize(dir);
-}
-
-// Returns true on a surface hit within [t0, t1]; rad is the surface radiance.
-bool march(vec3 origin, vec3 dir, float t0, float t1, ivec2 px, float seed, out vec3 rad) {
-    int steps = u_steps;
-    float t = t0 + (t1 - t0) * ig_noise(vec2(px), seed);
-    float dt = (t1 - t0) / float(steps);
     for (int i = 0; i < steps; ++i) {
-        vec3 pos = origin + dir * t;
-        vec4 clip = u_view_proj * vec4(pos, 1.0);
-        if (clip.w > 1e-4) {
-            vec2 ndc = clip.xy / clip.w;
-            if (ndc.x >= -1.0 && ndc.x <= 1.0 && ndc.y >= -1.0 && ndc.y <= 1.0) {
-                vec2 uv = ndc * 0.5 + 0.5;
-                ivec2 spx = ivec2(uv * vec2(u_ssrc_w, u_ssrc_h));
-                float surf_depth = imageLoad(u_depth_tex, spx).r;
-                vec4 view_p = u_view * vec4(pos, 1.0);
-                float ray_depth = -view_p.z;
-                if (ray_depth > surf_depth + u_thickness) {
-                    rad = texture(u_surface_tex, uv).rgb;
-                    return true;
-                }
+        float t = start + (float(i) + 0.5) / float(steps) * (1.0 - start);
+        vec2 uv = s_uv + d_uv * t;
+        if (uv.x <= 0.0 || uv.x >= 1.0 || uv.y <= 0.0 || uv.y >= 1.0) return false;
+
+        float ray_d = 1.0 / mix(inv_d0, inv_d1, t);
+        float surf_d = texture(u_depth_tex, uv).r;
+        if (surf_d > 0.001 && surf_d < u_far - 1.0) {
+            bool crossed = (prev_ray_d <= surf_d && ray_d >= surf_d);
+            bool near = abs(ray_d - surf_d) < u_thickness;
+            if (crossed || near) {
+                rad = texture(u_source_tex, uv).rgb
+                    + texture(u_gi_tex, uv).rgb * u_feedback;
+                hit_uv = uv;
+                return true;
             }
         }
-        t += dt;
+        prev_ray_d = ray_d;
     }
     return false;
 }
 
-vec3 merge_value(int d, int px, int py) {
-    float d_next = (float(d) + 0.5) *
-        float(u_next_rays * u_next_rays) / float(u_rays * u_rays) - 0.5;
-    float px_c = (float(px) + 0.5) * u_spacing / u_next_spacing;
-    float py_c = (float(py) + 0.5) * u_spacing / u_next_spacing;
-    float xtex = d_next * float(u_next_grid_w) + px_c * float(u_next_grid_w);
-    float ytex = py_c;
-    vec2 muv = (vec2(xtex, ytex) + 0.5) / vec2(float(u_next_tex_w), float(u_next_tex_h));
-    return texture(u_next_tex, muv).rgb;
-}
-
 void main() {
     ivec2 t = ivec2(gl_GlobalInvocationID.xy);
-    int d = t.x / u_grid_w;
-    int px = t.x % u_grid_w;
-    int py = t.y;
+    if (t.x >= u_tex_w || t.y >= u_tex_h) return;
 
-    vec2 uv = (vec2(px, py) + 0.5) * u_spacing / vec2(u_ssrc_w, u_ssrc_h);
-    vec4 P = texture(u_pos_tex, uv);
-    if (P.w < 0.5) {
-        vec3 v = (u_has_next == 1)
-            ? merge_value(d, px, py)
-            : u_ambient_color * u_ambient_intensity;
-        imageStore(u_out, t, vec4(v, 1.0));
+    int px = t.x / u_N;
+    int py = t.y / u_N;
+    int ai = t.x % u_N;
+    int aj = t.y % u_N;
+
+    vec2 probe_px = (vec2(px, py) + 0.5) * u_spacing;
+    ivec2 pt = ivec2(clamp(round(probe_px), vec2(0.0), u_res - 1.0));
+    vec4 P = texelFetch(u_pos_tex, pt, 0);
+    if (P.a < 0.5) {
+        imageStore(u_out, t, vec4(0.0, 0.0, 0.0, 0.0));
         return;
     }
 
     vec3 origin = P.xyz;
-    vec3 n = oct_decode(texture(u_normal_tex, uv).xy);
-
-    vec3 tng = normalize(cross(vec3(0.0, 1.0, 0.0), n));
-    if (dot(tng, tng) < 1e-4) tng = normalize(cross(vec3(1.0, 0.0, 0.0), n));
-    vec3 bin = cross(n, tng);
-
-    vec3 dir = dir_world(d, tng, bin, n);
-    origin += n * u_ray_bias;
+    vec3 dir = dir_from_angle(ai, aj, u_N);
 
     vec3 rad;
-    float seed = u_seed + float(d) * 0.137;
-    if (march(origin, dir, u_interval_start, u_interval_end, ivec2(px, py), seed, rad)) {
+    vec2 hit_uv;
+    if (march(origin, dir, rad, hit_uv)) {
         imageStore(u_out, t, vec4(rad, 1.0));
     } else if (u_has_next == 1) {
-        imageStore(u_out, t, vec4(merge_value(d, px, py), 1.0));
+        vec3 m = sample_next(probe_px, ai, aj);
+        imageStore(u_out, t, vec4(m, 1.0));
     } else {
-        imageStore(u_out, t, vec4(u_ambient_color * u_ambient_intensity, 1.0));
+        imageStore(u_out, t, vec4(0.0, 0.0, 0.0, 0.0));
     }
 }
 )";
 
 const char* gather_cs = R"(
 #version 460 core
-#define MAX_CASCADES 10
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(rgba16f, binding = 0) uniform readonly image2D u_albedo_tex;
 layout(rgba16f, binding = 1) uniform readonly image2D u_normal_tex;
-layout(rgba16f, binding = 2) uniform readonly image2D u_emissive_tex;
+layout(rgba16f, binding = 2) uniform readonly image2D u_source_tex;
 layout(rgba16f, binding = 3) uniform readonly image2D u_position_tex;
 layout(r32f, binding = 4) uniform readonly image2D u_depth_tex;
 layout(rgba16f, binding = 5) uniform writeonly image2D u_out;
+layout(binding = 6) uniform sampler2D u_cascade0;
+layout(binding = 7) uniform sampler2D u_cascade_dbg;
+layout(rgba16f, binding = 7) uniform writeonly image2D u_gi_out;   // indirect-only history
 
-layout(binding = 10) uniform sampler2D u_surface_tex;
-layout(binding = 11) uniform sampler2D u_cascades[MAX_CASCADES];
-
-uniform int u_ssrc_w;
-uniform int u_ssrc_h;
+uniform vec2 u_res;
 uniform float u_far;
-uniform int u_num_cascades;
-uniform int u_rays[MAX_CASCADES];
-uniform int u_spacing[MAX_CASCADES];
-uniform int u_grid_w[MAX_CASCADES];
-uniform int u_tex_w[MAX_CASCADES];
-uniform int u_tex_h[MAX_CASCADES];
-
+uniform int   u_N;             // cascade 0 angular grid side
+uniform float u_spacing;       // cascade 0 probe spacing
+uniform int   u_probes_x;
+uniform int   u_probes_y;
 uniform float u_gi_strength;
-uniform float u_near_strength;
-uniform int u_view_mode;
-uniform int u_debug_level;
-
-const float PI = 3.14159265359;
+uniform float u_gi_clamp;
+uniform int   u_view_mode;
+uniform int   u_debug_level;
+uniform int   u_dbg_N;
+uniform float u_dbg_spacing;
+uniform int   u_dbg_probes_x;
+uniform int   u_dbg_probes_y;
 
 vec3 oct_decode(vec2 e) {
     e = e * 2.0 - 1.0;
@@ -311,104 +298,92 @@ vec3 oct_decode(vec2 e) {
     return normalize(n);
 }
 
-vec2 concentric_disk(vec2 p) {
-    float a = 2.0 * p.x - 1.0;
-    float b = 2.0 * p.y - 1.0;
-    float r, phi;
-    if (a > -b) {
-        if (a > b)      { r = a; phi = (PI / 4.0) * (b / max(a, 1e-6)); }
-        else            { r = b; phi = (PI / 4.0) * (2.0 - a / max(b, 1e-6)); }
-    } else {
-        if (a < b)      { r = -a; phi = (PI / 4.0) * (4.0 + b / max(a, 1e-6)); }
-        else            { r = -b; phi = (PI / 4.0) * (6.0 - a / max(b, 1e-6)); }
+vec3 dir_from_angle(int ai, int aj, int N) {
+    float phi = (float(ai) + 0.5) / float(N) * 6.2831853;
+    float theta = (float(aj) + 0.5) / float(N) * 3.1415927;
+    float s = sin(theta);
+    return normalize(vec3(s * cos(phi), s * sin(phi), cos(theta)));
+}
+
+// Bilinear probe sample of the resolved cascade 0 at a pixel position.
+vec3 c0_sample(vec2 pos, int ai, int aj) {
+    vec2 fp = pos / u_spacing - 0.5;
+    vec2 p0 = floor(fp);
+    vec2 f = fp - p0;
+    vec3 acc = vec3(0.0);
+    for (int dx = 0; dx < 2; ++dx)
+    for (int dy = 0; dy < 2; ++dy) {
+        ivec2 pi = clamp(ivec2(p0) + ivec2(dx, dy),
+                         ivec2(0), ivec2(u_probes_x - 1, u_probes_y - 1));
+        vec3 v = texelFetch(u_cascade0, ivec2(pi.x * u_N + ai, pi.y * u_N + aj), 0).rgb;
+        float w = ((dx == 0) ? (1.0 - f.x) : f.x) * ((dy == 0) ? (1.0 - f.y) : f.y);
+        acc += v * w;
     }
-    return r * vec2(cos(phi), sin(phi));
-}
-
-vec3 dir_world(int d, int r, vec3 t, vec3 b, vec3 n) {
-    int dx = d % r;
-    int dy = d / r;
-    vec2 disk = concentric_disk((vec2(dx, dy) + 0.5) / float(r));
-    vec3 dir = t * disk.x + b * disk.y + n * sqrt(max(1.0 - dot(disk, disk), 0.0));
-    return normalize(dir);
-}
-
-// Bilinear sample of a stored cascade (level >= 1) at this pixel, direction d.
-vec3 sample_cascade(int level, ivec2 px, float d) {
-    float spacing = float(u_spacing[level]);
-    float px_c = (float(px.x) + 0.5) / spacing;
-    float py_c = (float(px.y) + 0.5) / spacing;
-    float xtex = (d + 0.5) * float(u_grid_w[level]) + px_c * float(u_grid_w[level]);
-    float ytex = py_c;
-    vec2 uv = (vec2(xtex, ytex) + 0.5) / vec2(float(u_tex_w[level]), float(u_tex_h[level]));
-    return texture(u_cascades[level - 1], uv).rgb;
+    return acc;
 }
 
 void main() {
     ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= int(u_res.x) || px.y >= int(u_res.y)) return;
 
-    vec3 albedo  = imageLoad(u_albedo_tex, px).rgb;
-    vec3 emissive = imageLoad(u_emissive_tex, px).rgb;
-    float surf_mark = imageLoad(u_albedo_tex, px).a;
+    vec4 alb4 = imageLoad(u_albedo_tex, px);
+    if (alb4.a < 0.5) {
+        imageStore(u_out, px, vec4(0.0, 0.0, 0.0, 1.0));
+        imageStore(u_gi_out, px, vec4(0.0, 0.0, 0.0, 1.0));
+        return;
+    }
+    vec3 albedo = alb4.rgb;
     vec3 n = oct_decode(imageLoad(u_normal_tex, px).xy);
 
-    vec3 tng = normalize(cross(vec3(0.0, 1.0, 0.0), n));
-    if (dot(tng, tng) < 1e-4) tng = normalize(cross(vec3(1.0, 0.0, 0.0), n));
-    vec3 bin = cross(n, tng);
-
-    if (u_view_mode == 1) { imageStore(u_out, px, vec4(albedo, 1.0)); return; }
-    if (u_view_mode == 2) { imageStore(u_out, px, vec4(n * 0.5 + 0.5, 1.0)); return; }
+    if (u_view_mode == 1) { imageStore(u_out, px, vec4(albedo, 1.0)); imageStore(u_gi_out, px, vec4(0.0, 0.0, 0.0, 1.0)); return; }
+    if (u_view_mode == 2) { imageStore(u_out, px, vec4(n * 0.5 + 0.5, 1.0)); imageStore(u_gi_out, px, vec4(0.0, 0.0, 0.0, 1.0)); return; }
     if (u_view_mode == 3) {
-        vec3 p = imageLoad(u_position_tex, px).rgb;
-        imageStore(u_out, px, vec4(clamp(p * 0.25 + 0.5, 0.0, 1.0), 1.0));
+        vec3 p = clamp(imageLoad(u_position_tex, px).rgb * 0.5 + 0.5, 0.0, 1.0);
+        imageStore(u_out, px, vec4(p, 1.0));
+        imageStore(u_gi_out, px, vec4(0.0, 0.0, 0.0, 1.0));
         return;
     }
     if (u_view_mode == 4) {
-        vec2 suv = (vec2(px) + 0.5) / vec2(u_ssrc_w, u_ssrc_h);
-        imageStore(u_out, px, vec4(texture(u_surface_tex, suv).rgb, 1.0));
+        imageStore(u_out, px, vec4(imageLoad(u_source_tex, px).rgb, 1.0));
+        imageStore(u_gi_out, px, vec4(0.0, 0.0, 0.0, 1.0));
         return;
     }
-    if (u_view_mode == 5) { imageStore(u_out, px, vec4(emissive, 1.0)); return; }
+    if (u_view_mode == 5) {
+        float d = imageLoad(u_depth_tex, px).r / u_far;
+        imageStore(u_out, px, vec4(vec3(d), 1.0));
+        imageStore(u_gi_out, px, vec4(0.0, 0.0, 0.0, 1.0));
+        return;
+    }
     if (u_view_mode == 6) {
-        float depth = imageLoad(u_depth_tex, px).r / u_far;
-        imageStore(u_out, px, vec4(vec3(depth), 1.0));
-        return;
-    }
-    if (u_view_mode == 7) {
-        int lvl = clamp(u_debug_level, 0, u_num_cascades - 1);
-        vec3 c;
-        if (lvl == 0) {
-            vec2 suv = (vec2(px) + 0.5) / vec2(u_ssrc_w, u_ssrc_h);
-            c = texture(u_surface_tex, suv).rgb;
-        } else {
-            c = sample_cascade(lvl, px, 0.0);
-        }
+        vec2 puv = (vec2(px) + 0.5) / u_res;
+        vec2 fp = puv * u_res / u_dbg_spacing - 0.5;
+        ivec2 probe = clamp(ivec2(floor(fp)),
+                            ivec2(0), ivec2(u_dbg_probes_x - 1, u_dbg_probes_y - 1));
+        int ai = u_dbg_N / 2;
+        int aj = u_dbg_N / 2;
+        vec3 c = texelFetch(u_cascade_dbg,
+                            ivec2(probe.x * u_dbg_N + ai, probe.y * u_dbg_N + aj), 0).rgb;
         imageStore(u_out, px, vec4(c, 1.0));
+        imageStore(u_gi_out, px, vec4(0.0, 0.0, 0.0, 1.0));
         return;
     }
 
     vec3 E = vec3(0.0);
-    for (int c = 0; c < u_num_cascades; ++c) {
-        int r = u_rays[c];
-        float omega = 4.0 * PI / float(r * r);
-        for (int d = 0; d < r * r; ++d) {
-            vec3 dir = dir_world(d, r, tng, bin, n);
-            float cosw = max(dot(n, dir), 0.0);
-            if (cosw <= 0.0) continue;
-            vec3 rad;
-            if (c == 0) {
-                vec2 suv = (vec2(px) + 0.5) / vec2(u_ssrc_w, u_ssrc_h);
-                rad = texture(u_surface_tex, suv).rgb * u_near_strength;
-            } else {
-                rad = sample_cascade(c, px, float(d));
-            }
-            E += rad * cosw * omega;
-        }
+    float wsum = 0.0;
+    vec2 pos = (vec2(px) + 0.5) / u_res * u_res;
+    for (int aj = 0; aj < u_N; ++aj)
+    for (int ai = 0; ai < u_N; ++ai) {
+        vec3 dir = dir_from_angle(ai, aj, u_N);
+        float c = dot(n, dir);
+        if (c <= 0.0) continue;
+        E += c0_sample(pos, ai, aj) * c;
+        wsum += c;
     }
-
-    vec3 final = albedo / PI * (E * u_gi_strength) + emissive;
-    if (surf_mark < 0.5) final = vec3(0.0);
+    vec3 gi = (wsum > 1e-4) ? E / wsum : vec3(0.0);
+    vec3 indirect = albedo * gi * u_gi_strength;
+    vec3 final = indirect + imageLoad(u_source_tex, px).rgb;
     imageStore(u_out, px, vec4(final, 1.0));
+    imageStore(u_gi_out, px, vec4(min(indirect, vec3(u_gi_clamp)), 1.0));
 }
 )";
 
@@ -455,8 +430,8 @@ struct Ssrc {
     gl::Texture albedo{gl::TextureType::tex_2d};
     gl::Texture normal{gl::TextureType::tex_2d};
     gl::Texture position{gl::TextureType::tex_2d};
-    gl::Texture surface{gl::TextureType::tex_2d};
-    gl::Texture emissive{gl::TextureType::tex_2d};
+    gl::Texture source{gl::TextureType::tex_2d};
+    gl::Texture gi{gl::TextureType::tex_2d};
     gl::Texture depth{gl::TextureType::tex_2d};
     gl::Texture color{gl::TextureType::tex_2d};
     gl::Renderbuffer depth_rbo;
@@ -476,8 +451,8 @@ void create_ssrc_textures(Ssrc& s, int w, int h) {
     tex2(s.albedo);
     tex2(s.normal);
     tex2(s.position);
-    tex2(s.surface);
-    tex2(s.emissive);
+    tex2(s.source);
+    tex2(s.gi);
     tex2(s.color);
 
     s.depth.image_2d(0, GL_R32F, w, h, GL_RED, GL_FLOAT, nullptr, 1);
@@ -492,22 +467,24 @@ void create_ssrc_textures(Ssrc& s, int w, int h) {
     s.fbo.attach_texture(GL_COLOR_ATTACHMENT0, s.albedo);
     s.fbo.attach_texture(GL_COLOR_ATTACHMENT1, s.normal);
     s.fbo.attach_texture(GL_COLOR_ATTACHMENT2, s.position);
-    s.fbo.attach_texture(GL_COLOR_ATTACHMENT3, s.surface);
-    s.fbo.attach_texture(GL_COLOR_ATTACHMENT4, s.emissive);
-    s.fbo.attach_texture(GL_COLOR_ATTACHMENT5, s.depth);
+    s.fbo.attach_texture(GL_COLOR_ATTACHMENT3, s.source);
+    s.fbo.attach_texture(GL_COLOR_ATTACHMENT4, s.depth);
     s.fbo.attach_renderbuffer(GL_DEPTH_ATTACHMENT, s.depth_rbo);
-    GLenum bufs[6] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2,
-                      GL_COLOR_ATTACHMENT3, GL_COLOR_ATTACHMENT4, GL_COLOR_ATTACHMENT5};
-    glDrawBuffers(6, bufs);
+    GLenum bufs[5] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2,
+                      GL_COLOR_ATTACHMENT3, GL_COLOR_ATTACHMENT4};
+    glDrawBuffers(5, bufs);
     if (!s.fbo.check()) {
         gllib::log(gllib::LogLevel::error, "SSRC G-buffer framebuffer incomplete");
     }
     gl::Framebuffer::unbind(gl::FramebufferType::both);
+
+    const float zero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    glClearTexImage(s.gi.handle(), 0, GL_RGBA, GL_FLOAT, zero);
 }
 
 struct LevelParams {
     int spacing = 1;
-    int rays = 1;
+    int N = 1;
     int grid_w = 1;
     int grid_h = 1;
     int tex_w = 1;
@@ -638,12 +615,21 @@ int main() {
         }
     }
     glm::vec3 cam_target = (lo + hi) * 0.5f;
-    float cam_dist = 0.5f * glm::length(hi - lo) + 3.0f;
+    float cam_dist = 0.5f * glm::length(hi - lo) + 1.8f;
 
     gfx::Camera cam;
     cam.perspective(45.0f, float(window.framebuffer_width()) / float(window.framebuffer_height()),
                     0.1f, 1000.0f);
-    cam.look_at(cam_target + glm::vec3(0, 0, cam_dist), cam_target);
+    glm::vec3 cam_offset = glm::vec3(0, 0, cam_dist);
+    if (getenv("SSRC_CAM_X") && getenv("SSRC_CAM_Y") && getenv("SSRC_CAM_Z")) {
+        cam_offset = glm::vec3(std::atof(getenv("SSRC_CAM_X")),
+                               std::atof(getenv("SSRC_CAM_Y")),
+                               std::atof(getenv("SSRC_CAM_Z")));
+    }
+    cam.look_at(cam_target + cam_offset, cam_target);
+
+    gllib::logf(gllib::LogLevel::info, "SSRC camera target(%.2f %.2f %.2f) dist %.2f",
+                cam_target.x, cam_target.y, cam_target.z, cam_dist);
 
     // --- Fullscreen triangle (gl_VertexID) ---
     gl::VertexArray fsq_vao;
@@ -651,19 +637,18 @@ int main() {
     // --- Tuning state ---
     int view_mode = getenv("SSRC_VIEW") ? std::atoi(getenv("SSRC_VIEW")) : 0;
     int debug_level = getenv("SSRC_DEBUG_LEVEL") ? std::atoi(getenv("SSRC_DEBUG_LEVEL")) : 1;
-    int num_cascades = 6;
+    int num_cascades = 4;
     int probe_spacing = 8;
-    int rays_cap = 12;
-    int ray_steps = 32;
-    float base_interval = 0.02f;
+    int rays_base = 8;
+    float base_interval = 0.1f;
     float res_scale = 0.5f;
-    float gi_strength = 1.0f;
-    float near_strength = 0.4f;
-    float emissive_scale = 4.0f;
-    float ray_bias = 0.005f;
-    float thickness = 0.005f;
-    glm::vec3 ambient_color(0.15f, 0.12f, 0.10f);
-    float ambient_intensity = 0.5f;
+    float gi_strength = 1.5f;
+    float feedback = 0.9f;
+    float gi_clamp = 200.0f;
+    float emissive_scale = 30.0f;
+    float thickness = 0.01f;
+    float skip_px = 3.0f;
+    float step_px = 2.0f;
     float exposure = 1.0f;
     int tonemap = 1;
     float gamma = 2.2f;
@@ -673,23 +658,22 @@ int main() {
     Ssrc ssrc;
     std::vector<gl::Texture> cascades;
     std::vector<LevelParams> lvl;
-    int last_sw = -1, last_sh = -1, last_spacing = -1, last_cap = -1, last_n = -1;
+    int last_sw = -1, last_sh = -1, last_spacing = -1, last_rays = -1, last_n = -1;
 
     auto rebuild_cascades = [&]() {
         int sw = ssrc.w, sh = ssrc.h;
         lvl.resize(num_cascades);
         for (int c = 0; c < num_cascades; ++c) {
             int spacing = probe_spacing << c;
-            int rays = std::min(spacing, rays_cap);
+            int N = rays_base << c;
             int gw = std::max(1, (sw + spacing - 1) / spacing);
             int gh = std::max(1, (sh + spacing - 1) / spacing);
-            lvl[c] = LevelParams{spacing, rays, gw, gh, gw * rays * rays, gh};
+            lvl[c] = LevelParams{spacing, N, gw, gh, gw * N, gh * N};
         }
-        int n = num_cascades - 1;
-        cascades.resize(n);
-        for (int j = 0; j < n; ++j) {
-            const LevelParams& lp = lvl[j + 1];
-            gl::Texture& tex = cascades[j];
+        cascades.resize(num_cascades);
+        for (int c = 0; c < num_cascades; ++c) {
+            const LevelParams& lp = lvl[c];
+            gl::Texture& tex = cascades[c];
             tex.image_2d(0, GL_RGBA16F, lp.tex_w, lp.tex_h, GL_RGBA, GL_FLOAT, nullptr, 1);
             tex.parameter(GL_TEXTURE_MIN_FILTER, GL_LINEAR);
             tex.parameter(GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -721,27 +705,28 @@ int main() {
             last_sw = sw;
             last_sh = sh;
             last_spacing = probe_spacing;
-            last_cap = rays_cap;
+            last_rays = rays_base;
             last_n = num_cascades;
-        } else if (probe_spacing != last_spacing || rays_cap != last_cap || num_cascades != last_n) {
+        } else if (probe_spacing != last_spacing || rays_base != last_rays ||
+                   num_cascades != last_n) {
             rebuild_cascades();
             last_spacing = probe_spacing;
-            last_cap = rays_cap;
+            last_rays = rays_base;
             last_n = num_cascades;
         }
 
         glm::mat4 vp = cam.view_projection();
-        float seed = float(std::fmod(now, 1.0));
+        glm::mat4 proj = cam.projection();
 
         // ===================================================================
-        // 1. Geometry pass — 6 MRT G-buffer at ssrc resolution
+        // 1. Geometry pass — G-buffer + source (emission) at ssrc resolution
         // ===================================================================
         ssrc.fbo.bind();
         gl::viewport(0, 0, sw, sh);
-        gl::clear_color(0.0f, 0.0f, 0.0f, 1.0f);
+        gl::clear_color(0.0f, 0.0f, 0.0f, 0.0f);
         gl::clear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
         const float farv[4] = {far_plane, 0.0f, 0.0f, 0.0f};
-        glClearBufferfv(GL_COLOR, 6, farv);
+        glClearBufferfv(GL_COLOR, 4, farv);
 
         gl::enable(GL_DEPTH_TEST);
         gl::depth_func(GL_LESS);
@@ -752,7 +737,7 @@ int main() {
         loc = g_loc("u_view_proj"); if (loc >= 0) gbuf_prog.uniform_matrix4fv(loc, glm::value_ptr(vp));
         loc = g_loc("u_view");      if (loc >= 0) gbuf_prog.uniform_matrix4fv(loc, glm::value_ptr(cam.view()));
         loc = g_loc("u_model");     if (loc >= 0) gbuf_prog.uniform_matrix4fv(loc, glm::value_ptr(model_mat));
-        loc = g_loc("u_emissive_scale");   if (loc >= 0) gbuf_prog.uniform1f(loc, emissive_scale);
+        loc = g_loc("u_emissive_scale"); if (loc >= 0) gbuf_prog.uniform1f(loc, emissive_scale);
 
         for (size_t i = 0; i < model.mesh_count(); ++i) {
             int mi = model.mesh_material(int(i));
@@ -766,50 +751,49 @@ int main() {
         gl::memory_barrier(GL_ALL_BARRIER_BITS);
 
         // ===================================================================
-        // 2. Cascade build — coarsest to finest, one dispatch per cascade
+        // 2. Cascade build — coarsest to finest; each pass traces its interval
+        //    and merges with the already-resolved next coarser cascade.
         // ===================================================================
         build_prog.use();
         auto b_loc = [&](const char* n) { return build_prog.uniform_location(n); };
-        loc = b_loc("u_view_proj"); if (loc >= 0) build_prog.uniform_matrix4fv(loc, glm::value_ptr(vp));
-        loc = b_loc("u_view");      if (loc >= 0) build_prog.uniform_matrix4fv(loc, glm::value_ptr(cam.view()));
-        loc = b_loc("u_ssrc_w");    if (loc >= 0) build_prog.uniform1i(loc, sw);
-        loc = b_loc("u_ssrc_h");    if (loc >= 0) build_prog.uniform1i(loc, sh);
+        loc = b_loc("u_proj");      if (loc >= 0) build_prog.uniform_matrix4fv(loc, glm::value_ptr(proj));
+        loc = b_loc("u_res");       if (loc >= 0) build_prog.uniform2f(loc, float(sw), float(sh));
         loc = b_loc("u_far");       if (loc >= 0) build_prog.uniform1f(loc, far_plane);
-        loc = b_loc("u_ray_bias");  if (loc >= 0) build_prog.uniform1f(loc, ray_bias);
         loc = b_loc("u_thickness"); if (loc >= 0) build_prog.uniform1f(loc, thickness);
-        loc = b_loc("u_steps");     if (loc >= 0) build_prog.uniform1i(loc, ray_steps);
-        loc = b_loc("u_seed");      if (loc >= 0) build_prog.uniform1f(loc, seed);
-        loc = b_loc("u_ambient_color");      if (loc >= 0) build_prog.uniform3fv(loc, glm::value_ptr(ambient_color));
-        loc = b_loc("u_ambient_intensity");  if (loc >= 0) build_prog.uniform1f(loc, ambient_intensity);
+        loc = b_loc("u_skip_px");   if (loc >= 0) build_prog.uniform1f(loc, skip_px);
+        loc = b_loc("u_step_px");   if (loc >= 0) build_prog.uniform1f(loc, step_px);
+        loc = b_loc("u_feedback");  if (loc >= 0) build_prog.uniform1f(loc, feedback);
 
         ssrc.position.bind(0);
-        ssrc.normal.bind(1);
-        ssrc.surface.bind(2);
-        ssrc.depth.bind_image(3, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
+        ssrc.depth.bind(1);
+        ssrc.source.bind(2);
+        ssrc.gi.bind(3);
 
-        for (int c = num_cascades - 1; c >= 1; --c) {
+        for (int c = num_cascades - 1; c >= 0; --c) {
             const LevelParams& cur = lvl[c];
-            float istart = base_interval * std::pow(4.0f, float(c - 1));
-            float iend = base_interval * std::pow(4.0f, float(c));
+            float t0 = (c == 0) ? 0.0f : base_interval * std::pow(4.0f, float(c - 1));
+            float t1 = base_interval * std::pow(4.0f, float(c));
             int has_next = (c < num_cascades - 1) ? 1 : 0;
 
-            cascades[c - 1].bind_image(4, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
-            if (has_next) cascades[c].bind(5);
+            cascades[c].bind_image(4, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
+            if (has_next) cascades[c + 1].bind(5);
 
-            loc = b_loc("u_grid_w");        if (loc >= 0) build_prog.uniform1i(loc, cur.grid_w);
-            loc = b_loc("u_rays");          if (loc >= 0) build_prog.uniform1i(loc, cur.rays);
+            loc = b_loc("u_N");             if (loc >= 0) build_prog.uniform1i(loc, cur.N);
             loc = b_loc("u_spacing");       if (loc >= 0) build_prog.uniform1f(loc, float(cur.spacing));
-            loc = b_loc("u_interval_start"); if (loc >= 0) build_prog.uniform1f(loc, istart);
-            loc = b_loc("u_interval_end");  if (loc >= 0) build_prog.uniform1f(loc, iend);
+            loc = b_loc("u_probes_x");      if (loc >= 0) build_prog.uniform1i(loc, cur.grid_w);
+            loc = b_loc("u_probes_y");      if (loc >= 0) build_prog.uniform1i(loc, cur.grid_h);
+            loc = b_loc("u_tex_w");         if (loc >= 0) build_prog.uniform1i(loc, cur.tex_w);
+            loc = b_loc("u_tex_h");         if (loc >= 0) build_prog.uniform1i(loc, cur.tex_h);
+            loc = b_loc("u_t0");            if (loc >= 0) build_prog.uniform1f(loc, t0);
+            loc = b_loc("u_t1");            if (loc >= 0) build_prog.uniform1f(loc, t1);
             loc = b_loc("u_has_next");      if (loc >= 0) build_prog.uniform1i(loc, has_next);
 
             if (has_next) {
                 const LevelParams& next = lvl[c + 1];
-                loc = b_loc("u_next_rays");    if (loc >= 0) build_prog.uniform1i(loc, next.rays);
-                loc = b_loc("u_next_spacing"); if (loc >= 0) build_prog.uniform1f(loc, float(next.spacing));
-                loc = b_loc("u_next_grid_w");  if (loc >= 0) build_prog.uniform1i(loc, next.grid_w);
-                loc = b_loc("u_next_tex_w");   if (loc >= 0) build_prog.uniform1i(loc, next.tex_w);
-                loc = b_loc("u_next_tex_h");   if (loc >= 0) build_prog.uniform1i(loc, next.tex_h);
+                loc = b_loc("u_next_N");        if (loc >= 0) build_prog.uniform1i(loc, next.N);
+                loc = b_loc("u_next_spacing");  if (loc >= 0) build_prog.uniform1f(loc, float(next.spacing));
+                loc = b_loc("u_next_probes_x"); if (loc >= 0) build_prog.uniform1i(loc, next.grid_w);
+                loc = b_loc("u_next_probes_y"); if (loc >= 0) build_prog.uniform1i(loc, next.grid_h);
             }
 
             int groups_x = (cur.tex_w + 7) / 8;
@@ -819,49 +803,38 @@ int main() {
         }
 
         // ===================================================================
-        // 3. Gather pass — integrate all cascades into a HDR target
+        // 3. Final gather — cosine-weighted hemisphere integral from cascade 0
         // ===================================================================
         gather_prog.use();
         auto g2_loc = [&](const char* n) { return gather_prog.uniform_location(n); };
 
         ssrc.albedo.bind_image(0, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA16F);
         ssrc.normal.bind_image(1, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA16F);
-        ssrc.emissive.bind_image(2, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA16F);
+        ssrc.source.bind_image(2, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA16F);
         ssrc.position.bind_image(3, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA16F);
         ssrc.depth.bind_image(4, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
         ssrc.color.bind_image(5, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
+        ssrc.gi.bind_image(7, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
 
-        ssrc.surface.bind(10);
-        for (int j = 0; j < int(cascades.size()); ++j) cascades[j].bind(11 + j);
+        cascades[0].bind(6);
+        cascades[size_t(std::clamp(debug_level, 0, num_cascades - 1))].bind(7);
 
-        loc = g2_loc("u_ssrc_w");        if (loc >= 0) gather_prog.uniform1i(loc, sw);
-        loc = g2_loc("u_ssrc_h");        if (loc >= 0) gather_prog.uniform1i(loc, sh);
-        loc = g2_loc("u_far");           if (loc >= 0) gather_prog.uniform1f(loc, far_plane);
-        loc = g2_loc("u_num_cascades");  if (loc >= 0) gather_prog.uniform1i(loc, num_cascades);
-        loc = g2_loc("u_gi_strength");   if (loc >= 0) gather_prog.uniform1f(loc, gi_strength);
-        loc = g2_loc("u_near_strength"); if (loc >= 0) gather_prog.uniform1f(loc, near_strength);
-        loc = g2_loc("u_view_mode");     if (loc >= 0) gather_prog.uniform1i(loc, view_mode);
-        loc = g2_loc("u_debug_level");   if (loc >= 0) gather_prog.uniform1i(loc, debug_level);
-
-        int base_rays = g2_loc("u_rays");
-        int base_spacing = g2_loc("u_spacing");
-        int base_grid = g2_loc("u_grid_w");
-        int base_tex_w = g2_loc("u_tex_w");
-        int base_tex_h = g2_loc("u_tex_h");
-        for (int c = 0; c < num_cascades; ++c) {
-            if (base_rays >= 0) gather_prog.uniform1i(base_rays + c, lvl[c].rays);
-            if (base_spacing >= 0) gather_prog.uniform1i(base_spacing + c, lvl[c].spacing);
-            if (base_grid >= 0) gather_prog.uniform1i(base_grid + c, lvl[c].grid_w);
-            if (base_tex_w >= 0) gather_prog.uniform1i(base_tex_w + c, lvl[c].tex_w);
-            if (base_tex_h >= 0) gather_prog.uniform1i(base_tex_h + c, lvl[c].tex_h);
-        }
-
-        int base_casc = g2_loc("u_cascades");
-        if (base_casc >= 0) {
-            int units[MAX_CASCADES];
-            for (int j = 0; j < MAX_CASCADES; ++j) units[j] = 11 + j;
-            for (int j = 0; j < MAX_CASCADES; ++j) gather_prog.uniform1i(base_casc + j, units[j]);
-        }
+        const LevelParams& c0 = lvl[0];
+        const LevelParams& dbg = lvl[std::clamp(debug_level, 0, num_cascades - 1)];
+        loc = g2_loc("u_res");         if (loc >= 0) gather_prog.uniform2f(loc, float(sw), float(sh));
+        loc = g2_loc("u_far");         if (loc >= 0) gather_prog.uniform1f(loc, far_plane);
+        loc = g2_loc("u_N");           if (loc >= 0) gather_prog.uniform1i(loc, c0.N);
+        loc = g2_loc("u_spacing");     if (loc >= 0) gather_prog.uniform1f(loc, float(c0.spacing));
+        loc = g2_loc("u_probes_x");    if (loc >= 0) gather_prog.uniform1i(loc, c0.grid_w);
+        loc = g2_loc("u_probes_y");    if (loc >= 0) gather_prog.uniform1i(loc, c0.grid_h);
+        loc = g2_loc("u_gi_strength"); if (loc >= 0) gather_prog.uniform1f(loc, gi_strength);
+        loc = g2_loc("u_gi_clamp");    if (loc >= 0) gather_prog.uniform1f(loc, gi_clamp);
+        loc = g2_loc("u_view_mode");   if (loc >= 0) gather_prog.uniform1i(loc, view_mode);
+        loc = g2_loc("u_debug_level"); if (loc >= 0) gather_prog.uniform1i(loc, debug_level);
+        loc = g2_loc("u_dbg_N");          if (loc >= 0) gather_prog.uniform1i(loc, dbg.N);
+        loc = g2_loc("u_dbg_spacing");    if (loc >= 0) gather_prog.uniform1f(loc, float(dbg.spacing));
+        loc = g2_loc("u_dbg_probes_x");   if (loc >= 0) gather_prog.uniform1i(loc, dbg.grid_w);
+        loc = g2_loc("u_dbg_probes_y");   if (loc >= 0) gather_prog.uniform1i(loc, dbg.grid_h);
 
         gl::dispatch_compute((sw + 7) / 8, (sh + 7) / 8, 1);
         gl::memory_barrier(GL_ALL_BARRIER_BITS);
@@ -909,27 +882,24 @@ int main() {
             ImGui::Separator();
 
             ImGui::Combo("View", &view_mode,
-                         "Composite\0Albedo\0Normal\0Position\0Surface\0Emissive\0Depth\0Cascade\0");
+                         "Composite\0Albedo\0Normal\0Position\0Source\0Depth\0Cascade\0");
             ImGui::SliderInt("Debug cascade", &debug_level, 0, num_cascades - 1);
 
             ImGui::Separator();
             ImGui::SliderInt("Cascades", &num_cascades, 2, MAX_CASCADES);
             ImGui::SliderInt("Probe spacing", &probe_spacing, 2, 64);
-            ImGui::SliderInt("Rays cap", &rays_cap, 2, 16);
+            ImGui::SliderInt("Rays per side", &rays_base, 2, 16);
             ImGui::SliderFloat("Base interval", &base_interval, 0.001f, 1.0f, "%.3f");
             ImGui::SliderFloat("Res scale", &res_scale, 0.25f, 1.0f, "%.2f");
-            ImGui::SliderInt("Ray steps", &ray_steps, 8, 64);
+            ImGui::SliderFloat("Step px", &step_px, 0.5f, 8.0f, "%.2f");
+            ImGui::SliderFloat("Skip px", &skip_px, 0.0f, 16.0f, "%.1f");
 
             ImGui::Separator();
             ImGui::SliderFloat("GI strength", &gi_strength, 0.0f, 4.0f);
-            ImGui::SliderFloat("Near strength", &near_strength, 0.0f, 2.0f);
-            ImGui::SliderFloat("Ray bias", &ray_bias, 0.0f, 0.1f, "%.4f");
-            ImGui::SliderFloat("Thickness", &thickness, 0.0f, 0.1f, "%.4f");
-            ImGui::SliderFloat("Emissive scale", &emissive_scale, 0.0f, 20.0f);
-
-            ImGui::Separator();
-            ImGui::ColorEdit3("Ambient", &ambient_color.x);
-            ImGui::SliderFloat("Ambient intensity", &ambient_intensity, 0.0f, 2.0f);
+            ImGui::SliderFloat("Feedback", &feedback, 0.0f, 1.0f, "%.2f");
+            ImGui::SliderFloat("GI clamp", &gi_clamp, 0.0f, 500.0f);
+            ImGui::SliderFloat("Thickness", &thickness, 0.0f, 0.2f, "%.4f");
+            ImGui::SliderFloat("Emissive scale", &emissive_scale, 0.0f, 50.0f);
 
             ImGui::Separator();
             ImGui::SliderFloat("Exposure", &exposure, 0.05f, 5.0f);
@@ -939,11 +909,15 @@ int main() {
             ImGui::Separator();
             float aw = ImGui::GetContentRegionAvail().x;
             if (aw < 64.0f) aw = 256.0f;
-            ImGui::Image((ImTextureID)(intptr_t)ssrc.surface.handle(),
+            ImGui::Image((ImTextureID)(intptr_t)ssrc.source.handle(),
+                         ImVec2(aw, aw * 0.5f), ImVec2(0, 1), ImVec2(1, 0));
+            ImGui::Text("GI history (indirect, feedback input)");
+            ImGui::Image((ImTextureID)(intptr_t)ssrc.gi.handle(),
                          ImVec2(aw, aw * 0.5f), ImVec2(0, 1), ImVec2(1, 0));
             if (!cascades.empty()) {
-                ImGui::Text("Cascade %d (packed)", debug_level);
-                ImGui::Image((ImTextureID)(intptr_t)cascades[size_t(std::clamp(debug_level - 1, 0, int(cascades.size()) - 1))].handle(),
+                ImGui::Text("Cascade %d (packed atlas)", debug_level);
+                ImGui::Image((ImTextureID)(intptr_t)
+                                 cascades[size_t(std::clamp(debug_level, 0, num_cascades - 1))].handle(),
                              ImVec2(aw, aw * 0.3f), ImVec2(0, 1), ImVec2(1, 0));
             }
             ImGui::End();
