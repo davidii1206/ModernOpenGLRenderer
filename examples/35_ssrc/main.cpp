@@ -118,11 +118,14 @@ layout(binding = 2) uniform sampler2D u_source_tex;  // outgoing radiance (emiss
 layout(binding = 3) uniform sampler2D u_gi_tex;      // previous frame's indirect GI (feedback)
 layout(rgba16f, binding = 4) uniform writeonly image2D u_out;
 layout(binding = 5) uniform sampler2D u_next_tex;    // coarser cascade atlas
+layout(binding = 6) uniform sampler2D u_normal_tex;  // octahedral view-space normal
 
 uniform mat4 u_proj;
 uniform vec2 u_res;
 uniform float u_far;
 uniform float u_feedback;
+uniform float u_normal_bias;     // max origin lift along the normal (grazing rays)
+uniform float u_normal_bias_min; // min origin lift along the normal (near-normal rays)
 
 uniform int   u_N;             // angular grid side for this cascade
 uniform float u_spacing;       // probe spacing (px at ssrc res)
@@ -156,6 +159,16 @@ vec3 dir_from_angle(int ai, int aj, int N) {
 vec2 uv_from_view(vec3 p) {
     vec4 clip = u_proj * vec4(p, 1.0);
     return clip.xy / clip.w * 0.5 + 0.5;
+}
+
+vec3 oct_decode(vec2 e) {
+    e = e * 2.0 - 1.0;
+    vec3 n = vec3(e, 1.0);
+    n.z = 1.0 - abs(n.x) - abs(n.y);
+    if (n.z < 0.0) {
+        n.xy = (1.0 - abs(n.yx)) * mix(vec2(-1.0), vec2(1.0), step(0.0, n.xy));
+    }
+    return normalize(n);
 }
 
 // Quadrilinear (bilinear space x bilinear angle) sample of the coarser cascade
@@ -243,8 +256,14 @@ void main() {
         return;
     }
 
-    vec3 origin = P.xyz;
+    vec3 N = oct_decode(texelFetch(u_normal_tex, pt, 0).xy);
     vec3 dir = dir_from_angle(ai, aj, u_N);
+    // Lift the origin along the normal. Near-normal rays only need a tiny offset
+    // (keeps short rays toward close geometry — e.g. the light fixture — and
+    // near-field contact bounce intact); grazing rays need full clearance to
+    // avoid self-intersecting the probe's own surface.
+    float bias = mix(u_normal_bias_min, u_normal_bias, 1.0 - abs(dot(N, dir)));
+    vec3 origin = P.xyz + N * bias;
 
     vec3 rad;
     vec2 hit_uv;
@@ -373,11 +392,13 @@ void main() {
     vec2 pos = (vec2(px) + 0.5) / u_res * u_res;
     for (int aj = 0; aj < u_N; ++aj)
     for (int ai = 0; ai < u_N; ++ai) {
+        float theta = (float(aj) + 0.5) / float(u_N) * 3.1415927;
         vec3 dir = dir_from_angle(ai, aj, u_N);
         float c = dot(n, dir);
         if (c <= 0.0) continue;
-        E += c0_sample(pos, ai, aj) * c;
-        wsum += c;
+        float w = c * sin(theta);
+        E += c0_sample(pos, ai, aj) * w;
+        wsum += w;
     }
     vec3 gi = (wsum > 1e-4) ? E / wsum : vec3(0.0);
     vec3 indirect = albedo * gi * u_gi_strength;
@@ -547,6 +568,7 @@ void camera_control(gfx::Window& w, gfx::Camera& cam, float dt, bool allow, bool
 int main() {
     gllib::log_to_stderr(gllib::LogLevel::info);
     gfx::Window window({"35 SSRC - Radiance Cascades", 1600, 900});
+    window.vsync(false);
 
     // --- ImGui ---
     gfx::ImGuiOverlay gui;
@@ -641,12 +663,14 @@ int main() {
     int probe_spacing = 8;
     int rays_base = 8;
     float base_interval = 0.1f;
-    float res_scale = 0.5f;
+    float res_scale = 1.0f;
     float gi_strength = 1.5f;
     float feedback = 0.9f;
     float gi_clamp = 200.0f;
     float emissive_scale = 30.0f;
     float thickness = 0.01f;
+    float normal_bias = 0.02f;
+    float normal_bias_min = 0.002f;
     float skip_px = 3.0f;
     float step_px = 2.0f;
     float exposure = 1.0f;
@@ -763,11 +787,14 @@ int main() {
         loc = b_loc("u_skip_px");   if (loc >= 0) build_prog.uniform1f(loc, skip_px);
         loc = b_loc("u_step_px");   if (loc >= 0) build_prog.uniform1f(loc, step_px);
         loc = b_loc("u_feedback");  if (loc >= 0) build_prog.uniform1f(loc, feedback);
+        loc = b_loc("u_normal_bias");     if (loc >= 0) build_prog.uniform1f(loc, normal_bias);
+        loc = b_loc("u_normal_bias_min"); if (loc >= 0) build_prog.uniform1f(loc, normal_bias_min);
 
         ssrc.position.bind(0);
         ssrc.depth.bind(1);
         ssrc.source.bind(2);
         ssrc.gi.bind(3);
+        ssrc.normal.bind(6);
 
         for (int c = num_cascades - 1; c >= 0; --c) {
             const LevelParams& cur = lvl[c];
@@ -899,6 +926,8 @@ int main() {
             ImGui::SliderFloat("Feedback", &feedback, 0.0f, 1.0f, "%.2f");
             ImGui::SliderFloat("GI clamp", &gi_clamp, 0.0f, 500.0f);
             ImGui::SliderFloat("Thickness", &thickness, 0.0f, 0.2f, "%.4f");
+            ImGui::SliderFloat("Normal bias", &normal_bias, 0.0f, 0.1f, "%.4f");
+            ImGui::SliderFloat("Normal bias min", &normal_bias_min, 0.0f, 0.05f, "%.4f");
             ImGui::SliderFloat("Emissive scale", &emissive_scale, 0.0f, 50.0f);
 
             ImGui::Separator();
