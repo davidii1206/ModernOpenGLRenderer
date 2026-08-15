@@ -22,10 +22,15 @@
 //
 // Usage:
 //   33_mdc_voxelize [--model PATH.glb] [--grid N] [--scale S] [--out FILE.bin]
-//   --model  initial model (one of the three example-32 scenes, or any glb)
-//   --grid   initial grid resolution, power of two (default 1024; 64..2048)
-//   --scale  initial "resolution scale" multiplier over the 1024 base
-//   --out    also write the grid to FILE.bin (MDCV v2, see below)
+//   --model    initial model (one of the three example-32 scenes, or any glb)
+//   --grid     initial grid resolution, power of two (default 1024; 64..2048)
+//   --scale    initial "resolution scale" multiplier over the 1024 base
+//   --pad      half-voxel footprint overlap for neighbouring patches (default 0.5)
+//   --mid      fraction of the depth band kept, re-anchored on the band midpoint
+//              (default 0.5; 1.0 = full conservative band, the old behaviour)
+//   --density  multiplier for the atlas texel density (default 1.0; >1 shrinks
+//              the conservative depth bias ~linearly and forces an atlas rebuild)
+//   --out      also write the grid to FILE.bin (MDCV v2, see below)
 //
 // Controls: LMB drag orbits, scroll wheel zooms.
 //
@@ -131,7 +136,8 @@ struct VoxelStats {
 // Voxelise the atlas into a bit grid. Single-threaded (the MDC pipeline itself
 // is single-threaded; this mirrors it). The tree descent is identical to the
 // ray-marcher shader's, so N only changes the rasterisation step size.
-static Grid voxelize(const gfx::CoverageAtlas& atlas, int N, VoxelStats& st) {
+static Grid voxelize(const gfx::CoverageAtlas& atlas, int N, VoxelStats& st, float pad_frac = 0.0f,
+                     float mid_frac = 0.5f) {
     using clock = std::chrono::steady_clock;
     auto t0 = clock::now();
 
@@ -211,6 +217,42 @@ static Grid voxelize(const gfx::CoverageAtlas& atlas, int N, VoxelStats& st) {
                 const float b0 = p.proj_min.y + float(j) * db, b1 = b0 + db;
                 const float cu0 = dmin + d0, cu1 = dmax + d0;
 
+                // The conservative per-texel band [dmin, dmax] is the surface's
+                // depth extent across the whole texel square. For a tilted texel
+                // the near edge sits a full thickness in front of the surface at
+                // the texel centre, and at patch seams (where the surface is most
+                // oblique to the depth axis) that bias piles up into a coherent
+                // ridge. Re-anchor the stamped column on the band midpoint and
+                // keep only a mid_frac fraction of the thickness, so the reported
+                // surface tracks the true surface instead of its near edge. The
+                // depth extent is additionally capped at one voxel so a steep
+                // texel can never push its column more than half a voxel in front
+                // of the texel-centre surface; without the cap the column front
+                // would stick out a full thickness, and neighbouring patches'
+                // differing thicknesses would leave a visible step at the seam.
+                float bm_lo = cu0, bm_hi = cu1;
+                if (mid_frac < 1.0f) {
+                    const float bm_mid = 0.5f * (cu0 + cu1);
+                    const float u_cell = std::abs(p.basis_u.x) * g.cs.x +
+                                         std::abs(p.basis_u.y) * g.cs.y +
+                                         std::abs(p.basis_u.z) * g.cs.z;
+                    const float bm_hw  = std::min(0.5f * (cu1 - cu0) * mid_frac,
+                                                  0.5f * u_cell);
+                    bm_lo = bm_mid - bm_hw;
+                    bm_hi = bm_mid + bm_hw;
+                }
+
+                // Half-voxel overlap on the projection footprint so that
+                // neighbouring patches' boxes meet instead of leaving a
+                // sub-voxel step at their shared face. The depth band is
+                // deliberately not extended (that would just thicken slabs).
+                const float pad = pad_frac > 0.0f
+                    ? pad_frac * (std::abs(ex.x) * g.cs.x + std::abs(ex.y) * g.cs.y +
+                                  std::abs(ex.z) * g.cs.z)
+                    : 0.0f;
+                const float a0p = a0 - pad, a1p = a1 + pad;
+                const float b0p = b0 - pad, b1p = b1 + pad;
+
                 // World AABB of the texel column box in the (u, ex, ey) frame.
                 vec3 wlo(0.0f), whi(0.0f);
                 auto add_range = [&](const vec3& ax, float cmin, float cmax) {
@@ -220,9 +262,9 @@ static Grid voxelize(const gfx::CoverageAtlas& atlas, int N, VoxelStats& st) {
                         else              { wlo[k] = -cmax; whi[k] = -cmin; }
                     }
                 };
-                add_range(p.basis_u, cu0, cu1);
-                add_range(ex, a0, a1);
-                add_range(ey, b0, b1);
+                add_range(p.basis_u, bm_lo, bm_hi);
+                add_range(ex, a0p, a1p);
+                add_range(ey, b0p, b1p);
 
                 const int gx0 = std::clamp(int(std::floor((wlo.x - lo.x) / g.cs.x)), 0, N - 1);
                 const int gx1 = std::clamp(int(std::floor((whi.x - lo.x) / g.cs.x)), 0, N - 1);
@@ -392,7 +434,7 @@ void main() {
 // --- Scene loading (model + cached MDC atlas) -------------------------------
 
 static bool load_scene(const ModelEntry& entry, gfx::Model& model,
-                       gfx::CoverageAtlas& atlas, float tol_frac) {
+                       gfx::CoverageAtlas& atlas, float tol_frac, float density_mul = 1.0f) {
     std::printf("Loading %s...\n", entry.glb);
     if (!model.load(entry.glb)) {
         std::fprintf(stderr, "Failed to load %s\n", entry.glb);
@@ -414,7 +456,7 @@ static bool load_scene(const ModelEntry& entry, gfx::Model& model,
     }
     float span = std::max({hi.x - lo.x, hi.y - lo.y, hi.z - lo.z});
     const float want_density = span > 1e-6f
-        ? float(atlas.config().auto_target) / span : 0.0f;
+        ? float(atlas.config().auto_target) / span * density_mul : 0.0f;
 
     const bool loaded = atlas.load_files(entry.cache);
     const bool leaf_ok = atlas.config().mip_leaf_tile == 1;
@@ -474,6 +516,9 @@ int main(int argc, char** argv) {
     float scale_arg = 1.0f;
     float zoom_arg = 1.0f;
     float tol_arg = 0.0f;
+    float pad_arg = 0.5f;
+    float mid_arg = 0.5f;
+    float density_arg = 1.0f;
     bool color_mode_pos = false;
 
     for (int i = 1; i < argc; ++i) {
@@ -483,6 +528,9 @@ int main(int argc, char** argv) {
         else if (a == "--scale") { if (i + 1 < argc) scale_arg = float(std::atof(argv[++i])); }
         else if (a == "--zoom" ) { if (i + 1 < argc) zoom_arg = float(std::atof(argv[++i])); }
         else if (a == "--tol"  ) { if (i + 1 < argc) tol_arg = float(std::atof(argv[++i])); }
+        else if (a == "--pad"  ) { if (i + 1 < argc) pad_arg = float(std::atof(argv[++i])); }
+        else if (a == "--mid"  ) { if (i + 1 < argc) mid_arg = float(std::atof(argv[++i])); }
+        else if (a == "--density") { if (i + 1 < argc) density_arg = float(std::atof(argv[++i])); }
         else if (a == "--color-mode") { if (i + 1 < argc) color_mode_pos = std::atoi(argv[++i]) != 0; }
         else if (a == "--out"  ) { if (i + 1 < argc) out_path = argv[++i]; }
         else if (a == "--dump-frame") { if (i + 1 < argc) dump_frame = argv[++i]; }
@@ -532,7 +580,7 @@ int main(int argc, char** argv) {
     gfx::CoverageAtlas atlas;
     gfx::CoverageAtlasConfig atlas_default;
     const float tol_frac = tol_arg > 0.0f ? tol_arg : atlas_default.mip_tol_frac;
-    if (!load_scene(models[cur_model], model, atlas, tol_frac)) return EXIT_FAILURE;
+    if (!load_scene(models[cur_model], model, atlas, tol_frac, density_arg)) return EXIT_FAILURE;
     std::printf("Mip tolerance: %.4g\n", tol_frac);
 
     // --- Camera (model-relative) ---
@@ -562,7 +610,7 @@ int main(int argc, char** argv) {
 
     auto do_voxelize = [&] {
         VoxelStats s;
-        Grid g = voxelize(atlas, grid, s);
+        Grid g = voxelize(atlas, grid, s, pad_arg, mid_arg);
         grid_ = std::move(g);
         vstats = s;
         last_vox_ms = s.ms;
@@ -729,7 +777,7 @@ int main(int argc, char** argv) {
             ImGui::SeparatorText("Scene");
             ImGui::Checkbox("World-position colour", &color_mode_pos);
             if (ImGui::Combo("Model", &cur_model, "Cornell Box\0Stanford Bunny\0Stanford Dragon\0")) {
-                if (load_scene(models[cur_model], model, atlas, tol_frac)) {
+                if (load_scene(models[cur_model], model, atlas, tol_frac, density_arg)) {
                     refresh_camera();
                     do_voxelize();
                     upload_grid();

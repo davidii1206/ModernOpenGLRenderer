@@ -174,6 +174,7 @@ static const char* patch_fs = R"(
 #version 460 core
 in vec3 v_normal;
 flat in int v_patch_id;
+uniform int u_sel_patch;
 layout(std430, binding = 0) readonly buffer ColorBuf {
     vec4 patch_colors[];
 };
@@ -182,7 +183,10 @@ void main() {
     vec3 n = normalize(v_normal);
     vec3 light_dir = normalize(vec3(0.0, 1.0, 0.6));
     float light = 0.55 + 0.45 * abs(dot(n, light_dir));
-    frag_color = vec4(patch_colors[v_patch_id].rgb * light, 1.0);
+    vec3 col = patch_colors[v_patch_id].rgb * light;
+    if (v_patch_id == u_sel_patch)
+        col = mix(col, vec3(1.0, 1.0, 1.0), 0.7);
+    frag_color = vec4(col, 1.0);
 }
 )";
 
@@ -205,6 +209,8 @@ layout(location = 0) out vec4 frag_color;
 uniform int u_patch_count;
 uniform int u_chain;             // 0 = UV, 1 = thickness, 2 = depth, 3 = normal
 uniform int u_debug_meta;        // TEMP: 0=normal, 1=pid, 2=level, 3=idx
+uniform int u_sel_patch;         // patch picked in the 3D view (-1 = none)
+uniform int u_sel_on;            // 1 = highlight the picked patch's atlas rect
 uniform int u_level_off[32];     // meta SSBO offsets per level (shared topology)
 uniform int u_value_off[32];     // value texture offsets per level (selected chain)
 
@@ -229,6 +235,13 @@ vec3 octahedral_decode(vec2 f) {
         n.y = (1.0 - abs(f.x)) * (f.y >= 0.0 ? 1.0 : -1.0);
     }
     return normalize(n);
+}
+
+vec4 highlight_patch(vec4 col, int x, int y, int w, int h) {
+    if (u_sel_on == 0 || u_sel_patch < 0) return col;
+    bool border = (x < 3 || y < 3 || x >= w - 3 || y >= h - 3);
+    if (border) return vec4(mix(col.rgb, vec3(1.0, 0.15, 0.12), 0.95), 1.0);
+    return vec4(mix(col.rgb, vec3(1.0, 0.30, 0.25), 0.50), 1.0);
 }
 
 void main() {
@@ -264,7 +277,11 @@ void main() {
 
     // Normalized (0..1) value bytes; byte 0 = empty, covered nodes are 1..255.
     // Matches the reference renderer (tools/mip4_to_bmp.py shows the raw bytes).
-    if (u_debug_meta == 1) { frag_color = vec4(vec3(float(pid) / float(u_patch_count)), 1.0); return; }
+    if (u_debug_meta == 1) {
+        vec4 c = vec4(vec3(float(pid) / float(u_patch_count)), 1.0);
+        if (pid == u_sel_patch) c = highlight_patch(c, x, y, int(r.z), int(r.w));
+        frag_color = c; return;
+    }
     if (u_debug_meta == 2) { frag_color = vec4(vec3(float(L) / 8.0), 1.0); return; }
     if (u_debug_meta == 3) { frag_color = vec4(vec3(float(idx) / 9000.0), 1.0); return; }
     if (u_debug_meta == 4) { frag_color = vec4(vec3(float(u_level_off[1]) / 13.0), 1.0); return; }
@@ -279,15 +296,20 @@ void main() {
     int vo = u_value_off[L] + idx;
     vec2 q = texelFetch(u_values, ivec2(vo % TEX_W, vo / TEX_W), 0).rg;
 
+    vec4 col;
     if (u_chain == 0)
-        frag_color = vec4(q, 0.0, 1.0);         // UV: u,v
+        col = vec4(q, 0.0, 1.0);          // UV: u,v
     else if (u_chain == 3) {
         // Normal: decode the octahedral coords back to a viewable normal.
         vec2 oct = vec2(decode_value(q.x, -1.0, 1.0, 8),
                         decode_value(q.y, -1.0, 1.0, 8));
-        frag_color = vec4(octahedral_decode(oct) * 0.5 + 0.5, 1.0);
+        col = vec4(octahedral_decode(oct) * 0.5 + 0.5, 1.0);
     } else
-        frag_color = vec4(vec3(q.x), 1.0);      // thickness / depth: channel 0
+        col = vec4(vec3(q.x), 1.0);       // thickness / depth: channel 0
+
+    if (pid == u_sel_patch)
+        col = highlight_patch(col, x, y, int(r.z), int(r.w));
+    frag_color = col;
 }
 )";
 
@@ -623,6 +645,40 @@ bool query_hot(inout QCache qc, ivec2 txy, int pid,
     }
     return query_node(qc, txy, pid, L, idx, x0, y0, s, dmin, dmax, thick);
 }
+
+// Refine a bracketed march interval [ta, tb] (ta in front of the surface) to the
+// point where the ray reaches the RECONSTRUCTED surface. The conservative depth
+// band stored per texel is [dmin, dmax]: dmin is the footprint MINIMUM so the
+// band never lets a ray tunnel through the near half of a slanted texel, but
+// that front sits a full thickness in front of the true surface at the texel
+// centre. Resolving the band front would therefore reconstruct the footprint's
+// near edge instead of the surface, stepping out by up to a texel thickness —
+// and at patch seams, where the slant and texel size change between patches,
+// those steps pile up into a coherent ridge. The band MIDPOINT crosses the
+// surface through the texel centres, which stays continuous across patch
+// borders. This mirrors the voxelizer's --mid re-anchoring (example 33).
+float refine_band_mid(inout QCache qc, int pid, vec3 ro, vec3 rd, PatchInfo pi, uvec4 r,
+                      float ta, float tb) {
+    for (int it = 0; it < 8; ++it) {
+        float tm = (ta + tb) * 0.5;
+        vec3 Pm = ro + rd * tm;
+        vec2 proj_m = vec2(dot(Pm, pi.basis_v), dot(Pm, pi.basis_w));
+        vec2 nrm_m = (proj_m - pi.proj_min) / pi.proj_size;
+        if (nrm_m.x >= 0.0 && nrm_m.y >= 0.0 && nrm_m.x <= 1.0 && nrm_m.y <= 1.0) {
+            ivec2 txy_m = ivec2(int(r.x) + int(nrm_m.x * float(r.z)),
+                                int(r.y) + int(nrm_m.y * float(r.w)));
+            int Lm, idxm, x0m, y0m, sm;
+            float dm_m, dmax_m, thk_m;
+            if (query_node(qc, txy_m, pid, Lm, idxm, x0m, y0m, sm, dm_m, dmax_m, thk_m)) {
+                float Dm = dot(Pm - u_depth_origin, pi.basis_u);
+                if (Dm <= 0.5 * (dm_m + min(dmax_m, dm_m + thk_m))) tb = tm; else ta = tm;
+                continue;
+            }
+        }
+        ta = tm;   // fell off the patch or hit an uncovered node: keep the lower bound
+    }
+    return (ta + tb) * 0.5;
+}
 )";
 
 // Production kernel: no debug modes, no runtime perf uniform, far BVH children
@@ -758,7 +814,12 @@ void main() {
                 }
                 float band_hi = inside ? min(dmax, dm + thk) : 0.0;
                 if (inside && D >= dm - htol && D <= band_hi + htol) {
-                    best_t = t;
+                    // Snap the hit to the band midpoint (texel-centre surface)
+                    // instead of leaving it at the first sample inside the
+                    // conservative band; see refine_band_mid.
+                    float th = t;
+                    if (have_prev && t > t_prev) th = refine_band_mid(qc, pid, ro, rd, pi, r, t_prev, t);
+                    best_t = th;
                     best_pid = pid;
                     best_L = L; best_idx = idx;
                     best_x0 = x0; best_y0 = y0; best_s = s;
@@ -803,7 +864,10 @@ void main() {
                                           Lm, idxm, x0m, y0m, sm, dm_m, dmax_m, thk_m)) {
                                 rL = Lm; ridx = idxm; rx0 = x0m; ry0 = y0m; rs = sm; rvalid = true;
                                 float Dm = dot(Pm - u_depth_origin, pi.basis_u);
-                                if (Dm <= dm_m) tb = tm; else ta = tm;
+                                // Converge on the band midpoint (texel-centre
+                                // surface) rather than the band front (footprint
+                                // near edge); see refine_band_mid.
+                                if (Dm <= 0.5f * (dm_m + min(dmax_m, dm_m + thk_m))) tb = tm; else ta = tm;
                                 continue;
                             }
                         }
@@ -1166,7 +1230,12 @@ void main() {
                 }
                 float band_hi = inside ? min(dmax, dm + thk) : 0.0;
                 if (inside && D >= dm - htol && D <= band_hi + htol) {
-                    best_t = t;
+                    // Snap the hit to the band midpoint (texel-centre surface)
+                    // instead of leaving it at the first sample inside the
+                    // conservative band; see refine_band_mid.
+                    float th = t;
+                    if (have_prev && t > t_prev) th = refine_band_mid(qc, pid, ro, rd, pi, r, t_prev, t);
+                    best_t = th;
                     best_pid = pid;
                     best_L = L; best_idx = idx;
                     best_x0 = x0; best_y0 = y0; best_s = s;
@@ -1192,7 +1261,10 @@ void main() {
                             float dm_m, dmax_m, thk_m;
                             if (query_node(qc, txy_m, pid, Lm, idxm, x0m, y0m, sm, dm_m, dmax_m, thk_m)) {
                                 float Dm = dot(Pm - u_depth_origin, pi.basis_u);
-                                if (Dm <= dm_m) tb = tm; else ta = tm;
+                                // Converge on the band midpoint (texel-centre
+                                // surface) rather than the band front (footprint
+                                // near edge); see refine_band_mid.
+                                if (Dm <= 0.5f * (dm_m + min(dmax_m, dm_m + thk_m))) tb = tm; else ta = tm;
                                 continue;
                             }
                         }
@@ -2005,6 +2077,45 @@ static glm::vec3 screen_ray(const gfx::Camera& cam, double mx, double my,
     return glm::normalize(glm::vec3(world) - origin);
 }
 
+// Exact patch under the cursor: brute-force ray-triangle test over every
+// patch's own triangles (the scene is small, runs once per click). The BVH
+// pick above only finds the nearest *AABB* entry, which on a curved surface is
+// often a neighbour patch whose box is entered first but whose surface is
+// behind the clicked one. Returns the patch id of the nearest actual surface
+// hit, or -1.
+static int pick_patch_exact(const gfx::CoverageAtlas& atlas,
+                            const glm::vec3& ro, const glm::vec3& rd) {
+    const auto& patches = atlas.patches();
+    const auto& tris    = atlas.triangles();
+    const auto& pos     = atlas.positions();
+    int best_patch = -1;
+    float best_t = 1e30f;
+    for (size_t pi = 0; pi < patches.size(); ++pi) {
+        for (int ti : patches[pi].tris) {
+            const auto& tr = tris[size_t(ti)];
+            const glm::vec3& a = pos[tr.v[0]];
+            const glm::vec3& b = pos[tr.v[1]];
+            const glm::vec3& c = pos[tr.v[2]];
+            glm::vec3 e1 = b - a, e2 = c - a;
+            glm::vec3 h = glm::cross(rd, e2);
+            float det = glm::dot(e1, h);
+            if (std::fabs(det) < 1e-12f) continue;
+            float inv = 1.0f / det;
+            glm::vec3 s = ro - a;
+            float u = glm::dot(s, h) * inv;
+            if (u < 0.0f || u > 1.0f) continue;
+            glm::vec3 q = glm::cross(s, e1);
+            float v = glm::dot(rd, q) * inv;
+            if (v < 0.0f || u + v > 1.0f) continue;
+            float t = glm::dot(e2, q) * inv;
+            if (t < 0.0f || t >= best_t) continue;
+            best_t = t;
+            best_patch = int(pi);
+        }
+    }
+    return best_patch;
+}
+
 // ---------------------------------------------------------------------------
 // Model switching
 // ---------------------------------------------------------------------------
@@ -2301,6 +2412,8 @@ int main() {
     bool show_bvh = true;
     bool show_bvh_occ = true;     // occlude boxes by the scene depth
     RayHit pick;                  // last mouse pick result
+    int selected_patch = -1;      // leaf patch id picked in the 3D view (-1 = none)
+    bool highlight_atlas_patch = true;  // tint the picked patch in the atlas view
     bool left_prev = false;
     bool press_in_view = false;
     double press_x = 0.0, press_y = 0.0;
@@ -2459,11 +2572,11 @@ int main() {
             window.scroll_delta();
         }
 
-        // Left click in the 3D view: ray-cast against the BVH. Only active
-        // while the wireframe is shown. Clicks that press or release over an
-        // ImGui window never pick.
+        // Left click in the 3D view: ray-cast against the BVH to pick the
+        // patch under the cursor (highlighted in the atlas view). Clicks that
+        // press or release over an ImGui window never pick.
         bool left_now = window.mouse_down(gfx::MouseButton::left);
-        if (left_now && !left_prev && !gui.wants_mouse() && show_bvh) {
+        if (left_now && !left_prev && !gui.wants_mouse()) {
             press_in_view = true;
             window.cursor_position(press_x, press_y);
         } else if (!left_now && left_prev) {
@@ -2487,6 +2600,10 @@ int main() {
                     } else {
                         pick = RayHit{};
                     }
+                    // Atlas highlight follows the exact surface triangle hit
+                    // (the BVH pick above can grab a neighbouring patch whose
+                    // AABB is entered first).
+                    selected_patch = pick_patch_exact(atlas, ro, rd);
                 }
             }
             press_in_view = false;
@@ -2553,6 +2670,8 @@ int main() {
             patch_prog.use();
             loc = patch_prog.uniform_location("u_vp");
             if (loc >= 0) patch_prog.uniform_matrix4fv(loc, glm::value_ptr(vp));
+            loc = patch_prog.uniform_location("u_sel_patch");
+            if (loc >= 0) patch_prog.uniform1i(loc, selected_patch);
             glBindVertexArray(patch_gpu.vao);
             glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, patch_gpu.color_ssbo);
             glBindBuffer(GL_DRAW_INDIRECT_BUFFER, patch_gpu.indirect);
@@ -2784,6 +2903,8 @@ int main() {
             loc = a_loc("u_patch_count"); if (loc >= 0) atlas_prog.uniform1i(loc, int(patch_gpu.patch_count));
             loc = a_loc("u_chain");       if (loc >= 0) atlas_prog.uniform1i(loc, atlas_chain);
             loc = a_loc("u_debug_meta");  if (loc >= 0) atlas_prog.uniform1i(loc, getenv("DUMP") ? atoi(getenv("DUMPMETA") ? getenv("DUMPMETA") : "0") : 0);
+            loc = a_loc("u_sel_patch");   if (loc >= 0) atlas_prog.uniform1i(loc, selected_patch);
+            loc = a_loc("u_sel_on");      if (loc >= 0) atlas_prog.uniform1i(loc, highlight_atlas_patch ? 1 : 0);
             loc = a_loc("u_level_off");   if (loc >= 0) glUniform1iv(loc, 32, atlas_view.level_off);
             loc = a_loc("u_value_off");   if (loc >= 0) glUniform1iv(loc, 32, atlas_view.value_off[atlas_chain]);
             loc = a_loc("u_values");      if (loc >= 0) atlas_prog.uniform1i(loc, 0);
@@ -2996,6 +3117,20 @@ int main() {
             t_bvh.skip();
         }
 
+        // Selected-patch box in 3D: always drawn (independent of show_bvh) so
+        // the user sees exactly which region the atlas highlight corresponds to.
+        if (selected_patch >= 0 && size_t(selected_patch) < atlas.patches().size()) {
+            const auto& sp = atlas.patches()[size_t(selected_patch)];
+            t_bvh.begin();
+            bvh_draw.clear();
+            glm::vec3 c = (sp.aabb_min + sp.aabb_max) * 0.5f;
+            glm::vec3 half = (sp.aabb_max - sp.aabb_min) * 0.5f + glm::vec3(0.006f);
+            bvh_draw.draw_box(c - half, c + half, {1.0f, 0.08f, 0.15f, 1.0f});
+            gl::disable(GL_DEPTH_TEST);
+            bvh_draw.render(vp);
+            t_bvh.end();
+        }
+
         t_imgui.begin();
         // --- ImGui debug window ---
         {
@@ -3165,6 +3300,7 @@ int main() {
                     cam.look_at(st.cam_target + glm::vec3(0.0f, 0.0f, st.cam_dist), st.cam_target);
                     base_density = atlas.config().texel_density;
                     pick = RayHit{};
+                    selected_patch = -1;
                     std::printf("Switched to %s\n", kModels[cur_model].name);
                 } else {
                     std::fprintf(stderr, "Failed to switch to %s\n", kModels[cur_model].name);
@@ -3185,6 +3321,8 @@ int main() {
             ImGui::Separator();
 
             ImGui::Checkbox("Show atlas reconstruction", &show_atlas);
+            if (show_atlas)
+                ImGui::Checkbox("Highlight picked patch in atlas", &highlight_atlas_patch);
             ImGui::Checkbox("Show primary-ray normals", &show_ray_pass);
             if (show_ray_pass) {
                 ImGui::SliderFloat("Connectivity tol", &ray_connect_tol, 0.001f, 0.2f, "%.3f");
@@ -3226,6 +3364,15 @@ int main() {
             }
             ImGui::Separator();
 
+            if (selected_patch >= 0 && size_t(selected_patch) < atlas.patches().size()) {
+                const auto& sp = atlas.patches()[size_t(selected_patch)];
+                ImGui::Text("Selected patch %d: atlas (%d,%d) %dx%d  axis %d  proj (%.4f, %.4f)",
+                            selected_patch, sp.atlas_x, sp.atlas_y, sp.tex_w, sp.tex_h,
+                            sp.axis, sp.proj_min.x, sp.proj_min.y);
+                ImGui::Text("  aabb min (%.3f, %.3f, %.3f)  max (%.3f, %.3f, %.3f)",
+                            sp.aabb_min.x, sp.aabb_min.y, sp.aabb_min.z,
+                            sp.aabb_max.x, sp.aabb_max.y, sp.aabb_max.z);
+            }
             ImGui::Text("Coverage atlas: %dx%d @ %.0f texels/unit",
                         atlas.atlas_width(), atlas.atlas_height(), atlas.final_density());
             ImGui::Combo("Atlas texture", &atlas_chain, "UV\0Thickness\0Depth\0Normal\0");
@@ -3263,6 +3410,7 @@ int main() {
                     // resolution slider keeps scaling relative to it instead of
                     // compounding on every recompute.
                     pick = RayHit{};
+                    selected_patch = -1;
                     std::printf("Rebuilt atlas: %dx%d @ %.0f texels/unit, %zu patches\n",
                                 atlas.atlas_width(), atlas.atlas_height(),
                                 atlas.final_density(), atlas.patches().size());
@@ -3274,6 +3422,26 @@ int main() {
                 float ah = asz * float(atlas_view.view_h) / float(atlas_view.view_w);
                 ImGui::Image((ImTextureID)(intptr_t)atlas_view.view_tex,
                              ImVec2(asz, ah), ImVec2(0, 1), ImVec2(1, 0));
+                // Screen-space highlight of the picked patch: the shader tint is
+                // diluted when the atlas is downscaled, so draw a thick border on
+                // top of the image. The image is upright w.r.t. the atlas FBO:
+                // image top-left = texture (s=0, t=1) = atlas row (0, view_h-1).
+                if (highlight_atlas_patch && selected_patch >= 0 &&
+                    size_t(selected_patch) < atlas.patches().size()) {
+                    const auto& sp = atlas.patches()[size_t(selected_patch)];
+                    const float vw = float(atlas_view.view_w), vh = float(atlas_view.view_h);
+                    const ImVec2 mn = ImGui::GetItemRectMin();
+                    const float ix0 = mn.x + (float(sp.atlas_x) / vw) * asz;
+                    const float iy0 = mn.y + (1.0f - float(sp.atlas_y + sp.tex_h) / vh) * ah;
+                    const float ix1 = mn.x + (float(sp.atlas_x + sp.tex_w) / vw) * asz;
+                    const float iy1 = mn.y + (1.0f - float(sp.atlas_y) / vh) * ah;
+                    ImDrawList* dl = ImGui::GetWindowDrawList();
+                    dl->AddRect(ImVec2(ix0, iy0), ImVec2(ix1, iy1),
+                                IM_COL32(255, 70, 55, 255), 0.0f, 0, 3.0f);
+                    char lbl[64];
+                    std::snprintf(lbl, sizeof(lbl), "patch %d", selected_patch);
+                    dl->AddText(ImVec2(ix0 + 5, iy0 + 5), IM_COL32(255, 70, 55, 255), lbl);
+                }
             }
             ImGui::Separator();
 

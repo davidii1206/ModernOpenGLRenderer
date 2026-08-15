@@ -690,19 +690,29 @@ static void merge_pass(std::vector<Cluster>& clusters,
 
 // ================================================= patch finalisation ==
 
-static Vec3 orthonormal_tangent(int axis) {
+// World axes of the two *raw* projection components returned by project_along
+// (basis_v = first proj component, basis_w = second). The generic
+// cross(n, tangent) frame flips the second component on the negative axes and
+// on +Y, which breaks the texel <-> world mapping for any consumer that
+// rebuilds a world position or a texel coordinate from basis_v/basis_w. The
+// stored basis must round-trip exactly with project_along() so both the ray
+// shader and CPU analysis tools agree on (i, j) for every axis.
+static Vec3 raw_basis_v(int axis) {
     switch (axis) {
         case 0: case 1: return {0, 1, 0};
         case 2: case 3: return {1, 0, 0};
         case 4: case 5: return {1, 0, 0};
     }
-    return {1,0,0};
+    return {1, 0, 0};
 }
 
-static Vec3 orthonormal_bitangent(int axis) {
-    Vec3 n = axis_dirs[axis];
-    Vec3 t = orthonormal_tangent(axis);
-    return glm::cross(n, t);
+static Vec3 raw_basis_w(int axis) {
+    switch (axis) {
+        case 0: case 1: return {0, 0, 1};
+        case 2: case 3: return {0, 0, 1};
+        case 4: case 5: return {0, 1, 0};
+    }
+    return {0, 1, 0};
 }
 
 static std::vector<Patch> finalize_patches(
@@ -718,8 +728,8 @@ static std::vector<Patch> finalize_patches(
         fp.axis = p.axis;
         AABB bb;
         fp.basis_u = axis_dirs[p.axis];
-        fp.basis_v = orthonormal_tangent(p.axis);
-        fp.basis_w = orthonormal_bitangent(p.axis);
+        fp.basis_v = raw_basis_v(p.axis);
+        fp.basis_w = raw_basis_w(p.axis);
 
         Vec2 min_proj = {1e30f, 1e30f};
         Vec2 max_proj = {-1e30f, -1e30f};
@@ -1474,6 +1484,114 @@ static void rasterize_atlas_textures(
                          atlas_w, ax, ay, tw, th);
     }
 
+    // ---- Seam band blend ----
+    // A patch's band above rasterises only its own triangles, so at a shared
+    // border the two patches report footprint ranges centred on their own
+    // texel squares. Where the surface is oblique to the depth axis the band
+    // midpoint sits half a footprint-span off the true seam surface, and the
+    // two sides' differing texel sizes make those offsets disagree — the two
+    // border coordinates step against each other and a coherent ridge shows up
+    // in the voxel grid. Re-rasterise each neighbour's triangles into this
+    // patch's border texels (depth/thickness only, UV/normal stay patch-local)
+    // so the bands on both sides of a seam describe the same world region and
+    // meet continuously.
+    if (!getenv("MDC_NO_SEAM_BLEND")) {
+        long blend_texels = 0;
+        for (size_t a = 0; a < patches.size(); ++a) {
+            const Patch& P = patches[a];
+            if (P.tex_w <= 0 || P.tex_h <= 0 || P.tris.empty()) continue;
+            // World size of one P texel (used to soften the neighbour test).
+            Vec3 pa = P.aabb_min, pb = P.aabb_max;
+            float ptex = 0.0f;
+            for (int k = 0; k < 3; ++k)
+                ptex = std::max(ptex, std::abs(P.basis_v[k]) * P.proj_size.x / P.tex_w +
+                                      std::abs(P.basis_w[k]) * P.proj_size.y / P.tex_h);
+            pa -= Vec3(ptex, ptex, ptex);
+            pb += Vec3(ptex, ptex, ptex);
+
+            int ax = P.atlas_x, ay = P.atlas_y;
+            int tw = P.tex_w, th = P.tex_h;
+            Vec2 pmn = P.proj_min, pmx = P.proj_min + P.proj_size;
+            auto to_atlas = [&](Vec2 p) -> Vec2 {
+                float u = (pmx.x > pmn.x) ? (p.x - pmn.x) / (pmx.x - pmn.x) : 0.5f;
+                float v = (pmx.y > pmn.y) ? (p.y - pmn.y) / (pmx.y - pmn.y) : 0.5f;
+                return {float(ax) + u * tw, float(ay) + v * th};
+            };
+
+            for (size_t b = 0; b < patches.size(); ++b) {
+                if (b == a) continue;
+                const Patch& Q = patches[b];
+                if (Q.tris.empty()) continue;
+                const Vec3& qa = Q.aabb_min;
+                const Vec3& qb = Q.aabb_max;
+                if (qb.x < pa.x || qa.x > pb.x || qb.y < pa.y || qa.y > pb.y ||
+                    qb.z < pa.z || qa.z > pb.z) continue;
+
+                for (int ti : Q.tris) {
+                    Vec2 gv[3]; float gd[3];
+                    for (int e = 0; e < 3; ++e) {
+                        Vec3 pos = positions[tris[ti].v[e]];
+                        gv[e] = project_along(P.axis, pos);
+                        gd[e] = depth_along(P.axis, pos);
+                    }
+                    Vec2 av[3] = {to_atlas(gv[0]), to_atlas(gv[1]), to_atlas(gv[2])};
+                    int x0 = std::max(ax, (int)std::floor(std::min({av[0].x,av[1].x,av[2].x})) - 1);
+                    int x1 = std::min(ax+tw-1, (int)std::ceil(std::max({av[0].x,av[1].x,av[2].x})) + 1);
+                    int y0 = std::max(ay, (int)std::floor(std::min({av[0].y,av[1].y,av[2].y})) - 1);
+                    int y1 = std::min(ay+th-1, (int)std::ceil(std::max({av[0].y,av[1].y,av[2].y})) + 1);
+                    float area2 = (av[1].x-av[0].x)*(av[2].y-av[0].y) -
+                                  (av[2].x-av[0].x)*(av[1].y-av[0].y);
+                    if (std::abs(area2) < 1e-10f) continue;
+                    float inv = 1.0f/area2;
+                    bool cw = area2 < 0.0f;
+                    float b0 = 0.5f*(std::abs(av[1].x-av[0].x)+std::abs(av[1].y-av[0].y));
+                    float b1 = 0.5f*(std::abs(av[2].x-av[1].x)+std::abs(av[2].y-av[1].y));
+                    float b2 = 0.5f*(std::abs(av[0].x-av[2].x)+std::abs(av[0].y-av[2].y));
+                    for (int py=y0; py<=y1; ++py) {
+                        for (int px=x0; px<=x1; ++px) {
+                            size_t idx = size_t(py)*atlas_w+px;
+                            if (atlas_depth[idx] <= -1e20f) continue;
+                            float ppx=float(px)+0.5f, ppy=float(py)+0.5f;
+                            float e0=(av[1].x-av[0].x)*(ppy-av[0].y)-(ppx-av[0].x)*(av[1].y-av[0].y);
+                            float e1=(av[2].x-av[1].x)*(ppy-av[1].y)-(ppx-av[1].x)*(av[2].y-av[1].y);
+                            float e2=(av[0].x-av[2].x)*(ppy-av[2].y)-(ppx-av[2].x)*(av[0].y-av[2].y);
+                            bool covered = cw ? (e0<=b0+1e-6f&&e1<=b1+1e-6f&&e2<=b2+1e-6f)
+                                              : (e0>=-b0-1e-6f&&e1>=-b1-1e-6f&&e2>=-b2-1e-6f);
+                            if (!covered) continue;
+                            // Union band over this texel square from the
+                            // neighbour's surface (5-sample footprint min/max).
+                            float ldmin=1e30f, ldmax=-1e30f;
+                            const float sxp[5]={ppx,float(px),float(px+1),float(px+1),float(px)};
+                            const float syp[5]={ppy,float(py),float(py),float(py+1),float(py+1)};
+                            bool any = false;
+                            for (int c=0;c<5;++c){
+                                float ce0=(av[1].x-av[0].x)*(syp[c]-av[0].y)-(sxp[c]-av[0].x)*(av[1].y-av[0].y);
+                                float ce1=(av[2].x-av[1].x)*(syp[c]-av[1].y)-(sxp[c]-av[1].x)*(av[2].y-av[1].y);
+                                float ce2=(av[0].x-av[2].x)*(syp[c]-av[2].y)-(sxp[c]-av[2].x)*(av[0].y-av[2].y);
+                                bool cin = cw ? (ce0<=1e-6f&&ce1<=1e-6f&&ce2<=1e-6f)
+                                              : (ce0>=-1e-6f&&ce1>=-1e-6f&&ce2>=-1e-6f);
+                                if (!cin) continue;
+                                any = true;
+                                float cw2=ce0*inv, cw0=ce1*inv, cw1=1.0f-cw0-cw2;
+                                float d=cw0*gd[0]+cw1*gd[1]+cw2*gd[2];
+                                ldmin=std::min(ldmin,d); ldmax=std::max(ldmax,d);
+                            }
+                            if (!any) continue;
+                            float lo = std::min(atlas_depth[idx], ldmin);
+                            float hi = std::max(atlas_depth[idx] + atlas_thickness[idx], ldmax);
+                            if (lo != atlas_depth[idx] || hi-lo != atlas_thickness[idx]) {
+                                ++blend_texels;
+                                atlas_depth[idx] = lo;
+                                atlas_thickness[idx] = hi - lo;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        fprintf(stderr, "[RASTER] seam blend extended %ld texel bands\n", blend_texels);
+    }
+
     if (getenv("MDC_RASTER_DBG")) {
         fprintf(stderr, "[RASTER] g_depth_origin = (%.4f %.4f %.4f)\n",
                 g_depth_origin.x, g_depth_origin.y, g_depth_origin.z);
@@ -1999,7 +2117,7 @@ static bool write_atlas_state(const char* path,
     FILE* f = fopen(path, "wb");
     if (!f) { fprintf(stderr, "Cannot write %s\n", path); return false; }
     write_u32(f, 0x41544C53u);       // "ATLS"
-    write_u32(f, 4u);                // version (4 adds the per-texel coverage mask)
+    write_u32(f, 5u);                // version (5 fixes basis_v/basis_w to match project_along)
     write_f32(f, cfg.texel_density); write_i32(f, cfg.auto_target);
     write_f32(f, cfg.budget_texels); write_i32(f, cfg.min_tex); write_i32(f, cfg.max_tex);
     write_f32(f, cfg.mip_tol_frac);  write_i32(f, cfg.mip_leaf_tile);
@@ -2084,7 +2202,7 @@ static bool read_atlas_state(const char* path,
     if (!f) return false;
     uint32_t magic = 0, version = 0;
     if (!read_u32(f, magic) || magic != 0x41544C53u) { fclose(f); return false; }
-    if (!read_u32(f, version) || version != 4u) { fclose(f); return false; }
+    if (!read_u32(f, version) || version != 5u) { fclose(f); return false; }
 
     auto read_cfg = [&]() -> bool {
         return read_f32(f, cfg.texel_density) && read_i32(f, cfg.auto_target) &&
