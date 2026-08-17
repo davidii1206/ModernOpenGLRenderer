@@ -139,10 +139,11 @@ layout(std430, binding = 0) readonly buffer PGeom { vec4 pgeom[]; };
 layout(std430, binding = 1) readonly buffer PNrm  { vec4 pnrm[];  };
 layout(std430, binding = 2) readonly buffer PAlb  { vec4 palb[];  };
 layout(std430, binding = 3) readonly buffer PEmit { vec4 pemit[]; };
+layout(std430, binding = 8) readonly buffer Rad   { vec4 rad[];   };
 
 uniform mat4 u_view_proj;
 uniform float u_point_size;
-uniform int u_color_mode;  // 0=albedo 1=emissive 2=normal 3=position
+uniform int u_color_mode;  // 0=albedo 1=emissive 2=normal 3=position 4=radiance
 
 out vec3 v_color;
 
@@ -153,7 +154,8 @@ void main() {
     if (u_color_mode == 0)      v_color = palb[gl_VertexID].rgb;
     else if (u_color_mode == 1) v_color = pemit[gl_VertexID].rgb;
     else if (u_color_mode == 2) v_color = pnrm[gl_VertexID].rgb * 0.5 + 0.5;
-    else                        v_color = pgeom[gl_VertexID].xyz;
+    else if (u_color_mode == 3) v_color = pgeom[gl_VertexID].xyz;
+    else                        v_color = rad[gl_VertexID].rgb;
 }
 )";
 
@@ -269,6 +271,81 @@ void main() {
         cw = cos((ang + b1 + b2) * 0.5);
     }
     cone[node] = vec4(axis, cw);
+}
+)";
+
+// ===========================================================================
+// Stage D — Direct lighting (emissive point sources) + radiance pull-up
+// ===========================================================================
+
+const char* direct_lighting_cs = R"(
+#version 460 core
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer PGeom     { vec4 pgeom[];    };
+layout(std430, binding = 1) readonly buffer PNrm      { vec4 pnrm[];     };
+layout(std430, binding = 3) readonly buffer PEmit      { vec4 pemit[];    };
+layout(std430, binding = 8) writeonly buffer Radiance  { vec4 radiance[]; };
+layout(std430, binding = 9) readonly buffer Emitters   { uint emitters[]; };
+
+uniform uint u_num_leaves;
+uniform uint u_num_emitters;
+uniform float u_leaf_area;
+
+void main() {
+    uint recv = gl_GlobalInvocationID.x;
+    if (recv >= u_num_leaves) return;
+
+    vec3 pos = pgeom[recv].xyz;
+    vec3 nrm = normalize(pnrm[recv].xyz);
+    vec3 emissive = pemit[recv].rgb;
+
+    vec3 incoming = vec3(0.0);
+    for (uint i = 0; i < u_num_emitters; i++) {
+        uint e = emitters[i];
+
+        vec3 e_pos = pgeom[e].xyz;
+        vec3 e_nrm = normalize(pnrm[e].xyz);
+        vec3 e_emit = pemit[e].rgb;
+
+        vec3 dir = e_pos - pos;
+        float dist2 = max(dot(dir, dir), 1e-4);
+        float dist = sqrt(dist2);
+        vec3 wi = dir / dist;
+
+        float cos_recv = max(dot(nrm, wi), 0.0);
+        float cos_emit = max(dot(e_nrm, -wi), 0.0);
+
+        incoming += e_emit * cos_emit * cos_recv / dist2 * u_leaf_area;
+    }
+
+    radiance[recv] = vec4(emissive + incoming, u_leaf_area);
+}
+)";
+
+const char* radiance_pullup_cs = R"(
+#version 460 core
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 8) buffer Radiance { vec4 radiance[]; };
+
+uniform uint u_count;
+uniform uint u_level_start;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= u_count) return;
+
+    uint node = u_level_start + idx;
+    uint left  = 2 * node + 1;
+    uint right = 2 * node + 2;
+
+    float aL = radiance[left].w;
+    float aR = radiance[right].w;
+    float aTotal = aL + aR;
+
+    vec3 avg = (radiance[left].rgb * aL + radiance[right].rgb * aR) / max(aTotal, 1e-10);
+    radiance[node] = vec4(avg, aTotal);
 }
 )";
 
@@ -879,7 +956,7 @@ void create_gbuffer(GBuffer& g, int w, int h) {
 // ===========================================================================
 int main() {
     gllib::log_to_stderr(gllib::LogLevel::info);
-    gfx::Window window({"36 Micro Rendering — Stage A+B+C", 1600, 900});
+    gfx::Window window({"36 Micro Rendering — Stage A+B+C+D", 1600, 900});
     window.vsync(false);
 
     gfx::ImGuiOverlay gui;
@@ -915,10 +992,14 @@ int main() {
     };
     gl::Program leaf_update_prog = make_compute(leaf_update_cs);
     gl::Program tree_refit_prog  = make_compute(tree_refit_cs);
+    gl::Program direct_light_prog = make_compute(direct_lighting_cs);
+    gl::Program radiance_pull_prog = make_compute(radiance_pullup_cs);
     gl::Program sphere_prog      = make_program(sphere_vs, sphere_fs);
 
     if (!gbuf_prog.linked() || !display_prog.linked() || !pc_prog.linked() ||
-        !leaf_update_prog.linked() || !tree_refit_prog.linked() || !sphere_prog.linked()) {
+        !leaf_update_prog.linked() || !tree_refit_prog.linked() ||
+        !direct_light_prog.linked() || !radiance_pull_prog.linked() ||
+        !sphere_prog.linked()) {
         gllib::log(gllib::LogLevel::error, "Shader compilation failed");
         return EXIT_FAILURE;
     }
@@ -1032,6 +1113,25 @@ int main() {
     // Bind sphere_buf and cone_buf to fixed binding points for compute + wireframe
     sphere_buf.bind_base(6);
     cone_buf.bind_base(7);
+
+    // --- Stage D: Extract emitter leaf indices + create radiance buffer ---
+    std::vector<uint32_t> emitter_indices;
+    for (int i = 0; i < N; ++i) {
+        if (glm::dot(ph.pts[i].emi, ph.pts[i].emi) > 1e-6f)
+            emitter_indices.push_back(uint32_t(i));
+    }
+    gllib::logf(gllib::LogLevel::info, "Stage D: %zu emitter leaves out of %d",
+                emitter_indices.size(), N);
+
+    gl::Buffer emitters_buf(gl::BufferType::shader, gl::BufferUsage::static_draw);
+    emitters_buf.data(emitter_indices.data(), emitter_indices.size() * sizeof(uint32_t));
+    emitters_buf.bind_base(9);
+
+    gl::Buffer radiance_buf(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);
+    radiance_buf.data(nullptr, size_t(N) * sizeof(glm::vec4));  // filled by compute
+    radiance_buf.bind_base(8);
+
+    float leaf_area = (emitter_indices.empty() || N == 0) ? 0.0f : ph.total_area / float(N);
 
     // --- Empty VAO for point cloud (shader reads from SSBO via gl_VertexID) ---
     gl::VertexArray pc_vao;
@@ -1156,6 +1256,34 @@ int main() {
 
             auto t1 = std::chrono::steady_clock::now();
             refit_ms = float(std::chrono::duration<double, std::milli>(t1 - t0).count());
+
+            // --- Stage D: Direct lighting from emissive leaves ---
+            radiance_buf.bind_base(8);
+            emitters_buf.bind_base(9);
+
+            direct_light_prog.use();
+            loc_c = direct_light_prog.uniform_location("u_num_leaves");
+            if (loc_c >= 0) glProgramUniform1ui(direct_light_prog.handle(), loc_c, GLuint(N));
+            loc_c = direct_light_prog.uniform_location("u_num_emitters");
+            if (loc_c >= 0) glProgramUniform1ui(direct_light_prog.handle(), loc_c, GLuint(emitter_indices.size()));
+            loc_c = direct_light_prog.uniform_location("u_leaf_area");
+            if (loc_c >= 0) glProgramUniform1f(direct_light_prog.handle(), loc_c, leaf_area);
+            gl::dispatch_compute((N + 255) / 256, 1, 1);
+            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+            // --- Stage D: Radiance pull-up (bottom-up, log2(N) levels) ---
+            radiance_pull_prog.use();
+            for (int level = 0; level < LOG2N; ++level) {
+                uint32_t count = uint32_t(N) >> (level + 1);
+                if (count == 0) break;
+                uint32_t level_start = count - 1;
+                loc_c = radiance_pull_prog.uniform_location("u_count");
+                if (loc_c >= 0) glProgramUniform1ui(radiance_pull_prog.handle(), loc_c, count);
+                loc_c = radiance_pull_prog.uniform_location("u_level_start");
+                if (loc_c >= 0) glProgramUniform1ui(radiance_pull_prog.handle(), loc_c, level_start);
+                gl::dispatch_compute((count + 255) / 256, 1, 1);
+                glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+            }
         }
 
     // ===================================================================
@@ -1194,6 +1322,7 @@ int main() {
             pnrm_buf.bind_base(1);
             palb_buf.bind_base(2);
             pemit_buf.bind_base(3);
+            radiance_buf.bind_base(8);
 
             gl::enable(GL_PROGRAM_POINT_SIZE);
             gl::clear(GL_DEPTH_BUFFER_BIT);
@@ -1242,7 +1371,7 @@ int main() {
         // ===================================================================
         gui.begin_frame();
         {
-            ImGui::Begin("Stage A+B+C — Micro Rendering");
+            ImGui::Begin("Stage A+B+C+D — Micro Rendering");
             ImGui::Text("FPS: %.1f  Frame: %.2f ms", 1.0f / std::max(dt, 1e-6f), dt * 1000.0f);
             ImGui::Text("Resolution: %d x %d", gbuf.w, gbuf.h);
             ImGui::Separator();
@@ -1280,7 +1409,7 @@ int main() {
             ImGui::Separator();
             ImGui::Checkbox("Show point cloud", &show_points);
             ImGui::SliderFloat("Point size", &point_size, 1.0f, 20.0f);
-            ImGui::Combo("Point color", &pc_color_mode, "Albedo\0Emissive\0Normal\0Position\0");
+            ImGui::Combo("Point color", &pc_color_mode, "Albedo\0Emissive\0Normal\0Position\0Radiance\0");
 
             // Stage C — GPU refit
             ImGui::Separator();
@@ -1326,6 +1455,13 @@ int main() {
                 ImGui::Text("Max pos err: %.8f", max_pos_err);
                 ImGui::Text("Max cone err: %.8f rad", max_cone_err);
             }
+
+            // Stage D — Direct lighting
+            ImGui::Separator();
+            ImGui::Text("Stage D — Direct Lighting");
+            ImGui::Text("  Emitters: %zu / %d", emitter_indices.size(), N);
+            ImGui::Text("  Leaf area: %.6f", leaf_area);
+            ImGui::Text("  Switch to 'Radiance' color mode to visualize");
 
             ImGui::End();
         }
