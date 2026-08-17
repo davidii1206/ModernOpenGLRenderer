@@ -376,6 +376,7 @@ uniform ivec2 u_screen_size;
 uniform uint u_micro_size;
 uniform uint u_m_valid;
 uniform uint u_scale;
+uniform float u_gain;
 uniform ivec2 u_debug_pixel;
 
 #define STACK_SIZE 32
@@ -474,7 +475,7 @@ void main() {
         for (uint i = 0u; i < 64u; i++) {
             sum += s_contribs[i];
         }
-        vec3 indirect = u_m_valid > 0u ? alb * sum / float(u_m_valid) : vec3(0.0);
+        vec3 indirect = u_m_valid > 0u ? u_gain * alb * sum / float(u_m_valid) : vec3(0.0);
         imageStore(u_output, pixel_lr, vec4(indirect, 1.0));
     }
 }
@@ -1326,6 +1327,7 @@ int main() {
     bool run_micro_render = true;
     float micro_ms = 0.0f;
     int micro_size = 8;
+    float micro_gain = 4.0f;
     bool show_micro_debug = false;
     int debug_pixel_x = -1, debug_pixel_y = -1;
 
@@ -1483,6 +1485,8 @@ int main() {
             if (loc >= 0) glProgramUniform1ui(micro_render_prog.handle(), loc, GLuint(micro_size));
             loc = micro_render_prog.uniform_location("u_scale");
             if (loc >= 0) glProgramUniform1ui(micro_render_prog.handle(), loc, GLuint(micro_res_scale));
+            loc = micro_render_prog.uniform_location("u_gain");
+            if (loc >= 0) glProgramUniform1f(micro_render_prog.handle(), loc, micro_gain);
 
             int m_valid = 0;
             for (int ly = 0; ly < micro_size; ly++) {
@@ -1712,6 +1716,7 @@ int main() {
             }
             ImGui::Text("  Micro-res: %dx%d (%d valid disk px)", micro_size, micro_size, micro_size * micro_size);
             ImGui::SliderInt("Render scale", &micro_res_scale, 1, 8);
+            ImGui::SliderFloat("Gain", &micro_gain, 0.1f, 20.0f, "%.1f");
             ImGui::Text("  Internal: %dx%d", std::max(1, fw / micro_res_scale), std::max(1, fh / micro_res_scale));
             ImGui::Text("  Select 'Indirect' in G-Buffer View to visualize");
             ImGui::Checkbox("Debug micro-buffer", &show_micro_debug);
