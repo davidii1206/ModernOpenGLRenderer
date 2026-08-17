@@ -144,6 +144,7 @@ layout(std430, binding = 8) readonly buffer Rad   { vec4 rad[];   };
 uniform mat4 u_view_proj;
 uniform float u_point_size;
 uniform int u_color_mode;  // 0=albedo 1=emissive 2=normal 3=position 4=radiance
+uniform uint u_num_leaves;
 
 out vec3 v_color;
 
@@ -155,7 +156,7 @@ void main() {
     else if (u_color_mode == 1) v_color = pemit[gl_VertexID].rgb;
     else if (u_color_mode == 2) v_color = pnrm[gl_VertexID].rgb * 0.5 + 0.5;
     else if (u_color_mode == 3) v_color = pgeom[gl_VertexID].xyz;
-    else                        v_color = rad[gl_VertexID].rgb;
+    else                        v_color = rad[u_num_leaves - 1u + gl_VertexID].rgb;
 }
 )";
 
@@ -319,7 +320,7 @@ void main() {
         incoming += e_emit * cos_emit * cos_recv / dist2 * u_leaf_area;
     }
 
-    radiance[recv] = vec4(emissive + incoming, u_leaf_area);
+    radiance[u_num_leaves - 1u + recv] = vec4(emissive + incoming, u_leaf_area);
 }
 )";
 
@@ -1128,7 +1129,7 @@ int main() {
     emitters_buf.bind_base(9);
 
     gl::Buffer radiance_buf(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);
-    radiance_buf.data(nullptr, size_t(N) * sizeof(glm::vec4));  // filled by compute
+    radiance_buf.data(nullptr, size_t(2 * N - 1) * sizeof(glm::vec4));
     radiance_buf.bind_base(8);
 
     float leaf_area = (emitter_indices.empty() || N == 0) ? 0.0f : ph.total_area / float(N);
@@ -1319,6 +1320,8 @@ int main() {
             if (loc >= 0) pc_prog.uniform1f(loc, point_size);
             loc = pc_prog.uniform_location("u_color_mode");
             if (loc >= 0) pc_prog.uniform1i(loc, pc_color_mode);
+            loc = pc_prog.uniform_location("u_num_leaves");
+            if (loc >= 0) glProgramUniform1ui(pc_prog.handle(), loc, GLuint(N));
 
             pgeom_buf.bind_base(0);
             pnrm_buf.bind_base(1);
