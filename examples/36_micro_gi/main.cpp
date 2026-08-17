@@ -123,6 +123,8 @@ void main() {
         // emissive — pass through
     } else if (u_mode == 5) {
         c = vec4(vec3(c.r / u_far), 1.0);
+    } else if (u_mode == 6) {
+        // indirect — pass through
     }
 
     vec3 col = c.rgb * u_exposure;
@@ -347,6 +349,120 @@ void main() {
 
     vec3 avg = (radiance[left].rgb * aL + radiance[right].rgb * aR) / max(aTotal, 1e-10);
     radiance[node] = vec4(avg, aTotal);
+}
+)";
+
+// ===========================================================================
+// Stage E — Micro-rendering compute shader
+// ===========================================================================
+
+const char* micro_render_cs = R"(
+#version 460 core
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D gbuf_pos;
+layout(binding = 1) uniform sampler2D gbuf_nrm;
+layout(binding = 2) uniform sampler2D gbuf_alb;
+
+layout(std430, binding = 6) readonly buffer Spheres { vec4 sphere_buf[]; };
+layout(std430, binding = 8) readonly buffer Rad     { vec4 rad_buf[];    };
+
+layout(binding = 0, rgba16f) writeonly uniform image2D u_output;
+
+uniform uint u_num_leaves;
+uniform ivec2 u_screen_size;
+uniform uint u_micro_size;
+uniform uint u_m_valid;
+
+#define STACK_SIZE 32
+
+shared vec3 s_contribs[64];
+
+void main() {
+    ivec2 pixel = ivec2(gl_WorkGroupID.xy);
+    if (pixel.x >= u_screen_size.x || pixel.y >= u_screen_size.y) return;
+
+    ivec2 local = ivec2(gl_LocalInvocationID.xy);
+    uint lid = uint(local.x) + uint(local.y) * 8u;
+
+    vec3 pos = texelFetch(gbuf_pos, pixel, 0).xyz;
+    vec3 nrm = normalize(texelFetch(gbuf_nrm, pixel, 0).xyz);
+    vec3 alb = texelFetch(gbuf_alb, pixel, 0).rgb;
+
+    s_contribs[lid] = vec3(0.0);
+    barrier();
+
+    if (dot(pos, pos) < 1e-6) {
+        if (lid == 0u) imageStore(u_output, pixel, vec4(0.0));
+        return;
+    }
+
+    vec3 up = abs(nrm.y) < 0.999 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    vec3 T = normalize(cross(up, nrm));
+    vec3 B = cross(nrm, T);
+
+    float u = (2.0 * float(local.x) + 1.0) / float(u_micro_size) - 1.0;
+    float v = (2.0 * float(local.y) + 1.0) / float(u_micro_size) - 1.0;
+    float r2 = u * u + v * v;
+    bool valid = r2 <= 1.0;
+
+    vec3 local_dir = vec3(u, v, sqrt(max(1.0 - r2, 0.0)));
+    vec3 world_dir = normalize(T * local_dir.x + B * local_dir.y + nrm * local_dir.z);
+
+    float closest_t = 1e30;
+    uint closest_node = 0u;
+
+    if (valid) {
+        uint stack[STACK_SIZE];
+        int sp = 0;
+        stack[sp++] = 0u;
+
+        while (sp > 0) {
+            uint node = stack[--sp];
+            vec3 center = sphere_buf[node].xyz;
+            float radius = sphere_buf[node].w;
+
+            vec3 oc = center - pos;
+            float b = dot(oc, world_dir);
+            float c = dot(oc, oc) - radius * radius;
+            float disc = b * b - c;
+            if (disc < 0.0) continue;
+
+            float t = b - sqrt(disc);
+            if (t < 0.0) t = max(b + sqrt(disc), 0.0);
+            if (t < 0.0 || t >= closest_t) continue;
+
+            float dist = length(oc);
+            bool is_leaf = node >= (u_num_leaves - 1u);
+
+            if (is_leaf || radius * float(u_micro_size) < dist) {
+                closest_t = t;
+                closest_node = node;
+            } else {
+                uint left = 2u * node + 1u;
+                uint right = 2u * node + 2u;
+                if (sp + 2 <= STACK_SIZE) {
+                    stack[sp++] = right;
+                    stack[sp++] = left;
+                }
+            }
+        }
+    }
+
+    if (valid && closest_node > 0u) {
+        s_contribs[lid] = rad_buf[closest_node].rgb;
+    }
+
+    barrier();
+
+    if (lid == 0u) {
+        vec3 sum = vec3(0.0);
+        for (uint i = 0u; i < 64u; i++) {
+            sum += s_contribs[i];
+        }
+        vec3 indirect = u_m_valid > 0u ? alb * sum / float(u_m_valid) : vec3(0.0);
+        imageStore(u_output, pixel, vec4(indirect, 1.0));
+    }
 }
 )";
 
@@ -957,7 +1073,7 @@ void create_gbuffer(GBuffer& g, int w, int h) {
 // ===========================================================================
 int main() {
     gllib::log_to_stderr(gllib::LogLevel::info);
-    gfx::Window window({"36 Micro Rendering — Stage A+B+C+D", 1600, 900});
+    gfx::Window window({"36 Micro Rendering — Stage A+B+C+D+E", 1600, 900});
     window.vsync(false);
 
     gfx::ImGuiOverlay gui;
@@ -995,12 +1111,13 @@ int main() {
     gl::Program tree_refit_prog  = make_compute(tree_refit_cs);
     gl::Program direct_light_prog = make_compute(direct_lighting_cs);
     gl::Program radiance_pull_prog = make_compute(radiance_pullup_cs);
+    gl::Program micro_render_prog  = make_compute(micro_render_cs);
     gl::Program sphere_prog      = make_program(sphere_vs, sphere_fs);
 
     if (!gbuf_prog.linked() || !display_prog.linked() || !pc_prog.linked() ||
         !leaf_update_prog.linked() || !tree_refit_prog.linked() ||
         !direct_light_prog.linked() || !radiance_pull_prog.linked() ||
-        !sphere_prog.linked()) {
+        !micro_render_prog.linked() || !sphere_prog.linked()) {
         gllib::log(gllib::LogLevel::error, "Shader compilation failed");
         return EXIT_FAILURE;
     }
@@ -1145,6 +1262,17 @@ int main() {
     GBuffer gbuf;
     create_gbuffer(gbuf, window.framebuffer_width(), window.framebuffer_height());
 
+    // --- Indirect illumination texture (Stage E) ---
+    gl::Texture indirect_tex{gl::TextureType::tex_2d};
+    auto create_indirect_tex = [&](int w, int h) {
+        indirect_tex.image_2d(0, GL_RGBA16F, w, h, GL_RGBA, GL_FLOAT, nullptr, 1);
+        indirect_tex.parameter(GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        indirect_tex.parameter(GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        indirect_tex.parameter(GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        indirect_tex.parameter(GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    };
+    create_indirect_tex(window.framebuffer_width(), window.framebuffer_height());
+
     // --- Fullscreen triangle VAO ---
     gl::VertexArray fsq_vao;
 
@@ -1169,6 +1297,11 @@ int main() {
     glm::vec4 sphere_color(0.0f, 1.0f, 0.0f, 0.3f);
     int sphere_lod = 0;  // 0=all, 1=leaves only, 2=interior only
 
+    // Stage E state
+    bool run_micro_render = true;
+    float micro_ms = 0.0f;
+    int micro_size = 8;
+
     double last = window.time();
 
     while (!window.should_close()) {
@@ -1181,8 +1314,10 @@ int main() {
         cam.set_aspect(float(window.framebuffer_width()) / float(window.framebuffer_height()));
 
         int fw = window.framebuffer_width(), fh = window.framebuffer_height();
-        if (fw != gbuf.w || fh != gbuf.h)
+        if (fw != gbuf.w || fh != gbuf.h) {
             create_gbuffer(gbuf, fw, fh);
+            create_indirect_tex(fw, fh);
+        }
 
         glm::mat4 vp = cam.view_projection();
 
@@ -1289,6 +1424,47 @@ int main() {
             }
         }
 
+        // ===================================================================
+        // 1e. Micro-rendering (Stage E)
+        // ===================================================================
+        if (run_micro_render) {
+            auto t0m = std::chrono::steady_clock::now();
+
+            indirect_tex.bind_image(0, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
+
+            gbuf.position.bind(0);
+            gbuf.normal.bind(1);
+            gbuf.albedo.bind(2);
+
+            sphere_buf.bind_base(6);
+            radiance_buf.bind_base(8);
+
+            micro_render_prog.use();
+            loc = micro_render_prog.uniform_location("u_num_leaves");
+            if (loc >= 0) glProgramUniform1ui(micro_render_prog.handle(), loc, GLuint(N));
+            loc = micro_render_prog.uniform_location("u_screen_size");
+            if (loc >= 0) glProgramUniform2i(micro_render_prog.handle(), loc, fw, fh);
+            loc = micro_render_prog.uniform_location("u_micro_size");
+            if (loc >= 0) glProgramUniform1ui(micro_render_prog.handle(), loc, GLuint(micro_size));
+
+            int m_valid = 0;
+            for (int ly = 0; ly < micro_size; ly++) {
+                for (int lx = 0; lx < micro_size; lx++) {
+                    float mu = (2.0f * lx + 1.0f) / micro_size - 1.0f;
+                    float mv = (2.0f * ly + 1.0f) / micro_size - 1.0f;
+                    if (mu * mu + mv * mv <= 1.0f) m_valid++;
+                }
+            }
+            loc = micro_render_prog.uniform_location("u_m_valid");
+            if (loc >= 0) glProgramUniform1ui(micro_render_prog.handle(), loc, GLuint(m_valid));
+
+            gl::dispatch_compute((fw + 7) / 8, (fh + 7) / 8, 1);
+            glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+
+            auto t1m = std::chrono::steady_clock::now();
+            micro_ms = float(std::chrono::duration<double, std::milli>(t1m - t0m).count());
+        }
+
     // ===================================================================
         // 2. Display pass — fullscreen triangle showing selected G-buffer target
         // ===================================================================
@@ -1301,7 +1477,11 @@ int main() {
         fsq_vao.bind();
         gl::Texture* targets[] = { &gbuf.albedo, &gbuf.normal, &gbuf.position,
                                     &gbuf.emissive, &gbuf.depth };
-        targets[view_mode]->bind(0);
+        if (view_mode == 5) {
+            indirect_tex.bind(0);
+        } else {
+            targets[view_mode]->bind(0);
+        }
         loc = display_prog.uniform_location("u_tex");      if (loc >= 0) display_prog.uniform1i(loc, 0);
         loc = display_prog.uniform_location("u_mode");     if (loc >= 0) display_prog.uniform1i(loc, view_mode + 1);
         loc = display_prog.uniform_location("u_far");      if (loc >= 0) display_prog.uniform1f(loc, far_plane);
@@ -1376,14 +1556,14 @@ int main() {
         // ===================================================================
         gui.begin_frame();
         {
-            ImGui::Begin("Stage A+B+C+D — Micro Rendering");
+            ImGui::Begin("Stage A+B+C+D+E — Micro Rendering");
             ImGui::Text("FPS: %.1f  Frame: %.2f ms", 1.0f / std::max(dt, 1e-6f), dt * 1000.0f);
             ImGui::Text("Resolution: %d x %d", gbuf.w, gbuf.h);
             ImGui::Separator();
 
             // G-buffer view
             ImGui::Combo("G-Buffer View", &view_mode,
-                         "Albedo\0Normal\0Position\0Emissive\0Depth\0");
+                         "Albedo\0Normal\0Position\0Emissive\0Depth\0Indirect\0");
             ImGui::SliderFloat("Exposure", &exposure, 0.05f, 5.0f);
             ImGui::SliderFloat("Gamma", &gamma, 1.0f, 3.0f);
 
@@ -1467,6 +1647,17 @@ int main() {
             ImGui::Text("  Emitters: %zu / %d", emitter_indices.size(), N);
             ImGui::Text("  Leaf area: %.6f", leaf_area);
             ImGui::Text("  Switch to 'Radiance' color mode to visualize");
+
+            // Stage E — Micro-rendering
+            ImGui::Separator();
+            ImGui::Text("Stage E — Micro-Rendering");
+            ImGui::Checkbox("Run micro-render", &run_micro_render);
+            if (run_micro_render) {
+                ImGui::SameLine();
+                ImGui::Text("  %.2f ms", micro_ms);
+            }
+            ImGui::Text("  Micro-res: %dx%d (%d valid disk px)", micro_size, micro_size, micro_size * micro_size);
+            ImGui::Text("  Select 'Indirect' in G-Buffer View to visualize");
 
             ImGui::End();
         }
