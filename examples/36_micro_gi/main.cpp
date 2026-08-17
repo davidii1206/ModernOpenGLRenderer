@@ -294,6 +294,7 @@ layout(std430, binding = 9) readonly buffer Emitters   { uint emitters[]; };
 uniform uint u_num_leaves;
 uniform uint u_num_emitters;
 uniform float u_leaf_area;
+uniform float u_emissive_gain;
 
 void main() {
     uint recv = gl_GlobalInvocationID.x;
@@ -301,7 +302,7 @@ void main() {
 
     vec3 pos = pgeom[recv].xyz;
     vec3 nrm = normalize(pnrm[recv].xyz);
-    vec3 emissive = pemit[recv].rgb;
+    vec3 emissive = pemit[recv].rgb * u_emissive_gain;
 
     vec3 incoming = vec3(0.0);
     for (uint i = 0; i < u_num_emitters; i++) {
@@ -367,6 +368,9 @@ layout(binding = 2) uniform sampler2D gbuf_alb;
 layout(std430, binding = 2) readonly buffer Alb     { vec4 palb[];     };
 layout(std430, binding = 6) readonly buffer Spheres { vec4 sphere_buf[]; };
 layout(std430, binding = 8) readonly buffer Rad     { vec4 rad_buf[];    };
+
+layout(std430, binding = 10) writeonly buffer DebugPos { vec4 debug_pos[]; };
+layout(std430, binding = 11) writeonly buffer DebugCol { vec4 debug_col[]; };
 
 layout(binding = 0, rgba16f) writeonly uniform image2D u_output;
 layout(binding = 1, rgba16f) writeonly uniform image2D u_debug_img;
@@ -465,6 +469,8 @@ void main() {
 
     if (u_debug_pixel.x >= 0 && pixel_lr == u_debug_pixel) {
         imageStore(u_debug_img, local, vec4(contrib, 1.0));
+        debug_pos[lid] = closest_t < 1e29 ? vec4(sphere_buf[closest_node].xyz, 1.0) : vec4(0.0);
+        debug_col[lid] = closest_t < 1e29 ? vec4(contrib, 1.0) : vec4(0.3, 0.0, 0.0, 1.0);
     }
 
     s_contribs[lid] = contrib;
@@ -505,6 +511,34 @@ uniform vec4 u_color;
 out vec4 frag_color;
 void main() {
     frag_color = u_color;
+}
+)";
+
+// ===========================================================================
+// Stage E — Debug surfel overlay (64 colored dots for micro-buffer samples)
+// ===========================================================================
+
+const char* debug_surfel_vs = R"(
+#version 460 core
+layout(std430, binding = 10) readonly buffer DebugPos { vec4 d_pos[]; };
+layout(std430, binding = 11) readonly buffer DebugCol { vec4 d_col[]; };
+uniform mat4 u_view_proj;
+out vec4 v_color;
+void main() {
+    v_color = d_col[gl_VertexID];
+    gl_Position = u_view_proj * vec4(d_pos[gl_VertexID].xyz, 1.0);
+    gl_PointSize = 10.0;
+}
+)";
+
+const char* debug_surfel_fs = R"(
+#version 460 core
+in vec4 v_color;
+out vec4 frag_color;
+void main() {
+    vec2 pc = gl_PointCoord * 2.0 - 1.0;
+    if (dot(pc, pc) > 1.0) discard;
+    frag_color = v_color;
 }
 )";
 
@@ -1128,11 +1162,13 @@ int main() {
     gl::Program radiance_pull_prog = make_compute(radiance_pullup_cs);
     gl::Program micro_render_prog  = make_compute(micro_render_cs);
     gl::Program sphere_prog      = make_program(sphere_vs, sphere_fs);
+    gl::Program debug_surfel_prog = make_program(debug_surfel_vs, debug_surfel_fs);
 
     if (!gbuf_prog.linked() || !display_prog.linked() || !pc_prog.linked() ||
         !leaf_update_prog.linked() || !tree_refit_prog.linked() ||
         !direct_light_prog.linked() || !radiance_pull_prog.linked() ||
-        !micro_render_prog.linked() || !sphere_prog.linked()) {
+        !micro_render_prog.linked() || !sphere_prog.linked() ||
+        !debug_surfel_prog.linked()) {
         gllib::log(gllib::LogLevel::error, "Shader compilation failed");
         return EXIT_FAILURE;
     }
@@ -1278,7 +1314,7 @@ int main() {
     create_gbuffer(gbuf, window.framebuffer_width(), window.framebuffer_height());
 
     // --- Indirect illumination texture (Stage E) ---
-    int micro_res_scale = 4;
+    int micro_res_scale = 1;
     gl::Texture indirect_tex{gl::TextureType::tex_2d};
     auto create_indirect_tex = [&](int w, int h) {
         int rw = std::max(1, w / micro_res_scale);
@@ -1298,6 +1334,12 @@ int main() {
     debug_tex.parameter(GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     debug_tex.parameter(GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     debug_tex.parameter(GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    // --- Debug surfel SSBOs (64 samples for micro-buffer overlay) ---
+    gl::Buffer debug_pos_buf(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);
+    debug_pos_buf.data(nullptr, 64 * sizeof(glm::vec4));
+    gl::Buffer debug_col_buf(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);
+    debug_col_buf.data(nullptr, 64 * sizeof(glm::vec4));
 
     // --- Fullscreen triangle VAO ---
     gl::VertexArray fsq_vao;
@@ -1323,11 +1365,14 @@ int main() {
     glm::vec4 sphere_color(0.0f, 1.0f, 0.0f, 0.3f);
     int sphere_lod = 0;  // 0=all, 1=leaves only, 2=interior only
 
+    // Stage D state
+    float emissive_gain = 8.0f;
+
     // Stage E state
     bool run_micro_render = true;
     float micro_ms = 0.0f;
     int micro_size = 8;
-    float micro_gain = 4.0f;
+    float micro_gain = 1.0f;
     bool show_micro_debug = false;
     int debug_pixel_x = -1, debug_pixel_y = -1;
 
@@ -1437,6 +1482,8 @@ int main() {
             if (loc_c >= 0) glProgramUniform1ui(direct_light_prog.handle(), loc_c, GLuint(emitter_indices.size()));
             loc_c = direct_light_prog.uniform_location("u_leaf_area");
             if (loc_c >= 0) glProgramUniform1f(direct_light_prog.handle(), loc_c, leaf_area);
+            loc_c = direct_light_prog.uniform_location("u_emissive_gain");
+            if (loc_c >= 0) glProgramUniform1f(direct_light_prog.handle(), loc_c, emissive_gain);
             gl::dispatch_compute((N + 255) / 256, 1, 1);
             glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
@@ -1473,6 +1520,9 @@ int main() {
             palb_buf.bind_base(2);
             sphere_buf.bind_base(6);
             radiance_buf.bind_base(8);
+
+            debug_pos_buf.bind_base(10);
+            debug_col_buf.bind_base(11);
 
             debug_tex.bind_image(1, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
 
@@ -1610,6 +1660,23 @@ int main() {
         }
 
         // ===================================================================
+        // 2d. Debug surfel overlay (micro-buffer sample points)
+        // ===================================================================
+        if (show_micro_debug && run_micro_render) {
+            debug_surfel_prog.use();
+            loc = debug_surfel_prog.uniform_location("u_view_proj");
+            if (loc >= 0) debug_surfel_prog.uniform_matrix4fv(loc, glm::value_ptr(vp));
+
+            debug_pos_buf.bind_base(10);
+            debug_col_buf.bind_base(11);
+
+            gl::enable(GL_PROGRAM_POINT_SIZE);
+            pc_vao.bind();
+            glDrawArrays(GL_POINTS, 0, 64);
+            gl::disable(GL_PROGRAM_POINT_SIZE);
+        }
+
+        // ===================================================================
         // 3. ImGui
         // ===================================================================
         gui.begin_frame();
@@ -1704,6 +1771,7 @@ int main() {
             ImGui::Text("Stage D — Direct Lighting");
             ImGui::Text("  Emitters: %zu / %d", emitter_indices.size(), N);
             ImGui::Text("  Leaf area: %.6f", leaf_area);
+            ImGui::SliderFloat("Emissive gain", &emissive_gain, 0.1f, 50.0f, "%.1f");
             ImGui::Text("  Switch to 'Radiance' color mode to visualize");
 
             // Stage E — Micro-rendering
