@@ -1223,6 +1223,8 @@ int main() {
             // Bind compute-writeable buffers
             pgeom_buf.bind_base(0);
             pnrm_buf.bind_base(1);
+            palb_buf.bind_base(2);
+            pemit_buf.bind_base(3);
             tri_buf.bind_base(4);
             leaf_src_buf.bind_base(5);
             sphere_buf.bind_base(6);
