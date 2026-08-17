@@ -377,6 +377,10 @@ layout(std430, binding = 8) readonly buffer Rad     { vec4 rad_buf[];    };
 layout(std430, binding = 10) writeonly buffer DebugPos { vec4 debug_pos[]; };
 layout(std430, binding = 11) writeonly buffer DebugCol { vec4 debug_col[]; };
 layout(std430, binding = 12) writeonly buffer ProfBuf { uint prof_data[]; };
+layout(std430, binding = 15) writeonly buffer VisitStats { uvec4 visit_stats[]; };
+// visit_stats: x = total nodes visited (DFS pops), y = max stack depth reached
+//   (== STACK_DEPTH means the stack overflowed and children were dropped),
+//   z = unused, w = unused.
 
 layout(binding = 0, rgba16f) writeonly uniform image2D u_output;
 layout(binding = 1, rgba16f) writeonly uniform image2D u_debug_img;
@@ -388,52 +392,38 @@ uniform uint u_m_valid;
 uniform uint u_scale;
 uniform float u_gain;
 uniform ivec2 u_debug_pixel;
+uniform float u_self_eps2;
+uniform int u_low_res_w;
+uniform int u_low_res_h;
 
 #define NPHASES 4
-#define Q_CAP 1024
-#define MAX_BFS_ITERS 32
-
-shared uint s_bufA[Q_CAP];
-shared uint s_bufB[Q_CAP];
-shared uint s_nA;
-shared uint s_nB;
-shared uint s_widx;
-
-shared float s_depth[64];
-shared uint  s_node[64];
-shared vec3  s_radiance[64];
+#define STACK_DEPTH 32
 
 void main() {
-    ivec2 pixel_lr = ivec2(gl_WorkGroupID.xy);
-    ivec2 pixel = pixel_lr * int(u_scale);
-
-    if (pixel.x >= u_screen_size.x || pixel.y >= u_screen_size.y) return;
-
     ivec2 local = ivec2(gl_LocalInvocationID.xy);
     uint lid = uint(local.x) + uint(local.y) * 8u;
-    uint micro_total = u_micro_size * u_micro_size;
 
-    uint g_idx = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    ivec2 pixel_lr = ivec2(gl_WorkGroupID.xy) * 8 + local;
+
+    if (pixel_lr.x >= u_low_res_w || pixel_lr.y >= u_low_res_h) return;
+
+    ivec2 pixel = pixel_lr * int(u_scale);
+    if (pixel.x >= u_screen_size.x || pixel.y >= u_screen_size.y) return;
+
+    uint g_idx = uint(pixel_lr.x) + uint(pixel_lr.y) * uint(u_low_res_w);
     uint base = g_idx * NPHASES;
-
-    for (uint i = lid; i < 64u; i += 64u) {
-        s_depth[i] = 1e30;
-        s_node[i] = 0u;
-        s_radiance[i] = vec3(0.0);
-    }
 
     vec3 pos = texelFetch(gbuf_pos, pixel, 0).xyz;
     vec3 nrm = normalize(texelFetch(gbuf_nrm, pixel, 0).xyz);
     vec3 alb = texelFetch(gbuf_alb, pixel, 0).rgb;
 
     if (dot(pos, pos) < 1e-6) {
-        if (lid == 0u) {
-            imageStore(u_output, pixel_lr, vec4(0.0));
-            prof_data[base + 0] = uint(clockARB());
-            prof_data[base + 1] = uint(clockARB());
-            prof_data[base + 2] = uint(clockARB());
-            prof_data[base + 3] = uint(clockARB());
-        }
+        imageStore(u_output, pixel_lr, vec4(0.0));
+        visit_stats[g_idx] = uvec4(0u);
+        prof_data[base + 0] = uint(clockARB());
+        prof_data[base + 1] = uint(clockARB());
+        prof_data[base + 2] = uint(clockARB());
+        prof_data[base + 3] = uint(clockARB());
         return;
     }
 
@@ -441,138 +431,137 @@ void main() {
     vec3 T = normalize(cross(up, nrm));
     vec3 B = cross(nrm, T);
 
-    barrier();
-
-    if (lid == 0u) prof_data[base + 0] = uint(clockARB());
-
     float half_ms = float(u_micro_size) * 0.5;
     float ms_f = float(u_micro_size);
+    uint micro_total = u_micro_size * u_micro_size;
 
-    if (lid == 0u) {
-        s_bufA[0] = 0u;
-        s_nA = 1u;
-        s_nB = 0u;
+    prof_data[base + 0] = uint(clockARB());
+
+    // ---- Per-thread micro-buffer (private arrays → local memory) ----
+    // Each thread tracks the closest surfel for each micro-pixel independently.
+    float my_depth[64];
+    uint  my_node[64];
+    for (uint i = 0u; i < 64u; i++) {
+        my_depth[i] = 1e30;
+        my_node[i] = 0u;
     }
-    barrier();
 
-    for (uint iter = 0u; iter < MAX_BFS_ITERS; iter++) {
-        uint cn = (iter & 1u) == 0u ? s_nA : s_nB;
-        if (cn == 0u) break;
+    // ---- Per-thread iterative DFS (no shared state, no barriers) ----
+    uint my_stack[STACK_DEPTH];
+    int  my_sp = 0;
+    my_stack[my_sp++] = 0u;
 
-        if (lid == 0u) s_widx = 0u;
-        barrier();
+    uint visited = 0u;
+    uint max_sp = 0u;
 
-        for (uint i = lid; i < cn; i += 64u) {
-            uint node = (iter & 1u) == 0u ? s_bufA[i] : s_bufB[i];
+    while (my_sp > 0) {
+        max_sp = max(max_sp, uint(my_sp));
+        uint node = my_stack[--my_sp];
+        visited++;
 
-            vec4 sph = sphere_buf[node];
-            vec3 center = sph.xyz;
-            float radius = sph.w;
+        vec4 sph = sphere_buf[node];
+        vec3 center = sph.xyz;
+        float radius = sph.w;
 
-            vec3 to_center = center - pos;
-            float dist2 = dot(to_center, to_center);
+        vec3 to_center = center - pos;
+        float dist2 = dot(to_center, to_center);
 
-            if (dot(to_center, nrm) < 0.0) continue;
+        if (dot(to_center, nrm) < 0.0) continue;
 
-            vec4 cn2 = cone_buf[node];
-            float dot_oc_axis = dot(to_center, cn2.xyz);
-            if (dot_oc_axis > 0.0 && cn2.w > 0.0 &&
-                dot_oc_axis * dot_oc_axis > dist2 * (1.0 - cn2.w * cn2.w))
-                continue;
+        vec4 cn = cone_buf[node];
+        float dot_oc_axis = dot(to_center, cn.xyz);
+        if (dot_oc_axis > 0.0 && cn.w > 0.0 &&
+            dot_oc_axis * dot_oc_axis > dist2 * (1.0 - cn.w * cn.w))
+            continue;
 
-            float cz = dot(to_center, nrm);
-            if (cz <= 0.0) continue;
+        float cz = dot(to_center, nrm);
+        if (cz <= 0.0) continue;
 
-            float inv_cz = 1.0 / cz;
-            float u_proj = dot(to_center, T) * inv_cz;
-            float v_proj = dot(to_center, B) * inv_cz;
-            float px = (u_proj + 1.0) * half_ms;
-            float py = (v_proj + 1.0) * half_ms;
-            float r_proj = radius * inv_cz * half_ms;
+        float distSafe2 = max(dist2, 1e-10);
+        float invDist = inversesqrt(distSafe2);
 
-            if (px + r_proj < 0.0 || px - r_proj >= ms_f ||
-                py + r_proj < 0.0 || py - r_proj >= ms_f)
-                continue;
+        if (distSafe2 < u_self_eps2) continue;
 
-            bool is_leaf = node >= (u_num_leaves - 1u);
-            if (is_leaf || r_proj <= 0.5) {
-                float dist = sqrt(dist2);
-                int ms = int(u_micro_size);
-                int ir = max(1, int(ceil(r_proj)));
-                int px_i = int(px);
-                int py_i = int(py);
-                int xmin = max(0, px_i - ir);
-                int xmax = min(ms - 1, px_i + ir);
-                int ymin = max(0, py_i - ir);
-                int ymax = min(ms - 1, py_i + ir);
-                float r2 = r_proj * r_proj;
+        float dx = dot(to_center, T) * invDist;
+        float dy = dot(to_center, B) * invDist;
+        float cosTheta = cz * invDist;
 
-                for (int my = ymin; my <= ymax; my++) {
-                    for (int mx = xmin; mx <= xmax; mx++) {
-                        float dx = float(mx) + 0.5 - px;
-                        float dy = float(my) + 0.5 - py;
-                        if (dx * dx + dy * dy <= r2) {
-                            uint mid = uint(mx) + uint(my) * u_micro_size;
-                            if (dist < s_depth[mid]) {
-                                s_depth[mid] = dist;
-                                s_node[mid] = node;
-                            }
+        float px_f = (dx + 1.0) * half_ms;
+        float py_f = (dy + 1.0) * half_ms;
+
+        float angularRadius = radius * invDist;
+        float r_proj = angularRadius * cosTheta * half_ms;
+
+        if (px_f + r_proj < 0.0 || px_f - r_proj >= ms_f ||
+            py_f + r_proj < 0.0 || py_f - r_proj >= ms_f)
+            continue;
+
+        bool is_leaf = node >= (u_num_leaves - 1u);
+        if (is_leaf || r_proj <= 0.5) {
+            float dist = sqrt(dist2);
+            int ms = int(u_micro_size);
+            int ir = max(1, int(ceil(r_proj)));
+            int px_i = int(px_f);
+            int py_i = int(py_f);
+            int xmin = max(0, px_i - ir);
+            int xmax = min(ms - 1, px_i + ir);
+            int ymin = max(0, py_i - ir);
+            int ymax = min(ms - 1, py_i + ir);
+            float r2 = r_proj * r_proj;
+
+            for (int my = ymin; my <= ymax; my++) {
+                for (int mx = xmin; mx <= xmax; mx++) {
+                    float ddx = float(mx) + 0.5 - px_f;
+                    float ddy = float(my) + 0.5 - py_f;
+                    if (ddx * ddx + ddy * ddy <= r2) {
+                        uint mid = uint(mx) + uint(my) * u_micro_size;
+                        if (dist < my_depth[mid]) {
+                            my_depth[mid] = dist;
+                            my_node[mid] = node;
                         }
                     }
                 }
-            } else {
-                uint left = 2u * node + 1u;
-                uint right = 2u * node + 2u;
-                uint w = atomicAdd(s_widx, 2u);
-                if (w + 1u < Q_CAP) {
-                    if ((iter & 1u) == 0u) {
-                        s_bufB[w] = left;
-                        s_bufB[w + 1u] = right;
-                    } else {
-                        s_bufA[w] = left;
-                        s_bufA[w + 1u] = right;
-                    }
-                }
+            }
+        } else {
+            uint left  = 2u * node + 1u;
+            uint right = 2u * node + 2u;
+            if (my_sp + 2 <= STACK_DEPTH) {
+                my_stack[my_sp++] = left;
+                my_stack[my_sp++] = right;
             }
         }
-        barrier();
-
-        if (lid == 0u) {
-            if ((iter & 1u) == 0u)
-                s_nB = s_widx;
-            else
-                s_nA = s_widx;
-        }
-        barrier();
     }
 
-    if (lid == 0u) prof_data[base + 1] = uint(clockARB());
+    prof_data[base + 1] = uint(clockARB());
 
-    for (uint i = lid; i < micro_total; i += 64u) {
-        if (s_node[i] > 0u) {
-            s_radiance[i] = rad_buf[s_node[i]].rgb;
-        }
+    // ---- Read radiance for each micro-pixel's closest surfel ----
+    vec3 sum = vec3(0.0);
+    for (uint i = 0u; i < micro_total; i++) {
+        if (my_node[i] > 0u)
+            sum += rad_buf[my_node[i]].rgb;
     }
-    barrier();
 
-    if (lid == 0u) prof_data[base + 2] = uint(clockARB());
+    prof_data[base + 2] = uint(clockARB());
 
+    // ---- Debug pixel overlay ----
     if (u_debug_pixel.x >= 0 && pixel_lr == u_debug_pixel) {
-        imageStore(u_debug_img, local, vec4(s_radiance[lid], 1.0));
-        debug_pos[lid] = s_node[lid] > 0u ? vec4(sphere_buf[s_node[lid]].xyz, 1.0) : vec4(0.0);
-        debug_col[lid] = s_node[lid] > 0u ? vec4(s_radiance[lid], 1.0) : vec4(0.3, 0.0, 0.0, 1.0);
-    }
-
-    if (lid == 0u) {
-        vec3 sum = vec3(0.0);
         for (uint i = 0u; i < micro_total; i++) {
-            sum += s_radiance[i];
+            vec3 r = my_node[i] > 0u ? rad_buf[my_node[i]].rgb : vec3(0.3, 0.0, 0.0);
+            debug_col[i] = vec4(r, 1.0);
+            debug_pos[i] = my_node[i] > 0u ? vec4(sphere_buf[my_node[i]].xyz, 1.0) : vec4(0.0);
         }
-        vec3 indirect = u_m_valid > 0u ? u_gain * alb * sum / float(u_m_valid) : vec3(0.0);
-        imageStore(u_output, pixel_lr, vec4(indirect, 1.0));
+        imageStore(u_debug_img, local, vec4(sum / max(1.0, float(micro_total)), 1.0));
     }
 
-    if (lid == 0u) prof_data[base + 3] = uint(clockARB());
+    // ---- Write output ----
+    vec3 indirect = u_m_valid > 0u
+        ? u_gain * alb * sum / float(u_m_valid)
+        : vec3(0.0);
+    imageStore(u_output, pixel_lr, vec4(indirect, 1.0));
+
+    prof_data[base + 3] = uint(clockARB());
+
+    visit_stats[g_idx] = uvec4(visited, max_sp, 0u, 0u);
 }
 )";
 
@@ -968,6 +957,61 @@ PointHierarchy build_hierarchy(
     }
 
     return ph;
+}
+
+// ===========================================================================
+// Stage B — DFS-reorder BVH for cache-friendly traversal
+//   Reorders nodes so that DFS traversal visits them in sequential memory
+//   order.  Also produces explicit child-pointer arrays (heap layout uses
+//   2*i+1/2*i+2 addressing which is cache-hostile for DFS).
+//   Leaves are identified by left_child == 0xFFFFFFFF.
+// ===========================================================================
+struct DfsBvh {
+    std::vector<glm::vec4> sphere;       // DFS-reordered (tree_size)
+    std::vector<glm::vec4> cone;         // DFS-reordered (tree_size)
+    std::vector<uint32_t>  left_child;   // new-index of left child  (0xFFFFFFFF = leaf)
+    std::vector<uint32_t>  right_child;  // new-index of right child
+    int tree_size = 0;
+};
+
+DfsBvh dfs_reorder_bvh(const PointHierarchy& ph) {
+    int N = ph.N;
+    int tree_size = 2 * N - 1;
+    DfsBvh r;
+    r.tree_size = tree_size;
+    r.sphere.resize(tree_size);
+    r.cone.resize(tree_size);
+    r.left_child.resize(tree_size, 0xFFFFFFFFu);
+    r.right_child.resize(tree_size, 0xFFFFFFFFu);
+
+    std::vector<int> old_to_new(tree_size);
+    int next = 0;
+
+    // Pass 1: DFS to assign new sequential indices
+    std::function<void(int)> dfs = [&](int old_node) {
+        old_to_new[old_node] = next++;
+        if (old_node < N - 1) {
+            dfs(2 * old_node + 1);
+            dfs(2 * old_node + 2);
+        }
+    };
+    dfs(0);
+
+    // Pass 2: copy data into new order, build child pointers
+    for (int old_node = 0; old_node < tree_size; old_node++) {
+        int new_node = old_to_new[old_node];
+        r.sphere[new_node] = ph.sphere[old_node];
+        r.cone[new_node]   = ph.cone[old_node];
+        if (old_node < N - 1) {
+            r.left_child[new_node]  = uint32_t(old_to_new[2 * old_node + 1]);
+            r.right_child[new_node] = uint32_t(old_to_new[2 * old_node + 2]);
+        }
+    }
+
+    gllib::logf(gllib::LogLevel::info,
+        "DFS reorder: %d nodes, tree depth = %d",
+        tree_size, int(std::ceil(std::log2(double(N)))));
+    return r;
 }
 
 // ===========================================================================
@@ -1503,6 +1547,24 @@ int main() {
     sphere_buf.bind_base(6);
     cone_buf.bind_base(7);
 
+    // --- DFS-reorder BVH for cache-friendly traversal ---
+    DfsBvh dfs_bvh = dfs_reorder_bvh(ph);
+
+    gl::Buffer dfs_sphere_buf(gl::BufferType::shader, gl::BufferUsage::static_draw);
+    gl::Buffer dfs_cone_buf(gl::BufferType::shader, gl::BufferUsage::static_draw);
+    gl::Buffer dfs_left_buf(gl::BufferType::shader, gl::BufferUsage::static_draw);
+    gl::Buffer dfs_right_buf(gl::BufferType::shader, gl::BufferUsage::static_draw);
+
+    dfs_sphere_buf.data(dfs_bvh.sphere.data(), dfs_bvh.sphere.size() * sizeof(glm::vec4));
+    dfs_cone_buf.data(dfs_bvh.cone.data(), dfs_bvh.cone.size() * sizeof(glm::vec4));
+    dfs_left_buf.data(dfs_bvh.left_child.data(), dfs_bvh.left_child.size() * sizeof(uint32_t));
+    dfs_right_buf.data(dfs_bvh.right_child.data(), dfs_bvh.right_child.size() * sizeof(uint32_t));
+
+    dfs_sphere_buf.bind_base(16);
+    dfs_cone_buf.bind_base(17);
+    dfs_left_buf.bind_base(18);
+    dfs_right_buf.bind_base(19);
+
     // --- Stage D: Extract emitter leaf indices + create radiance buffer ---
     std::vector<uint32_t> emitter_indices;
     for (int i = 0; i < N; ++i) {
@@ -1565,6 +1627,12 @@ int main() {
     gl::Buffer prof_buf(gl::BufferType::shader, gl::BufferUsage::stream_read);
     std::vector<uint32_t> prof_readback;
 
+    gl::Buffer visit_stats_buf(gl::BufferType::shader, gl::BufferUsage::stream_read);
+    std::vector<uint32_t> visit_stats_readback; // uvec4 per workgroup, flattened
+    double visit_avg = 0.0, visit_max = 0.0;
+    double iters_avg = 0.0, iters_maxed_pct = 0.0; // % of pixels that hit MAX_BFS_ITERS
+    double frontier_avg = 0.0, frontier_saturated_pct = 0.0; // % that hit Q_CAP
+
     // --- Fullscreen triangle VAO ---
     gl::VertexArray fsq_vao;
 
@@ -1595,7 +1663,13 @@ int main() {
     bool run_micro_render = true;
     int micro_size = 8;
     float micro_gain = 1.0f;
+    int tile_size = 2;
     bool show_micro_debug = false;
+    uint64_t frame_counter = 0;
+    // Even with the debug panel open, only pay for the profiling stall
+    // periodically -- readback data doesn't need to be per-frame to be useful,
+    // and this keeps the debug view from itself becoming the bottleneck.
+    constexpr uint64_t kProfileEveryNFrames = 30;
     int debug_pixel_x = -1, debug_pixel_y = -1;
 
     // Intra-shader micro profiling results (ticks, displayed as %)
@@ -1618,6 +1692,8 @@ int main() {
     double last = window.time();
 
     while (!window.should_close()) {
+        ++frame_counter;
+        const bool profile_this_frame = (frame_counter % kProfileEveryNFrames) == 0;
         double now = window.time();
         float dt = float(now - last);
         last = now;
@@ -1775,6 +1851,11 @@ int main() {
             prof_buf.data(nullptr, prof_count * sizeof(uint32_t));
             prof_buf.bind_base(12);
 
+            // Node-visit instrumentation buffer (uvec4 per workgroup)
+            size_t visit_count = size_t(rw) * size_t(rh) * 4;
+            visit_stats_buf.data(nullptr, visit_count * sizeof(uint32_t));
+            visit_stats_buf.bind_base(15);
+
             debug_tex.bind_image(1, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
 
             micro_render_prog.use();
@@ -1788,6 +1869,19 @@ int main() {
             if (loc >= 0) glProgramUniform1ui(micro_render_prog.handle(), loc, GLuint(micro_res_scale));
             loc = micro_render_prog.uniform_location("u_gain");
             if (loc >= 0) glProgramUniform1f(micro_render_prog.handle(), loc, micro_gain);
+
+            loc = micro_render_prog.uniform_location("u_low_res_w");
+            if (loc >= 0) glProgramUniform1i(micro_render_prog.handle(), loc, rw);
+            loc = micro_render_prog.uniform_location("u_low_res_h");
+            if (loc >= 0) glProgramUniform1i(micro_render_prog.handle(), loc, rh);
+
+            // Squared threshold below which a node is treated as coincident with
+            // the receiver and skipped (see orthographic-mapping fix above).
+            // Derived from average per-leaf area rather than a fixed world-space
+            // constant, so it scales with scene/point density automatically.
+            float self_eps = 0.5f * std::sqrt(leaf_area / 3.14159265f);
+            loc = micro_render_prog.uniform_location("u_self_eps2");
+            if (loc >= 0) glProgramUniform1f(micro_render_prog.handle(), loc, self_eps * self_eps);
 
             int m_valid = 0;
             for (int ly = 0; ly < micro_size; ly++) {
@@ -1816,19 +1910,22 @@ int main() {
                 if (loc >= 0) glProgramUniform2i(micro_render_prog.handle(), loc, -1, -1);
             }
 
-            gl::dispatch_compute(rw, rh, 1);
-            glMemoryBarrier(GL_ALL_BARRIER_BITS);
-            glFinish();
+            int dispatch_w = (rw + 7) / 8;
+            int dispatch_h = (rh + 7) / 8;
+            gl::dispatch_compute(dispatch_w, dispatch_h, 1);
 
-            // Read back intra-shader profiling data
-            {
+            // Profiling readback: always run for console logging, but
+            // only do the expensive glFinish+map when profiling or logging.
+            if (profile_this_frame) {
+                glMemoryBarrier(GL_ALL_BARRIER_BITS);
+                glFinish();
+
                 prof_readback.resize(prof_count);
                 void* ptr = prof_buf.map_range(0, prof_count * sizeof(uint32_t), GL_MAP_READ_BIT);
                 if (ptr) {
                     memcpy(prof_readback.data(), ptr, prof_count * sizeof(uint32_t));
                     prof_buf.unmap();
                 }
-                // Accumulate per-phase deltas across all workgroups
                 double sums[3] = {};
                 uint64_t total = 0;
                 for (size_t wg = 0; wg < size_t(rw) * size_t(rh); ++wg) {
@@ -1846,6 +1943,30 @@ int main() {
                     phase_avg[i] = sums[i] / double(nwg);
                     phase_pct[i] = total > 0 ? sums[i] * 100.0 / double(total) : 0.0;
                 }
+
+                // --- Node-visit instrumentation summary (DFS) ---
+                visit_stats_readback.resize(visit_count);
+                void* vptr = visit_stats_buf.map_range(0, visit_count * sizeof(uint32_t), GL_MAP_READ_BIT);
+                if (vptr) {
+                    memcpy(visit_stats_readback.data(), vptr, visit_count * sizeof(uint32_t));
+                    visit_stats_buf.unmap();
+                }
+                uint64_t visitedSum = 0, visitedMax = 0;
+                uint64_t stackSum = 0, stackOverflowCount = 0;
+                for (size_t wg = 0; wg < nwg; ++wg) {
+                    uint32_t visited  = visit_stats_readback[wg * 4 + 0];
+                    uint32_t maxSp    = visit_stats_readback[wg * 4 + 1];
+                    visitedSum += visited;
+                    visitedMax = std::max<uint64_t>(visitedMax, visited);
+                    stackSum += maxSp;
+                    if (maxSp >= 32) stackOverflowCount++; // hit STACK_DEPTH
+                }
+                visit_avg    = double(visitedSum) / double(nwg);
+                visit_max    = double(visitedMax);
+                frontier_avg = double(stackSum) / double(nwg);  // reuse as avg max stack depth
+                frontier_saturated_pct = 100.0 * double(stackOverflowCount) / double(nwg); // reuse as stack overflow %
+            } else {
+                glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
             }
         }
         t_micro.end();
@@ -2066,6 +2187,7 @@ int main() {
             }
             ImGui::Text("  Micro-res: %dx%d (%d valid disk px)", micro_size, micro_size, micro_size * micro_size);
             ImGui::SliderInt("Render scale", &micro_res_scale, 1, 8);
+            ImGui::SliderInt("Tile size", &tile_size, 1, 8);
             ImGui::SliderFloat("Gain", &micro_gain, 0.1f, 20.0f, "%.1f");
             ImGui::Text("  Internal: %dx%d", std::max(1, fw / micro_res_scale), std::max(1, fh / micro_res_scale));
             ImGui::Text("  Select 'Indirect' in G-Buffer View to visualize");
@@ -2095,6 +2217,17 @@ int main() {
                 ImGui::Dummy(bs);
                 float tot_avg = float(phase_avg[0] + phase_avg[1] + phase_avg[2]);
                 imgui_stacked_legend("##microphases", phase_names, pvals, pcols, 3, tot_avg);
+
+                ImGui::Separator();
+                ImGui::Text("  DFS traversal instrumentation:");
+                ImGui::Text("    Nodes visited/px: avg %.0f, max %.0f",
+                             visit_avg, visit_max);
+                ImGui::Text("    Max stack depth: avg %.1f  |  hit STACK_DEPTH(32): %.1f%% of px",
+                             frontier_avg, frontier_saturated_pct);
+                if (frontier_saturated_pct > 5.0) {
+                    ImGui::TextColored(ImVec4(1, 0.4f, 0.3f, 1),
+                        "    -> stack overflow on a meaningful fraction of pixels!");
+                }
             }
 
             ImGui::Separator();
@@ -2148,6 +2281,25 @@ int main() {
             t_frame.flush_window();
             t_imgui.flush_window();
             win_start = now;
+
+            gllib::logf(gllib::LogLevel::info,
+                "PERF  frame=%.1fms  geo=%.1f  refit=%.1f  direct=%.1f  micro=%.1f  display=%.1f  imgui=%.1f  |  "
+                "phase: trav=%.2fms(%.0f%%) rad=%.2fms(%.0f%%) accum=%.2fms(%.0f%%)  |  "
+                "nodes: avg=%.0f max=%.0f  max_stack: avg=%.0f  |  "
+                "scale=%d  dispatch=%dx%d  (%d wg)  screen=%dx%d",
+                t_frame.disp_cpu(),
+                t_geo.disp_gpu(), t_refit.disp_gpu(), t_direct.disp_gpu(),
+                t_micro.disp_gpu(), t_display.disp_gpu(), t_imgui.disp_cpu(),
+                t_micro.disp_gpu() * phase_pct[0] / 100.0, phase_pct[0],
+                t_micro.disp_gpu() * phase_pct[1] / 100.0, phase_pct[1],
+                t_micro.disp_gpu() * phase_pct[2] / 100.0, phase_pct[2],
+                visit_avg, visit_max,
+                frontier_avg,
+                micro_res_scale,
+                std::max(1, (fw / micro_res_scale + 7) / 8),
+                std::max(1, (fh / micro_res_scale + 7) / 8),
+                std::max(1, (fw / micro_res_scale + 7) / 8) * std::max(1, (fh / micro_res_scale + 7) / 8),
+                fw, fh);
         }
 
         window.swap_buffers();
