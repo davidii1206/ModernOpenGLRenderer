@@ -21,6 +21,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <numeric>
 #include <random>
@@ -166,6 +167,139 @@ void main() {
 )";
 
 // ===========================================================================
+// Stage C — Compute shaders: leaf update + tree refit
+// ===========================================================================
+
+const char* leaf_update_cs = R"(
+#version 460 core
+layout(local_size_x = 256) in;
+
+struct GpuTri {
+    vec4 pos[3];
+    vec4 nrm[3];
+};
+
+struct LeafSrc {
+    uint tri_idx;
+    float u, v, pad;
+};
+
+layout(std430, binding = 0) writeonly buffer PGeom  { vec4 pgeom[];  };
+layout(std430, binding = 1) writeonly buffer PNrm   { vec4 pnrm[];   };
+layout(std430, binding = 4) readonly buffer TriBuf   { GpuTri tris[];  };
+layout(std430, binding = 5) readonly buffer LeafSrcB { LeafSrc leaves[]; };
+layout(std430, binding = 6) writeonly buffer Sphere  { vec4 sphere[];  };
+layout(std430, binding = 7) writeonly buffer Cone    { vec4 cone[];    };
+
+uniform uint u_num_leaves;
+uniform float u_leaf_radius;
+uniform int u_tree_offset;   // N - 1
+
+void main() {
+    uint leaf = gl_GlobalInvocationID.x;
+    if (leaf >= u_num_leaves) return;
+
+    LeafSrc src = leaves[leaf];
+    GpuTri tri = tris[src.tri_idx];
+
+    float w0 = 1.0 - src.u - src.v;
+    vec3 pos = w0 * tri.pos[0].xyz + src.u * tri.pos[1].xyz + src.v * tri.pos[2].xyz;
+    vec3 nrm = normalize(w0 * tri.nrm[0].xyz + src.u * tri.nrm[1].xyz + src.v * tri.nrm[2].xyz);
+
+    pgeom[leaf] = vec4(pos, u_leaf_radius);
+    pnrm[leaf]  = vec4(nrm, 0.0);
+
+    // Leaf-level tree node entries
+    sphere[u_tree_offset + leaf] = vec4(pos, u_leaf_radius);
+    cone[u_tree_offset + leaf]   = vec4(nrm, 1.0);
+}
+)";
+
+const char* tree_refit_cs = R"(
+#version 460 core
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 6) buffer Sphere { vec4 sphere[]; };
+layout(std430, binding = 7) buffer Cone   { vec4 cone[];   };
+
+uniform uint u_count;      // nodes at this level
+uniform uint u_level_start; // first node index at this level
+
+const float PI = 3.14159265358979;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= u_count) return;
+
+    uint node = u_level_start + idx;
+    uint left  = 2 * node + 1;
+    uint right = 2 * node + 2;
+
+    // --- Bounding sphere merge (Ritter) ---
+    vec3 c1 = sphere[left].xyz,  c2 = sphere[right].xyz;
+    float r1 = sphere[left].w,  r2 = sphere[right].w;
+    vec3 d = c2 - c1;
+    float dist = length(d);
+    vec3 C; float R;
+    if (dist < 1e-6) {
+        C = (r1 >= r2) ? c1 : c2;
+        R = max(r1, r2);
+    } else if (dist + r1 <= r2) {
+        C = c2; R = r2;
+    } else if (dist + r2 <= r1) {
+        C = c1; R = r1;
+    } else {
+        R = (dist + r1 + r2) * 0.5;
+        C = c1 + d * ((R - r1) / dist);
+    }
+    sphere[node] = vec4(C, R);
+
+    // --- Normal cone merge ---
+    vec3 a1 = cone[left].xyz,  a2 = cone[right].xyz;
+    float w1 = cone[left].w,  w2 = cone[right].w;
+    float b1 = acos(clamp(w1, -1.0, 1.0));
+    float b2 = acos(clamp(w2, -1.0, 1.0));
+    float ang = acos(clamp(dot(a1, a2), -1.0, 1.0));
+    vec3 axis; float cw;
+    if (ang + b1 + b2 >= PI - 1e-5 || length(a1 + a2) < 1e-4) {
+        axis = a1;
+        cw = -1.0;
+    } else {
+        axis = normalize(a1 + a2);
+        cw = cos((ang + b1 + b2) * 0.5);
+    }
+    cone[node] = vec4(axis, cw);
+}
+)";
+
+// ===========================================================================
+// Stage C — Bounding sphere wireframe debug overlay
+// ===========================================================================
+
+const char* sphere_vs = R"(
+#version 460 core
+layout(location = 0) in vec3 a_sphere_vert;
+layout(location = 1) in vec4 a_instance;   // center.xyz, radius
+
+uniform mat4 u_view_proj;
+
+void main() {
+    vec3 center = a_instance.xyz;
+    float radius = a_instance.w;
+    gl_Position = u_view_proj * vec4(center + a_sphere_vert * radius, 1.0);
+}
+)";
+
+const char* sphere_fs = R"(
+#version 460 core
+uniform vec4 u_color;
+out vec4 frag_color;
+void main() {
+    frag_color = u_color;
+}
+)";
+
+// ===========================================================================
 // Orbit camera
 // ===========================================================================
 void camera_control(gfx::Window& w, gfx::Camera& cam, float dt, bool allow, bool& captured) {
@@ -240,6 +374,18 @@ struct PointHierarchy {
     float leaf_radius = 0.0f;
     float total_area = 0.0f;
     int N = 0;
+};
+
+// GPU-friendly triangle layout (std430 compatible): 6 × vec4 = 96 bytes per tri
+struct GpuTri {
+    glm::vec4 pos[3];   // xyz = vertex position, w = 0
+    glm::vec4 nrm[3];   // xyz = vertex normal,   w = 0
+};
+
+// Per-leaf source data for GPU refit: 16 bytes
+struct LeafSrc {
+    uint32_t tri_idx;
+    float u, v, pad;
 };
 
 // ===========================================================================
@@ -590,6 +736,93 @@ bool load_cache(const std::string& path, PointHierarchy& ph, std::vector<Tri>& t
 } // namespace
 
 // ===========================================================================
+// Stage C — Unit sphere mesh for wireframe bounding-sphere debug rendering
+// ===========================================================================
+
+struct SphereMesh {
+    gl::VertexArray vao;
+    gl::Buffer vbo, ebo;
+    int index_count = 0;
+};
+
+SphereMesh create_wireframe_sphere(int lat_seg, int lon_seg) {
+    SphereMesh sm;
+
+    std::vector<glm::vec3> verts;
+    std::vector<uint32_t> idx;
+
+    // Top pole = index 0
+    verts.emplace_back(0.0f, 1.0f, 0.0f);
+    for (int i = 1; i < lat_seg; ++i) {
+        float phi = PI * float(i) / float(lat_seg);
+        float sp = std::sin(phi), cp = std::cos(phi);
+        for (int j = 0; j < lon_seg; ++j) {
+            float theta = 2.0f * PI * float(j) / float(lon_seg);
+            verts.emplace_back(sp * std::cos(theta), cp, sp * std::sin(theta));
+        }
+    }
+    // Bottom pole
+    verts.emplace_back(0.0f, -1.0f, 0.0f);
+
+    // Top cap
+    for (int j = 0; j < lon_seg; ++j) {
+        idx.push_back(0);
+        idx.push_back(1 + j);
+        idx.push_back(1 + (j + 1) % lon_seg);
+    }
+    // Middle bands
+    for (int i = 0; i < lat_seg - 2; ++i) {
+        int row0 = 1 + i * lon_seg;
+        int row1 = 1 + (i + 1) * lon_seg;
+        for (int j = 0; j < lon_seg; ++j) {
+            int j1 = (j + 1) % lon_seg;
+            idx.push_back(row0 + j);
+            idx.push_back(row0 + j1);
+            idx.push_back(row1 + j1);
+            idx.push_back(row0 + j);
+            idx.push_back(row1 + j1);
+            idx.push_back(row1 + j);
+        }
+    }
+    // Bottom cap
+    int bp = 1 + (lat_seg - 1) * lon_seg;
+    for (int j = 0; j < lon_seg; ++j) {
+        idx.push_back(bp);
+        idx.push_back(bp + (j + 1) % lon_seg);
+        idx.push_back(bp + j);
+    }
+
+    sm.index_count = int(idx.size());
+
+    sm.vbo = gl::Buffer(gl::BufferType::vertex, gl::BufferUsage::static_draw);
+    sm.vbo.data(verts.data(), verts.size() * sizeof(glm::vec3));
+    sm.ebo = gl::Buffer(gl::BufferType::index, gl::BufferUsage::static_draw);
+    sm.ebo.data(idx.data(), idx.size() * sizeof(uint32_t));
+
+    return sm;
+}
+
+void setup_sphere_vao(SphereMesh& sm, const gl::Buffer& instance_buf) {
+    sm.vao.bind();
+
+    // Attrib 0: unit sphere vertices
+    sm.vbo.bind();
+    sm.vao.attrib_pointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(glm::vec3), (const void*)0);
+    sm.vao.enable_attrib(0);
+
+    // Attrib 1: per-instance data from sphere_buf (center.xyz, radius)
+    instance_buf.bind();
+    sm.vao.attrib_pointer(1, 4, GL_FLOAT, GL_FALSE, sizeof(glm::vec4), (const void*)0);
+    sm.vao.enable_attrib(1);
+    glVertexAttribDivisor(1, 1);
+
+    // Element buffer
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, sm.ebo.handle());
+
+    gl::VertexArray::unbind();
+}
+
+// ===========================================================================
 // G-buffer FBO
 // ===========================================================================
 struct GBuffer {
@@ -646,7 +879,7 @@ void create_gbuffer(GBuffer& g, int w, int h) {
 // ===========================================================================
 int main() {
     gllib::log_to_stderr(gllib::LogLevel::info);
-    gfx::Window window({"36 Micro Rendering — Stage A+B", 1600, 900});
+    gfx::Window window({"36 Micro Rendering — Stage A+B+C", 1600, 900});
     window.vsync(false);
 
     gfx::ImGuiOverlay gui;
@@ -670,7 +903,22 @@ int main() {
     gl::Program gbuf_prog = make_program(gbuf_vs, gbuf_fs);
     gl::Program display_prog = make_program(display_vs, display_fs);
     gl::Program pc_prog = make_program(pc_vs, pc_fs);
-    if (!gbuf_prog.linked() || !display_prog.linked() || !pc_prog.linked()) {
+
+    // Stage C — compute shaders
+    auto make_compute = [](const char* src) -> gl::Program {
+        gl::Shader cs(gl::ShaderType::compute, src);
+        gl::Program prog;
+        prog.attach(cs);
+        if (!prog.link())
+            gllib::log(gllib::LogLevel::error, prog.info_log().c_str());
+        return prog;
+    };
+    gl::Program leaf_update_prog = make_compute(leaf_update_cs);
+    gl::Program tree_refit_prog  = make_compute(tree_refit_cs);
+    gl::Program sphere_prog      = make_program(sphere_vs, sphere_fs);
+
+    if (!gbuf_prog.linked() || !display_prog.linked() || !pc_prog.linked() ||
+        !leaf_update_prog.linked() || !tree_refit_prog.linked() || !sphere_prog.linked()) {
         gllib::log(gllib::LogLevel::error, "Shader compilation failed");
         return EXIT_FAILURE;
     }
@@ -746,12 +994,12 @@ int main() {
         ve[i] = glm::vec4(p.emi, 1.0f);
     }
 
-    gl::Buffer pgeom_buf(gl::BufferType::shader, gl::BufferUsage::static_draw);
-    gl::Buffer pnrm_buf(gl::BufferType::shader, gl::BufferUsage::static_draw);
+    gl::Buffer pgeom_buf(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);
+    gl::Buffer pnrm_buf(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);
     gl::Buffer palb_buf(gl::BufferType::shader, gl::BufferUsage::static_draw);
     gl::Buffer pemit_buf(gl::BufferType::shader, gl::BufferUsage::static_draw);
-    gl::Buffer sphere_buf(gl::BufferType::shader, gl::BufferUsage::static_draw);
-    gl::Buffer cone_buf(gl::BufferType::shader, gl::BufferUsage::static_draw);
+    gl::Buffer sphere_buf(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);
+    gl::Buffer cone_buf(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);
 
     pgeom_buf.data(vp.data(), vp.size() * sizeof(glm::vec4));
     pnrm_buf.data(vn.data(), vn.size() * sizeof(glm::vec4));
@@ -760,8 +1008,37 @@ int main() {
     sphere_buf.data(ph.sphere.data(), ph.sphere.size() * sizeof(glm::vec4));
     cone_buf.data(ph.cone.data(), ph.cone.size() * sizeof(glm::vec4));
 
+    // --- Stage C: Upload TriangleBuf + LeafSourceBuf ---
+    std::vector<GpuTri> gpu_tris(tris.size());
+    for (size_t i = 0; i < tris.size(); ++i) {
+        for (int v = 0; v < 3; ++v) {
+            gpu_tris[i].pos[v] = glm::vec4(tris[i].p[v], 0.0f);
+            gpu_tris[i].nrm[v] = glm::vec4(tris[i].n[v], 0.0f);
+        }
+    }
+    gl::Buffer tri_buf(gl::BufferType::shader, gl::BufferUsage::static_draw);
+    tri_buf.data(gpu_tris.data(), gpu_tris.size() * sizeof(GpuTri));
+
+    std::vector<LeafSrc> leaf_src(N);
+    for (int i = 0; i < N; ++i) {
+        leaf_src[i] = { uint32_t(ph.pts[i].tri_idx), ph.pts[i].u, ph.pts[i].v, 0.0f };
+    }
+    gl::Buffer leaf_src_buf(gl::BufferType::shader, gl::BufferUsage::static_draw);
+    leaf_src_buf.data(leaf_src.data(), leaf_src.size() * sizeof(LeafSrc));
+
+    gllib::logf(gllib::LogLevel::info, "Stage C: uploaded %zu triangles (%zu bytes), %d leaf sources",
+                tris.size(), gpu_tris.size() * sizeof(GpuTri), N);
+
+    // Bind sphere_buf and cone_buf to fixed binding points for compute + wireframe
+    sphere_buf.bind_base(6);
+    cone_buf.bind_base(7);
+
     // --- Empty VAO for point cloud (shader reads from SSBO via gl_VertexID) ---
     gl::VertexArray pc_vao;
+
+    // --- Stage C: wireframe bounding sphere debug mesh ---
+    SphereMesh sphere_mesh = create_wireframe_sphere(8, 16);
+    setup_sphere_vao(sphere_mesh, sphere_buf);
 
     // --- G-buffer ---
     GBuffer gbuf;
@@ -781,6 +1058,15 @@ int main() {
     bool show_points = true;
     float point_size = 5.0f;
     int pc_color_mode = 0;  // 0=albedo 1=emissive 2=normal 3=position
+
+    // Stage C debug state
+    bool show_spheres = false;
+    bool run_refit = true;
+    float refit_ms = 0.0f;
+    float max_pos_err = 0.0f;
+    float max_cone_err = 0.0f;
+    glm::vec4 sphere_color(0.0f, 1.0f, 0.0f, 0.3f);
+    int sphere_lod = 0;  // 0=all, 1=leaves only, 2=interior only
 
     double last = window.time();
 
@@ -829,6 +1115,50 @@ int main() {
         gl::Framebuffer::unbind(gl::FramebufferType::both);
 
     // ===================================================================
+        // 1b. Stage C — GPU refit: leaf update + bottom-up tree refit
+        // ===================================================================
+        if (run_refit) {
+            auto t0 = std::chrono::steady_clock::now();
+
+            // Bind compute-writeable buffers
+            pgeom_buf.bind_base(0);
+            pnrm_buf.bind_base(1);
+            tri_buf.bind_base(4);
+            leaf_src_buf.bind_base(5);
+            sphere_buf.bind_base(6);
+            cone_buf.bind_base(7);
+
+            // Pass 1: Leaf update — re-evaluate positions from triangle barycentrics
+            leaf_update_prog.use();
+            GLint loc_c;
+            loc_c = leaf_update_prog.uniform_location("u_num_leaves");
+            if (loc_c >= 0) glProgramUniform1ui(leaf_update_prog.handle(), loc_c, GLuint(N));
+            loc_c = leaf_update_prog.uniform_location("u_leaf_radius");
+            if (loc_c >= 0) glProgramUniform1f(leaf_update_prog.handle(), loc_c, ph.leaf_radius);
+            loc_c = leaf_update_prog.uniform_location("u_tree_offset");
+            if (loc_c >= 0) glProgramUniform1i(leaf_update_prog.handle(), loc_c, N - 1);
+            gl::dispatch_compute((N + 255) / 256, 1, 1);
+            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+            // Pass 2: Bottom-up refit — log2(N) levels, from leaves to root
+            tree_refit_prog.use();
+            for (int level = 0; level < LOG2N; ++level) {
+                uint32_t count = uint32_t(N) >> (level + 1);
+                if (count == 0) break;
+                uint32_t level_start = count - 1;
+                loc_c = tree_refit_prog.uniform_location("u_count");
+                if (loc_c >= 0) glProgramUniform1ui(tree_refit_prog.handle(), loc_c, count);
+                loc_c = tree_refit_prog.uniform_location("u_level_start");
+                if (loc_c >= 0) glProgramUniform1ui(tree_refit_prog.handle(), loc_c, level_start);
+                gl::dispatch_compute((count + 255) / 256, 1, 1);
+                glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+            }
+
+            auto t1 = std::chrono::steady_clock::now();
+            refit_ms = float(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        }
+
+    // ===================================================================
         // 2. Display pass — fullscreen triangle showing selected G-buffer target
         // ===================================================================
         gl::disable(GL_DEPTH_TEST);
@@ -875,11 +1205,44 @@ int main() {
         }
 
         // ===================================================================
+        // 2c. Bounding sphere wireframe debug overlay
+        // ===================================================================
+        if (show_spheres) {
+            sphere_prog.use();
+            loc = sphere_prog.uniform_location("u_view_proj");
+            if (loc >= 0) sphere_prog.uniform_matrix4fv(loc, glm::value_ptr(vp));
+            loc = sphere_prog.uniform_location("u_color");
+            if (loc >= 0) sphere_prog.uniform4fv(loc, glm::value_ptr(sphere_color));
+
+            gl::enable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+
+            sphere_mesh.vao.bind();
+
+            int inst_first = 0, inst_count = 2 * N - 1;
+            if (sphere_lod == 1) { inst_first = N - 1; inst_count = N; }
+            else if (sphere_lod == 2) { inst_first = 0; inst_count = N - 1; }
+
+            // Redirect instance attribute binding to the right offset in sphere_buf
+            glVertexArrayVertexBuffer(sphere_mesh.vao.handle(), 1,
+                                      sphere_buf.handle(),
+                                      inst_first * sizeof(glm::vec4),
+                                      sizeof(glm::vec4));
+
+            glDrawElementsInstanced(GL_TRIANGLES, sphere_mesh.index_count,
+                                    GL_UNSIGNED_INT, nullptr, inst_count);
+
+            glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+            gl::disable(GL_BLEND);
+        }
+
+        // ===================================================================
         // 3. ImGui
         // ===================================================================
         gui.begin_frame();
         {
-            ImGui::Begin("Stage A+B — Micro Rendering");
+            ImGui::Begin("Stage A+B+C — Micro Rendering");
             ImGui::Text("FPS: %.1f  Frame: %.2f ms", 1.0f / std::max(dt, 1e-6f), dt * 1000.0f);
             ImGui::Text("Resolution: %d x %d", gbuf.w, gbuf.h);
             ImGui::Separator();
@@ -918,6 +1281,51 @@ int main() {
             ImGui::Checkbox("Show point cloud", &show_points);
             ImGui::SliderFloat("Point size", &point_size, 1.0f, 20.0f);
             ImGui::Combo("Point color", &pc_color_mode, "Albedo\0Emissive\0Normal\0Position\0");
+
+            // Stage C — GPU refit
+            ImGui::Separator();
+            ImGui::Text("Stage C — GPU Refit");
+            ImGui::Checkbox("Run refit", &run_refit);
+            ImGui::SameLine();
+            ImGui::Text("  %.2f ms", refit_ms);
+            ImGui::Checkbox("Show bounding spheres", &show_spheres);
+            if (show_spheres) {
+                ImGui::Combo("Sphere LOD", &sphere_lod, "All\0Leaves\0Interior\0");
+                ImGui::ColorEdit4("Sphere color", &sphere_color.x,
+                                  ImGuiColorEditFlags_NoInputs);
+            }
+
+            if (ImGui::Button("Validate GPU vs CPU")) {
+                // Read back GPU sphere/cone data and compare with CPU reference
+                int tree_size = 2 * N - 1;
+                std::vector<glm::vec4> gpu_sphere(tree_size), gpu_cone(tree_size);
+                void* p = sphere_buf.map_range(0, tree_size * sizeof(glm::vec4), GL_MAP_READ_BIT);
+                if (p) { memcpy(gpu_sphere.data(), p, tree_size * sizeof(glm::vec4)); sphere_buf.unmap(); }
+                p = cone_buf.map_range(0, tree_size * sizeof(glm::vec4), GL_MAP_READ_BIT);
+                if (p) { memcpy(gpu_cone.data(), p, tree_size * sizeof(glm::vec4)); cone_buf.unmap(); }
+
+                max_pos_err = 0.0f;
+                max_cone_err = 0.0f;
+                for (int i = 0; i < tree_size; ++i) {
+                    glm::vec3 gp(gpu_sphere[i]), cp(ph.sphere[i]);
+                    float pos_d = glm::length(gp - cp);
+                    float rad_d = std::abs(gpu_sphere[i].w - ph.sphere[i].w);
+                    max_pos_err = std::max(max_pos_err, std::max(pos_d, rad_d));
+
+                    float ca = std::acos(std::clamp(glm::dot(glm::normalize(glm::vec3(gpu_cone[i])),
+                                                             glm::normalize(glm::vec3(ph.cone[i]))),
+                                                    -1.0f, 1.0f));
+                    float cd = std::abs(gpu_cone[i].w - ph.cone[i].w);
+                    max_cone_err = std::max(max_cone_err, std::max(ca, cd));
+                }
+                gllib::logf(gllib::LogLevel::info,
+                            "Validation: max pos err = %.8f, max cone err = %.8f rad",
+                            max_pos_err, max_cone_err);
+            }
+            if (max_pos_err > 0.0f || max_cone_err > 0.0f) {
+                ImGui::Text("Max pos err: %.8f", max_pos_err);
+                ImGui::Text("Max cone err: %.8f rad", max_cone_err);
+            }
 
             ImGui::End();
         }
