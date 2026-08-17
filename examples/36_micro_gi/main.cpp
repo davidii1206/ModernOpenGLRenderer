@@ -202,9 +202,9 @@ void main() {
     LeafSrc src = leaves[leaf];
     GpuTri tri = tris[src.tri_idx];
 
-    float w0 = 1.0 - src.u - src.v;
-    vec3 pos = w0 * tri.pos[0].xyz + src.u * tri.pos[1].xyz + src.v * tri.pos[2].xyz;
-    vec3 nrm = normalize(w0 * tri.nrm[0].xyz + src.u * tri.nrm[1].xyz + src.v * tri.nrm[2].xyz);
+    float w2 = 1.0 - src.u - src.v;
+    vec3 pos = src.u * tri.pos[0].xyz + src.v * tri.pos[1].xyz + w2 * tri.pos[2].xyz;
+    vec3 nrm = normalize(src.u * tri.nrm[0].xyz + src.v * tri.nrm[1].xyz + w2 * tri.nrm[2].xyz);
 
     pgeom[leaf] = vec4(pos, u_leaf_radius);
     pnrm[leaf]  = vec4(nrm, 0.0);
