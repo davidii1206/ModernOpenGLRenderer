@@ -7,6 +7,7 @@
 //          normal cones).  Debug point-cloud overlay.
 
 #include <gl/gl.hpp>
+#include <gl/query.hpp>
 #include <gfx/gfx.hpp>
 #include <gllib/log.hpp>
 
@@ -189,12 +190,14 @@ struct LeafSrc {
     float u, v, pad;
 };
 
-layout(std430, binding = 0) writeonly buffer PGeom  { vec4 pgeom[];  };
-layout(std430, binding = 1) writeonly buffer PNrm   { vec4 pnrm[];   };
+layout(std430, binding = 0) writeonly buffer PGeom   { vec4 pgeom[];   };
+layout(std430, binding = 1) writeonly buffer PNrm    { vec4 pnrm[];    };
 layout(std430, binding = 4) readonly buffer TriBuf   { GpuTri tris[];  };
 layout(std430, binding = 5) readonly buffer LeafSrcB { LeafSrc leaves[]; };
-layout(std430, binding = 6) writeonly buffer Sphere  { vec4 sphere[];  };
-layout(std430, binding = 7) writeonly buffer Cone    { vec4 cone[];    };
+layout(std430, binding = 6) writeonly buffer Sphere   { vec4 sphere[];  };
+layout(std430, binding = 7) writeonly buffer Cone     { vec4 cone[];    };
+layout(std430, binding = 13) writeonly buffer AabbMin { vec4 aabb_min[]; };
+layout(std430, binding = 14) writeonly buffer AabbMax { vec4 aabb_max[]; };
 
 uniform uint u_num_leaves;
 uniform float u_leaf_radius;
@@ -217,6 +220,10 @@ void main() {
     // Leaf-level tree node entries
     sphere[u_tree_offset + leaf] = vec4(pos, u_leaf_radius);
     cone[u_tree_offset + leaf]   = vec4(nrm, 1.0);
+
+    // Degenerate AABB (min == max == pos) for tight refit
+    aabb_min[u_tree_offset + leaf] = vec4(pos, 0.0);
+    aabb_max[u_tree_offset + leaf] = vec4(pos, 0.0);
 }
 )";
 
@@ -224,8 +231,10 @@ const char* tree_refit_cs = R"(
 #version 460 core
 layout(local_size_x = 256) in;
 
-layout(std430, binding = 6) buffer Sphere { vec4 sphere[]; };
-layout(std430, binding = 7) buffer Cone   { vec4 cone[];   };
+layout(std430, binding = 6) buffer Sphere  { vec4 sphere[];  };
+layout(std430, binding = 7) buffer Cone    { vec4 cone[];    };
+layout(std430, binding = 13) buffer AabbMin { vec4 aabb_min[]; };
+layout(std430, binding = 14) buffer AabbMax { vec4 aabb_max[]; };
 
 uniform uint u_count;      // nodes at this level
 uniform uint u_level_start; // first node index at this level
@@ -240,24 +249,16 @@ void main() {
     uint left  = 2 * node + 1;
     uint right = 2 * node + 2;
 
-    // --- Bounding sphere merge (Ritter) ---
-    vec3 c1 = sphere[left].xyz,  c2 = sphere[right].xyz;
-    float r1 = sphere[left].w,  r2 = sphere[right].w;
-    vec3 d = c2 - c1;
-    float dist = length(d);
-    vec3 C; float R;
-    if (dist < 1e-6) {
-        C = (r1 >= r2) ? c1 : c2;
-        R = max(r1, r2);
-    } else if (dist + r1 <= r2) {
-        C = c2; R = r2;
-    } else if (dist + r2 <= r1) {
-        C = c1; R = r1;
-    } else {
-        R = (dist + r1 + r2) * 0.5;
-        C = c1 + d * ((R - r1) / dist);
-    }
-    sphere[node] = vec4(C, R);
+    // --- AABB merge (tight bounding volume) ---
+    vec3 bmin = min(aabb_min[left].xyz, aabb_min[right].xyz);
+    vec3 bmax = max(aabb_max[left].xyz, aabb_max[right].xyz);
+    aabb_min[node] = vec4(bmin, 0.0);
+    aabb_max[node] = vec4(bmax, 0.0);
+
+    // --- Tight bounding sphere from AABB ---
+    vec3 center = (bmin + bmax) * 0.5;
+    float radius = length(bmax - bmin) * 0.5;
+    sphere[node] = vec4(center, radius);
 
     // --- Normal cone merge ---
     vec3 a1 = cone[left].xyz,  a2 = cone[right].xyz;
@@ -287,6 +288,7 @@ layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly buffer PGeom     { vec4 pgeom[];    };
 layout(std430, binding = 1) readonly buffer PNrm      { vec4 pnrm[];     };
+layout(std430, binding = 2) readonly buffer PAlb      { vec4 palb[];     };
 layout(std430, binding = 3) readonly buffer PEmit      { vec4 pemit[];    };
 layout(std430, binding = 8) writeonly buffer Radiance  { vec4 radiance[]; };
 layout(std430, binding = 9) readonly buffer Emitters   { uint emitters[]; };
@@ -295,6 +297,8 @@ uniform uint u_num_leaves;
 uniform uint u_num_emitters;
 uniform float u_leaf_area;
 uniform float u_emissive_gain;
+
+const float PI = 3.14159265358979;
 
 void main() {
     uint recv = gl_GlobalInvocationID.x;
@@ -310,7 +314,7 @@ void main() {
 
         vec3 e_pos = pgeom[e].xyz;
         vec3 e_nrm = normalize(pnrm[e].xyz);
-        vec3 e_emit = pemit[e].rgb;
+        vec3 e_emit = pemit[e].rgb * u_emissive_gain;
 
         vec3 dir = e_pos - pos;
         float dist2 = max(dot(dir, dir), 1e-4);
@@ -323,7 +327,7 @@ void main() {
         incoming += e_emit * cos_emit * cos_recv / dist2 * u_leaf_area;
     }
 
-    radiance[u_num_leaves - 1u + recv] = vec4(emissive + incoming, u_leaf_area);
+    radiance[u_num_leaves - 1u + recv] = vec4(emissive + palb[recv].rgb / PI * incoming, u_leaf_area);
 }
 )";
 
@@ -359,18 +363,20 @@ void main() {
 
 const char* micro_render_cs = R"(
 #version 460 core
+#extension GL_ARB_shader_clock : require
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(binding = 0) uniform sampler2D gbuf_pos;
 layout(binding = 1) uniform sampler2D gbuf_nrm;
 layout(binding = 2) uniform sampler2D gbuf_alb;
 
-layout(std430, binding = 2) readonly buffer Alb     { vec4 palb[];     };
 layout(std430, binding = 6) readonly buffer Spheres { vec4 sphere_buf[]; };
+layout(std430, binding = 7) readonly buffer Cones   { vec4 cone_buf[];   };
 layout(std430, binding = 8) readonly buffer Rad     { vec4 rad_buf[];    };
 
 layout(std430, binding = 10) writeonly buffer DebugPos { vec4 debug_pos[]; };
 layout(std430, binding = 11) writeonly buffer DebugCol { vec4 debug_col[]; };
+layout(std430, binding = 12) writeonly buffer ProfBuf { uint prof_data[]; };
 
 layout(binding = 0, rgba16f) writeonly uniform image2D u_output;
 layout(binding = 1, rgba16f) writeonly uniform image2D u_debug_img;
@@ -383,9 +389,19 @@ uniform uint u_scale;
 uniform float u_gain;
 uniform ivec2 u_debug_pixel;
 
-#define STACK_SIZE 32
+#define NPHASES 4
+#define Q_CAP 1024
+#define MAX_BFS_ITERS 32
 
-shared vec3 s_contribs[64];
+shared uint s_bufA[Q_CAP];
+shared uint s_bufB[Q_CAP];
+shared uint s_nA;
+shared uint s_nB;
+shared uint s_widx;
+
+shared float s_depth[64];
+shared uint  s_node[64];
+shared vec3  s_radiance[64];
 
 void main() {
     ivec2 pixel_lr = ivec2(gl_WorkGroupID.xy);
@@ -395,18 +411,29 @@ void main() {
 
     ivec2 local = ivec2(gl_LocalInvocationID.xy);
     uint lid = uint(local.x) + uint(local.y) * 8u;
+    uint micro_total = u_micro_size * u_micro_size;
+
+    uint g_idx = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    uint base = g_idx * NPHASES;
+
+    for (uint i = lid; i < 64u; i += 64u) {
+        s_depth[i] = 1e30;
+        s_node[i] = 0u;
+        s_radiance[i] = vec3(0.0);
+    }
 
     vec3 pos = texelFetch(gbuf_pos, pixel, 0).xyz;
     vec3 nrm = normalize(texelFetch(gbuf_nrm, pixel, 0).xyz);
     vec3 alb = texelFetch(gbuf_alb, pixel, 0).rgb;
 
-    s_contribs[lid] = vec3(0.0);
-    barrier();
-
     if (dot(pos, pos) < 1e-6) {
-        if (lid == 0u) imageStore(u_output, pixel_lr, vec4(0.0));
-        if (u_debug_pixel.x >= 0 && pixel_lr == u_debug_pixel)
-            imageStore(u_debug_img, local, vec4(0.0));
+        if (lid == 0u) {
+            imageStore(u_output, pixel_lr, vec4(0.0));
+            prof_data[base + 0] = uint(clockARB());
+            prof_data[base + 1] = uint(clockARB());
+            prof_data[base + 2] = uint(clockARB());
+            prof_data[base + 3] = uint(clockARB());
+        }
         return;
     }
 
@@ -414,76 +441,138 @@ void main() {
     vec3 T = normalize(cross(up, nrm));
     vec3 B = cross(nrm, T);
 
-    float u = (2.0 * float(local.x) + 1.0) / float(u_micro_size) - 1.0;
-    float v = (2.0 * float(local.y) + 1.0) / float(u_micro_size) - 1.0;
-    float r2 = u * u + v * v;
-    bool valid = r2 <= 1.0;
+    barrier();
 
-    vec3 local_dir = vec3(u, v, sqrt(max(1.0 - r2, 0.0)));
-    vec3 world_dir = normalize(T * local_dir.x + B * local_dir.y + nrm * local_dir.z);
+    if (lid == 0u) prof_data[base + 0] = uint(clockARB());
 
-    float closest_t = 1e30;
-    uint closest_node = 0u;
+    float half_ms = float(u_micro_size) * 0.5;
+    float ms_f = float(u_micro_size);
 
-    if (valid) {
-        uint stack[STACK_SIZE];
-        int sp = 0;
-        stack[sp++] = 0u;
+    if (lid == 0u) {
+        s_bufA[0] = 0u;
+        s_nA = 1u;
+        s_nB = 0u;
+    }
+    barrier();
 
-        while (sp > 0) {
-            uint node = stack[--sp];
-            vec3 center = sphere_buf[node].xyz;
-            float radius = sphere_buf[node].w;
+    for (uint iter = 0u; iter < MAX_BFS_ITERS; iter++) {
+        uint cn = (iter & 1u) == 0u ? s_nA : s_nB;
+        if (cn == 0u) break;
 
-            vec3 oc = center - pos;
-            float b = dot(oc, world_dir);
-            float c = dot(oc, oc) - radius * radius;
-            float disc = b * b - c;
-            if (disc < 0.0) continue;
+        if (lid == 0u) s_widx = 0u;
+        barrier();
 
-            float t = b - sqrt(disc);
-            if (t < 0.0) t = max(b + sqrt(disc), 0.0);
-            if (t < 0.0 || t >= closest_t) continue;
+        for (uint i = lid; i < cn; i += 64u) {
+            uint node = (iter & 1u) == 0u ? s_bufA[i] : s_bufB[i];
 
-            float dist = length(oc);
+            vec4 sph = sphere_buf[node];
+            vec3 center = sph.xyz;
+            float radius = sph.w;
+
+            vec3 to_center = center - pos;
+            float dist2 = dot(to_center, to_center);
+
+            if (dot(to_center, nrm) < 0.0) continue;
+
+            vec4 cn2 = cone_buf[node];
+            float dot_oc_axis = dot(to_center, cn2.xyz);
+            if (dot_oc_axis > 0.0 && cn2.w > 0.0 &&
+                dot_oc_axis * dot_oc_axis > dist2 * (1.0 - cn2.w * cn2.w))
+                continue;
+
+            float cz = dot(to_center, nrm);
+            if (cz <= 0.0) continue;
+
+            float inv_cz = 1.0 / cz;
+            float u_proj = dot(to_center, T) * inv_cz;
+            float v_proj = dot(to_center, B) * inv_cz;
+            float px = (u_proj + 1.0) * half_ms;
+            float py = (v_proj + 1.0) * half_ms;
+            float r_proj = radius * inv_cz * half_ms;
+
+            if (px + r_proj < 0.0 || px - r_proj >= ms_f ||
+                py + r_proj < 0.0 || py - r_proj >= ms_f)
+                continue;
+
             bool is_leaf = node >= (u_num_leaves - 1u);
+            if (is_leaf || r_proj <= 0.5) {
+                float dist = sqrt(dist2);
+                int ms = int(u_micro_size);
+                int ir = max(1, int(ceil(r_proj)));
+                int px_i = int(px);
+                int py_i = int(py);
+                int xmin = max(0, px_i - ir);
+                int xmax = min(ms - 1, px_i + ir);
+                int ymin = max(0, py_i - ir);
+                int ymax = min(ms - 1, py_i + ir);
+                float r2 = r_proj * r_proj;
 
-            if (is_leaf || radius * float(u_micro_size) < dist) {
-                closest_t = t;
-                closest_node = node;
+                for (int my = ymin; my <= ymax; my++) {
+                    for (int mx = xmin; mx <= xmax; mx++) {
+                        float dx = float(mx) + 0.5 - px;
+                        float dy = float(my) + 0.5 - py;
+                        if (dx * dx + dy * dy <= r2) {
+                            uint mid = uint(mx) + uint(my) * u_micro_size;
+                            if (dist < s_depth[mid]) {
+                                s_depth[mid] = dist;
+                                s_node[mid] = node;
+                            }
+                        }
+                    }
+                }
             } else {
                 uint left = 2u * node + 1u;
                 uint right = 2u * node + 2u;
-                if (sp + 2 <= STACK_SIZE) {
-                    stack[sp++] = right;
-                    stack[sp++] = left;
+                uint w = atomicAdd(s_widx, 2u);
+                if (w + 1u < Q_CAP) {
+                    if ((iter & 1u) == 0u) {
+                        s_bufB[w] = left;
+                        s_bufB[w + 1u] = right;
+                    } else {
+                        s_bufA[w] = left;
+                        s_bufA[w + 1u] = right;
+                    }
                 }
             }
         }
+        barrier();
+
+        if (lid == 0u) {
+            if ((iter & 1u) == 0u)
+                s_nB = s_widx;
+            else
+                s_nA = s_widx;
+        }
+        barrier();
     }
 
-    vec3 contrib = vec3(0.0);
-    if (valid && closest_t < 1e29) {
-        contrib = palb[closest_node].rgb * rad_buf[closest_node].rgb;
+    if (lid == 0u) prof_data[base + 1] = uint(clockARB());
+
+    for (uint i = lid; i < micro_total; i += 64u) {
+        if (s_node[i] > 0u) {
+            s_radiance[i] = rad_buf[s_node[i]].rgb;
+        }
     }
+    barrier();
+
+    if (lid == 0u) prof_data[base + 2] = uint(clockARB());
 
     if (u_debug_pixel.x >= 0 && pixel_lr == u_debug_pixel) {
-        imageStore(u_debug_img, local, vec4(contrib, 1.0));
-        debug_pos[lid] = closest_t < 1e29 ? vec4(sphere_buf[closest_node].xyz, 1.0) : vec4(0.0);
-        debug_col[lid] = closest_t < 1e29 ? vec4(contrib, 1.0) : vec4(0.3, 0.0, 0.0, 1.0);
+        imageStore(u_debug_img, local, vec4(s_radiance[lid], 1.0));
+        debug_pos[lid] = s_node[lid] > 0u ? vec4(sphere_buf[s_node[lid]].xyz, 1.0) : vec4(0.0);
+        debug_col[lid] = s_node[lid] > 0u ? vec4(s_radiance[lid], 1.0) : vec4(0.3, 0.0, 0.0, 1.0);
     }
-
-    s_contribs[lid] = contrib;
-    barrier();
 
     if (lid == 0u) {
         vec3 sum = vec3(0.0);
-        for (uint i = 0u; i < 64u; i++) {
-            sum += s_contribs[i];
+        for (uint i = 0u; i < micro_total; i++) {
+            sum += s_radiance[i];
         }
         vec3 indirect = u_m_valid > 0u ? u_gain * alb * sum / float(u_m_valid) : vec3(0.0);
         imageStore(u_output, pixel_lr, vec4(indirect, 1.0));
     }
+
+    if (lid == 0u) prof_data[base + 3] = uint(clockARB());
 }
 )";
 
@@ -835,31 +924,28 @@ PointHierarchy build_hierarchy(
         ph.nodeleaf[node] = uint32_t(i);
     }
 
-    // Bottom-up refit
+    // Bottom-up refit using AABB-based tight bounding spheres
+    // First pass: compute per-node AABBs from actual leaf positions
+    std::vector<glm::vec3> bmin(tree_size, glm::vec3(1e30f));
+    std::vector<glm::vec3> bmax(tree_size, glm::vec3(-1e30f));
+
+    for (int i = 0; i < N; ++i) {
+        int node = (N - 1) + i;
+        bmin[node] = ph.pts[i].pos;
+        bmax[node] = ph.pts[i].pos;
+    }
+
     for (int node = N - 2; node >= 0; --node) {
         int l = 2 * node + 1;
         int r = 2 * node + 2;
 
-        // Bounding sphere merge (Ritter's algorithm)
-        glm::vec3 c1(ph.sphere[l].x, ph.sphere[l].y, ph.sphere[l].z);
-        glm::vec3 c2(ph.sphere[r].x, ph.sphere[r].y, ph.sphere[r].z);
-        float r1 = ph.sphere[l].w, r2 = ph.sphere[r].w;
-        glm::vec3 d = c2 - c1;
-        float dist = glm::length(d);
-        glm::vec3 C;
-        float R;
-        if (dist < 1e-6f) {
-            C = (r1 >= r2) ? c1 : c2;
-            R = std::max(r1, r2);
-        } else if (dist + r1 <= r2) {
-            C = c2; R = r2;
-        } else if (dist + r2 <= r1) {
-            C = c1; R = r1;
-        } else {
-            R = (dist + r1 + r2) * 0.5f;
-            C = c1 + d * ((R - r1) / dist);
-        }
-        ph.sphere[node] = glm::vec4(C, R);
+        bmin[node] = glm::min(bmin[l], bmin[r]);
+        bmax[node] = glm::max(bmax[l], bmax[r]);
+
+        // Tight bounding sphere from AABB
+        glm::vec3 center = (bmin[node] + bmax[node]) * 0.5f;
+        float radius = glm::length(bmax[node] - bmin[node]) * 0.5f;
+        ph.sphere[node] = glm::vec4(center, radius);
 
         // Normal cone merge
         glm::vec3 a1(ph.cone[l].x, ph.cone[l].y, ph.cone[l].z);
@@ -977,6 +1063,119 @@ bool load_cache(const std::string& path, PointHierarchy& ph, std::vector<Tri>& t
 }
 
 } // namespace
+
+// ===========================================================================
+// GPU / CPU profiling (double-buffered GL_TIME_ELAPSED queries)
+// ===========================================================================
+
+class PassTimer {
+public:
+    explicit PassTimer(const char* name, bool gpu = true)
+        : name_(name), gpu_(gpu), q_(gl::QueryType::time_elapsed),
+          q_prev_(gl::QueryType::time_elapsed) {}
+
+    void begin() {
+        t0_ = std::chrono::steady_clock::now();
+        if (gpu_) q_.begin();
+    }
+    void end() {
+        if (gpu_) q_.end();
+        cpu_ms_ = std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - t0_).count();
+        ran_ = true;
+        if (gpu_) std::swap(q_, q_prev_);
+    }
+    void skip() { ran_ = false; cpu_ms_ = 0.0; }
+
+    void readback() {
+        gpu_ms_ = 0.0;
+        if (ran_) {
+            if (gpu_) gpu_ms_ = double(q_prev_.result()) * 1.0e-6;
+            cpu_acc_ += cpu_ms_;
+            gpu_acc_ += gpu_ms_;
+            n_++;
+        }
+        win_cpu_acc_ += cpu_ms_;
+        win_gpu_acc_ += gpu_ms_;
+        win_n_++;
+    }
+
+    void flush_window() {
+        disp_cpu_ = win_n_ ? win_cpu_acc_ / double(win_n_) : 0.0;
+        disp_gpu_ = win_n_ ? win_gpu_acc_ / double(win_n_) : 0.0;
+        win_cpu_acc_ = win_gpu_acc_ = 0.0;
+        win_n_ = 0;
+        cpu_hist_.push_back(float(disp_cpu_));
+        if (cpu_hist_.size() > kHist) cpu_hist_.erase(cpu_hist_.begin());
+        if (gpu_) {
+            gpu_hist_.push_back(float(disp_gpu_));
+            if (gpu_hist_.size() > kHist) gpu_hist_.erase(gpu_hist_.begin());
+        }
+    }
+
+    const char* name() const { return name_; }
+    bool gpu() const { return gpu_; }
+    double disp_cpu() const { return disp_cpu_; }
+    double disp_gpu() const { return disp_gpu_; }
+    const std::vector<float>& cpu_hist() const { return cpu_hist_; }
+    const std::vector<float>& gpu_hist() const { return gpu_hist_; }
+
+private:
+    static constexpr size_t kHist = 120;
+    const char* name_;
+    bool gpu_;
+    gl::Query q_, q_prev_;
+    std::chrono::steady_clock::time_point t0_;
+    double cpu_ms_ = 0.0, gpu_ms_ = 0.0;
+    double cpu_acc_ = 0.0, gpu_acc_ = 0.0;
+    double win_cpu_acc_ = 0.0, win_gpu_acc_ = 0.0;
+    double disp_cpu_ = 0.0, disp_gpu_ = 0.0;
+    int n_ = 0, win_n_ = 0;
+    bool ran_ = false;
+    std::vector<float> cpu_hist_, gpu_hist_;
+};
+
+static void imgui_stacked_bar(const ImVec2& pos, const ImVec2& size,
+                              const float* vals, const ImU32* cols, int n) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    float total = 0.0f;
+    for (int i = 0; i < n; ++i) total += vals[i];
+    if (total <= 0.0f) {
+        dl->AddRectFilled(pos, ImVec2(pos.x + size.x, pos.y + size.y),
+                          IM_COL32(40, 40, 40, 255));
+        return;
+    }
+    float x = pos.x;
+    for (int i = 0; i < n; ++i) {
+        float w = size.x * vals[i] / total;
+        if (w > 0.0f)
+            dl->AddRectFilled(ImVec2(x, pos.y), ImVec2(x + w, pos.y + size.y), cols[i]);
+        x += w;
+    }
+    dl->AddRect(pos, ImVec2(pos.x + size.x, pos.y + size.y),
+                IM_COL32(255, 255, 255, 90));
+}
+
+static void imgui_stacked_legend(const char* id, const char* const* names,
+                                 const float* ms, const ImU32* cols, int n, float total) {
+    if (ImGui::BeginTable(id, 2)) {
+        for (int i = 0; i < n; ++i) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImVec4 c = ImGui::ColorConvertU32ToFloat4(cols[i]);
+            ImGui::ColorButton("##sw", c,
+                               ImGuiColorEditFlags_NoTooltip |
+                               ImGuiColorEditFlags_NoInputs |
+                               ImGuiColorEditFlags_NoPicker, ImVec2(10, 10));
+            ImGui::SameLine();
+            ImGui::Text("%s", names[i]);
+            ImGui::TableNextColumn();
+            ImGui::Text("%.3f ms  (%.1f%%)", ms[i],
+                        total > 0.0f ? 100.0f * ms[i] / total : 0.0f);
+        }
+        ImGui::EndTable();
+    }
+}
 
 // ===========================================================================
 // Stage C — Unit sphere mesh for wireframe bounding-sphere debug rendering
@@ -1251,6 +1450,27 @@ int main() {
     gl::Buffer sphere_buf(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);
     gl::Buffer cone_buf(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);
 
+    // AABB buffers for tight bounding sphere computation (binding 13, 14)
+    int tree_size = 2 * N - 1;
+    std::vector<glm::vec4> aabb_min_data(tree_size, glm::vec4(1e30f));
+    std::vector<glm::vec4> aabb_max_data(tree_size, glm::vec4(-1e30f));
+    for (int i = 0; i < N; ++i) {
+        int node = (N - 1) + i;
+        aabb_min_data[node] = glm::vec4(ph.pts[i].pos, 0.0f);
+        aabb_max_data[node] = glm::vec4(ph.pts[i].pos, 0.0f);
+    }
+    for (int node = N - 2; node >= 0; --node) {
+        int l = 2 * node + 1, r = 2 * node + 2;
+        aabb_min_data[node] = glm::vec4(
+            glm::min(glm::vec3(aabb_min_data[l]), glm::vec3(aabb_min_data[r])), 0.0f);
+        aabb_max_data[node] = glm::vec4(
+            glm::max(glm::vec3(aabb_max_data[l]), glm::vec3(aabb_max_data[r])), 0.0f);
+    }
+    gl::Buffer aabb_min_buf(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);
+    gl::Buffer aabb_max_buf(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);
+    aabb_min_buf.data(aabb_min_data.data(), aabb_min_data.size() * sizeof(glm::vec4));
+    aabb_max_buf.data(aabb_max_data.data(), aabb_max_data.size() * sizeof(glm::vec4));
+
     pgeom_buf.data(vp.data(), vp.size() * sizeof(glm::vec4));
     pnrm_buf.data(vn.data(), vn.size() * sizeof(glm::vec4));
     palb_buf.data(va.data(), va.size() * sizeof(glm::vec4));
@@ -1341,6 +1561,10 @@ int main() {
     gl::Buffer debug_col_buf(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);
     debug_col_buf.data(nullptr, 64 * sizeof(glm::vec4));
 
+    // --- Micro-rendering intra-shader profiling SSBO ---
+    gl::Buffer prof_buf(gl::BufferType::shader, gl::BufferUsage::stream_read);
+    std::vector<uint32_t> prof_readback;
+
     // --- Fullscreen triangle VAO ---
     gl::VertexArray fsq_vao;
 
@@ -1359,7 +1583,6 @@ int main() {
     // Stage C debug state
     bool show_spheres = false;
     bool run_refit = true;
-    float refit_ms = 0.0f;
     float max_pos_err = 0.0f;
     float max_cone_err = 0.0f;
     glm::vec4 sphere_color(0.0f, 1.0f, 0.0f, 0.3f);
@@ -1370,11 +1593,27 @@ int main() {
 
     // Stage E state
     bool run_micro_render = true;
-    float micro_ms = 0.0f;
     int micro_size = 8;
     float micro_gain = 1.0f;
     bool show_micro_debug = false;
     int debug_pixel_x = -1, debug_pixel_y = -1;
+
+    // Intra-shader micro profiling results (ticks, displayed as %)
+    static const char* phase_names[] = {"traversal", "radiance", "accumulate"};
+    double phase_avg[3] = {};
+    double phase_pct[3] = {};
+    uint64_t prof_clock_period_ns = 1;
+
+    // Profiling timers
+    PassTimer t_frame("frame", false);
+    PassTimer t_geo("geometry");
+    PassTimer t_refit("gpu refit");
+    PassTimer t_direct("direct light");
+    PassTimer t_micro("micro render");
+    PassTimer t_display("display");
+    PassTimer t_pointcloud("point cloud");
+    PassTimer t_imgui("imgui", false);
+    double win_start = window.time();
 
     double last = window.time();
 
@@ -1397,9 +1636,12 @@ int main() {
 
         glm::mat4 vp = cam.view_projection();
 
+        t_frame.begin();
+
         // ===================================================================
         // 1. Geometry pass
         // ===================================================================
+        t_geo.begin();
         gbuf.fbo.bind();
         gl::viewport(0, 0, gbuf.w, gbuf.h);
         gl::clear_color(0.0f, 0.0f, 0.0f, 0.0f);
@@ -1425,13 +1667,14 @@ int main() {
         }
 
         gl::Framebuffer::unbind(gl::FramebufferType::both);
+        glMemoryBarrier(GL_FRAMEBUFFER_BARRIER_BIT);
+        t_geo.end();
 
     // ===================================================================
         // 1b. Stage C — GPU refit: leaf update + bottom-up tree refit
         // ===================================================================
+        t_refit.begin();
         if (run_refit) {
-            auto t0 = std::chrono::steady_clock::now();
-
             // Bind compute-writeable buffers
             pgeom_buf.bind_base(0);
             pnrm_buf.bind_base(1);
@@ -1441,6 +1684,8 @@ int main() {
             leaf_src_buf.bind_base(5);
             sphere_buf.bind_base(6);
             cone_buf.bind_base(7);
+            aabb_min_buf.bind_base(13);
+            aabb_max_buf.bind_base(14);
 
             // Pass 1: Leaf update — re-evaluate positions from triangle barycentrics
             leaf_update_prog.use();
@@ -1468,10 +1713,10 @@ int main() {
                 glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
             }
 
-            auto t1 = std::chrono::steady_clock::now();
-            refit_ms = float(std::chrono::duration<double, std::milli>(t1 - t0).count());
+            t_refit.end();
 
             // --- Stage D: Direct lighting from emissive leaves ---
+            t_direct.begin();
             radiance_buf.bind_base(8);
             emitters_buf.bind_base(9);
 
@@ -1500,14 +1745,14 @@ int main() {
                 gl::dispatch_compute((count + 255) / 256, 1, 1);
                 glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
             }
+            t_direct.end();
         }
 
         // ===================================================================
         // 1e. Micro-rendering (Stage E)
         // ===================================================================
+        t_micro.begin();
         if (run_micro_render) {
-            auto t0m = std::chrono::steady_clock::now();
-
             int rw = std::max(1, fw / micro_res_scale);
             int rh = std::max(1, fh / micro_res_scale);
 
@@ -1519,10 +1764,16 @@ int main() {
 
             palb_buf.bind_base(2);
             sphere_buf.bind_base(6);
+            cone_buf.bind_base(7);
             radiance_buf.bind_base(8);
 
             debug_pos_buf.bind_base(10);
             debug_col_buf.bind_base(11);
+
+            // Intra-shader profiling buffer
+            size_t prof_count = size_t(rw) * size_t(rh) * 4;
+            prof_buf.data(nullptr, prof_count * sizeof(uint32_t));
+            prof_buf.bind_base(12);
 
             debug_tex.bind_image(1, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
 
@@ -1569,13 +1820,40 @@ int main() {
             glMemoryBarrier(GL_ALL_BARRIER_BITS);
             glFinish();
 
-            auto t1m = std::chrono::steady_clock::now();
-            micro_ms = float(std::chrono::duration<double, std::milli>(t1m - t0m).count());
+            // Read back intra-shader profiling data
+            {
+                prof_readback.resize(prof_count);
+                void* ptr = prof_buf.map_range(0, prof_count * sizeof(uint32_t), GL_MAP_READ_BIT);
+                if (ptr) {
+                    memcpy(prof_readback.data(), ptr, prof_count * sizeof(uint32_t));
+                    prof_buf.unmap();
+                }
+                // Accumulate per-phase deltas across all workgroups
+                double sums[3] = {};
+                uint64_t total = 0;
+                for (size_t wg = 0; wg < size_t(rw) * size_t(rh); ++wg) {
+                    uint32_t t0 = prof_readback[wg * 4 + 0];
+                    uint32_t t1 = prof_readback[wg * 4 + 1];
+                    uint32_t t2 = prof_readback[wg * 4 + 2];
+                    uint32_t t3 = prof_readback[wg * 4 + 3];
+                    sums[0] += (t1 - t0);
+                    sums[1] += (t2 - t1);
+                    sums[2] += (t3 - t2);
+                    total   += (t3 - t0);
+                }
+                size_t nwg = size_t(rw) * size_t(rh);
+                for (int i = 0; i < 3; ++i) {
+                    phase_avg[i] = sums[i] / double(nwg);
+                    phase_pct[i] = total > 0 ? sums[i] * 100.0 / double(total) : 0.0;
+                }
+            }
         }
+        t_micro.end();
 
     // ===================================================================
         // 2. Display pass — fullscreen triangle showing selected G-buffer target
         // ===================================================================
+        t_display.begin();
         gl::disable(GL_DEPTH_TEST);
         gl::viewport(0, 0, fw, fh);
         gl::clear_color(0.02f, 0.02f, 0.03f, 1.0f);
@@ -1596,10 +1874,12 @@ int main() {
         loc = display_prog.uniform_location("u_exposure"); if (loc >= 0) display_prog.uniform1f(loc, exposure);
         loc = display_prog.uniform_location("u_gamma");    if (loc >= 0) display_prog.uniform1f(loc, gamma);
         gl::draw_arrays(GL_TRIANGLES, 0, 3);
+        t_display.end();
 
         // ===================================================================
         // 2b. Point cloud debug overlay
         // ===================================================================
+        t_pointcloud.begin();
         if (show_points) {
             pc_prog.use();
             loc = pc_prog.uniform_location("u_view_proj");
@@ -1625,6 +1905,7 @@ int main() {
             gl::draw_arrays(GL_POINTS, 0, N);
             gl::disable(GL_PROGRAM_POINT_SIZE);
         }
+        t_pointcloud.end();
 
         // ===================================================================
         // 2c. Bounding sphere wireframe debug overlay
@@ -1679,6 +1960,7 @@ int main() {
         // ===================================================================
         // 3. ImGui
         // ===================================================================
+        t_imgui.begin();
         gui.begin_frame();
         {
             ImGui::Begin("Stage A+B+C+D+E — Micro Rendering");
@@ -1726,7 +2008,7 @@ int main() {
             ImGui::Text("Stage C — GPU Refit");
             ImGui::Checkbox("Run refit", &run_refit);
             ImGui::SameLine();
-            ImGui::Text("  %.2f ms", refit_ms);
+            ImGui::Text("  %.2f ms", t_refit.disp_gpu());
             ImGui::Checkbox("Show bounding spheres", &show_spheres);
             if (show_spheres) {
                 ImGui::Combo("Sphere LOD", &sphere_lod, "All\0Leaves\0Interior\0");
@@ -1780,7 +2062,7 @@ int main() {
             ImGui::Checkbox("Run micro-render", &run_micro_render);
             if (run_micro_render) {
                 ImGui::SameLine();
-                ImGui::Text("  %.2f ms", micro_ms);
+                ImGui::Text("  %.2f ms", t_micro.disp_gpu());
             }
             ImGui::Text("  Micro-res: %dx%d (%d valid disk px)", micro_size, micro_size, micro_size * micro_size);
             ImGui::SliderInt("Render scale", &micro_res_scale, 1, 8);
@@ -1800,9 +2082,73 @@ int main() {
                 }
             }
 
+            if (run_micro_render && !prof_readback.empty()) {
+                ImGui::Separator();
+                ImGui::Text("  Shader phases:");
+                ImU32 pcols[] = {
+                    IM_COL32(100,180,255,255), IM_COL32(255,200,60,255), IM_COL32(100,220,120,255)
+                };
+                ImVec2 bp = ImGui::GetCursorScreenPos();
+                ImVec2 bs(ImGui::GetContentRegionAvail().x, 16.0f);
+                float pvals[3] = { float(phase_pct[0]), float(phase_pct[1]), float(phase_pct[2]) };
+                imgui_stacked_bar(bp, bs, pvals, pcols, 3);
+                ImGui::Dummy(bs);
+                float tot_avg = float(phase_avg[0] + phase_avg[1] + phase_avg[2]);
+                imgui_stacked_legend("##microphases", phase_names, pvals, pcols, 3, tot_avg);
+            }
+
+            ImGui::Separator();
+            ImGui::Text("Profiling");
+            {
+                static const PassTimer* timers[] = {
+                    &t_geo, &t_refit, &t_direct, &t_micro, &t_display, &t_pointcloud, &t_imgui, &t_frame
+                };
+                static const ImU32 colors[] = {
+                    IM_COL32(100,180,255,255), IM_COL32(255,120,100,255), IM_COL32(255,200,60,255),
+                    IM_COL32(100,220,120,255), IM_COL32(180,130,255,255), IM_COL32(255,160,200,255),
+                    IM_COL32(120,220,220,255), IM_COL32(200,200,200,255)
+                };
+                static const char* names[] = {
+                    "geo", "refit", "direct", "micro", "display", "pointcloud", "imgui", "frame"
+                };
+                constexpr int NT = sizeof(timers) / sizeof(timers[0]);
+                float total = timers[NT-1]->disp_cpu();
+                float bar_vals[NT];
+                for (int i = 0; i < NT; ++i)
+                    bar_vals[i] = (i < NT-1) ? float(timers[i]->disp_gpu()) : float(timers[i]->disp_cpu());
+
+                ImVec2 bp = ImGui::GetCursorScreenPos();
+                ImVec2 bs(ImGui::GetContentRegionAvail().x, 20.0f);
+                imgui_stacked_bar(bp, bs, bar_vals, colors, NT);
+                ImGui::Dummy(bs);
+                imgui_stacked_legend("##proflegend", names, bar_vals, colors, NT, total);
+            }
+
             ImGui::End();
         }
         gui.render();
+        t_imgui.end();
+        t_frame.end();
+
+        // Readback all timers
+        t_refit.readback();
+        t_direct.readback();
+        t_micro.readback();
+        t_display.readback();
+        t_pointcloud.readback();
+        t_frame.readback();
+        t_imgui.readback();
+
+        if (now - win_start >= 0.5) {
+            t_refit.flush_window();
+            t_direct.flush_window();
+            t_micro.flush_window();
+            t_display.flush_window();
+            t_pointcloud.flush_window();
+            t_frame.flush_window();
+            t_imgui.flush_window();
+            win_start = now;
+        }
 
         window.swap_buffers();
         window.poll_events();
