@@ -364,22 +364,28 @@ layout(binding = 0) uniform sampler2D gbuf_pos;
 layout(binding = 1) uniform sampler2D gbuf_nrm;
 layout(binding = 2) uniform sampler2D gbuf_alb;
 
+layout(std430, binding = 2) readonly buffer Alb     { vec4 palb[];     };
 layout(std430, binding = 6) readonly buffer Spheres { vec4 sphere_buf[]; };
 layout(std430, binding = 8) readonly buffer Rad     { vec4 rad_buf[];    };
 
 layout(binding = 0, rgba16f) writeonly uniform image2D u_output;
+layout(binding = 1, rgba16f) writeonly uniform image2D u_debug_img;
 
 uniform uint u_num_leaves;
 uniform ivec2 u_screen_size;
 uniform uint u_micro_size;
 uniform uint u_m_valid;
+uniform uint u_scale;
+uniform ivec2 u_debug_pixel;
 
 #define STACK_SIZE 32
 
 shared vec3 s_contribs[64];
 
 void main() {
-    ivec2 pixel = ivec2(gl_WorkGroupID.xy);
+    ivec2 pixel_lr = ivec2(gl_WorkGroupID.xy);
+    ivec2 pixel = pixel_lr * int(u_scale);
+
     if (pixel.x >= u_screen_size.x || pixel.y >= u_screen_size.y) return;
 
     ivec2 local = ivec2(gl_LocalInvocationID.xy);
@@ -393,7 +399,9 @@ void main() {
     barrier();
 
     if (dot(pos, pos) < 1e-6) {
-        if (lid == 0u) imageStore(u_output, pixel, vec4(0.0));
+        if (lid == 0u) imageStore(u_output, pixel_lr, vec4(0.0));
+        if (u_debug_pixel.x >= 0 && pixel_lr == u_debug_pixel)
+            imageStore(u_debug_img, local, vec4(0.0));
         return;
     }
 
@@ -449,10 +457,16 @@ void main() {
         }
     }
 
-    if (valid && closest_node > 0u) {
-        s_contribs[lid] = rad_buf[closest_node].rgb;
+    vec3 contrib = vec3(0.0);
+    if (valid && closest_t < 1e29) {
+        contrib = palb[closest_node].rgb * rad_buf[closest_node].rgb;
     }
 
+    if (u_debug_pixel.x >= 0 && pixel_lr == u_debug_pixel) {
+        imageStore(u_debug_img, local, vec4(contrib, 1.0));
+    }
+
+    s_contribs[lid] = contrib;
     barrier();
 
     if (lid == 0u) {
@@ -461,7 +475,7 @@ void main() {
             sum += s_contribs[i];
         }
         vec3 indirect = u_m_valid > 0u ? alb * sum / float(u_m_valid) : vec3(0.0);
-        imageStore(u_output, pixel, vec4(indirect, 1.0));
+        imageStore(u_output, pixel_lr, vec4(indirect, 1.0));
     }
 }
 )";
@@ -532,8 +546,8 @@ void camera_control(gfx::Window& w, gfx::Camera& cam, float dt, bool allow, bool
     glm::vec3 vel(0.0f);
     if (w.key_down(gfx::Key::w)) vel += fwd;
     if (w.key_down(gfx::Key::s)) vel -= fwd;
-    if (w.key_down(gfx::Key::a)) vel += right;
-    if (w.key_down(gfx::Key::d)) vel -= right;
+    if (w.key_down(gfx::Key::a)) vel -= right;
+    if (w.key_down(gfx::Key::d)) vel += right;
     if (w.key_down(gfx::Key::space)) vel.y += 1;
     if (w.key_down(gfx::Key::shift)) vel.y -= 1;
     if (glm::length(vel) > 0.0f) vel = glm::normalize(vel) * speed;
@@ -1263,15 +1277,26 @@ int main() {
     create_gbuffer(gbuf, window.framebuffer_width(), window.framebuffer_height());
 
     // --- Indirect illumination texture (Stage E) ---
+    int micro_res_scale = 4;
     gl::Texture indirect_tex{gl::TextureType::tex_2d};
     auto create_indirect_tex = [&](int w, int h) {
-        indirect_tex.image_2d(0, GL_RGBA16F, w, h, GL_RGBA, GL_FLOAT, nullptr, 1);
-        indirect_tex.parameter(GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        indirect_tex.parameter(GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        int rw = std::max(1, w / micro_res_scale);
+        int rh = std::max(1, h / micro_res_scale);
+        indirect_tex.image_2d(0, GL_RGBA16F, rw, rh, GL_RGBA, GL_FLOAT, nullptr, 1);
+        indirect_tex.parameter(GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        indirect_tex.parameter(GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         indirect_tex.parameter(GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         indirect_tex.parameter(GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     };
     create_indirect_tex(window.framebuffer_width(), window.framebuffer_height());
+
+    // --- Debug micro-buffer texture (8×8) ---
+    gl::Texture debug_tex{gl::TextureType::tex_2d};
+    debug_tex.image_2d(0, GL_RGBA16F, 8, 8, GL_RGBA, GL_FLOAT, nullptr, 1);
+    debug_tex.parameter(GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    debug_tex.parameter(GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    debug_tex.parameter(GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    debug_tex.parameter(GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
     // --- Fullscreen triangle VAO ---
     gl::VertexArray fsq_vao;
@@ -1301,6 +1326,8 @@ int main() {
     bool run_micro_render = true;
     float micro_ms = 0.0f;
     int micro_size = 8;
+    bool show_micro_debug = false;
+    int debug_pixel_x = -1, debug_pixel_y = -1;
 
     double last = window.time();
 
@@ -1314,9 +1341,11 @@ int main() {
         cam.set_aspect(float(window.framebuffer_width()) / float(window.framebuffer_height()));
 
         int fw = window.framebuffer_width(), fh = window.framebuffer_height();
-        if (fw != gbuf.w || fh != gbuf.h) {
+        static int prev_scale = micro_res_scale;
+        if (fw != gbuf.w || fh != gbuf.h || micro_res_scale != prev_scale) {
             create_gbuffer(gbuf, fw, fh);
             create_indirect_tex(fw, fh);
+            prev_scale = micro_res_scale;
         }
 
         glm::mat4 vp = cam.view_projection();
@@ -1430,14 +1459,20 @@ int main() {
         if (run_micro_render) {
             auto t0m = std::chrono::steady_clock::now();
 
+            int rw = std::max(1, fw / micro_res_scale);
+            int rh = std::max(1, fh / micro_res_scale);
+
             indirect_tex.bind_image(0, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
 
             gbuf.position.bind(0);
             gbuf.normal.bind(1);
             gbuf.albedo.bind(2);
 
+            palb_buf.bind_base(2);
             sphere_buf.bind_base(6);
             radiance_buf.bind_base(8);
+
+            debug_tex.bind_image(1, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
 
             micro_render_prog.use();
             loc = micro_render_prog.uniform_location("u_num_leaves");
@@ -1446,6 +1481,8 @@ int main() {
             if (loc >= 0) glProgramUniform2i(micro_render_prog.handle(), loc, fw, fh);
             loc = micro_render_prog.uniform_location("u_micro_size");
             if (loc >= 0) glProgramUniform1ui(micro_render_prog.handle(), loc, GLuint(micro_size));
+            loc = micro_render_prog.uniform_location("u_scale");
+            if (loc >= 0) glProgramUniform1ui(micro_render_prog.handle(), loc, GLuint(micro_res_scale));
 
             int m_valid = 0;
             for (int ly = 0; ly < micro_size; ly++) {
@@ -1465,8 +1502,18 @@ int main() {
             loc = micro_render_prog.uniform_location("gbuf_alb");
             if (loc >= 0) glProgramUniform1i(micro_render_prog.handle(), loc, 2);
 
-            gl::dispatch_compute(fw, fh, 1);
+            if (show_micro_debug && debug_pixel_x >= 0) {
+                loc = micro_render_prog.uniform_location("u_debug_pixel");
+                if (loc >= 0) glProgramUniform2i(micro_render_prog.handle(), loc,
+                    debug_pixel_x / micro_res_scale, debug_pixel_y / micro_res_scale);
+            } else {
+                loc = micro_render_prog.uniform_location("u_debug_pixel");
+                if (loc >= 0) glProgramUniform2i(micro_render_prog.handle(), loc, -1, -1);
+            }
+
+            gl::dispatch_compute(rw, rh, 1);
             glMemoryBarrier(GL_ALL_BARRIER_BITS);
+            glFinish();
 
             auto t1m = std::chrono::steady_clock::now();
             micro_ms = float(std::chrono::duration<double, std::milli>(t1m - t0m).count());
@@ -1664,7 +1711,21 @@ int main() {
                 ImGui::Text("  %.2f ms", micro_ms);
             }
             ImGui::Text("  Micro-res: %dx%d (%d valid disk px)", micro_size, micro_size, micro_size * micro_size);
+            ImGui::SliderInt("Render scale", &micro_res_scale, 1, 8);
+            ImGui::Text("  Internal: %dx%d", std::max(1, fw / micro_res_scale), std::max(1, fh / micro_res_scale));
             ImGui::Text("  Select 'Indirect' in G-Buffer View to visualize");
+            ImGui::Checkbox("Debug micro-buffer", &show_micro_debug);
+            if (show_micro_debug) {
+                auto& io = ImGui::GetIO();
+                debug_pixel_x = int(io.MousePos.x);
+                debug_pixel_y = int(io.MousePos.y);
+                ImGui::Text("  Hover pixel: (%d, %d)", debug_pixel_x, debug_pixel_y);
+                if (debug_pixel_x >= 0 && debug_pixel_y >= 0) {
+                    ImGui::Text("  Leaf albedo (R/G/B):");
+                    ImVec2 sz(192, 192);
+                    ImGui::Image((ImTextureID)(intptr_t)debug_tex.handle(), sz);
+                }
+            }
 
             ImGui::End();
         }
