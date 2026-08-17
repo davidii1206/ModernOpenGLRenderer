@@ -1559,7 +1559,7 @@ int main() {
             if (show_micro_debug && debug_pixel_x >= 0) {
                 loc = micro_render_prog.uniform_location("u_debug_pixel");
                 if (loc >= 0) glProgramUniform2i(micro_render_prog.handle(), loc,
-                    debug_pixel_x / micro_res_scale, debug_pixel_y / micro_res_scale);
+                    debug_pixel_x / micro_res_scale, (fh - 1 - debug_pixel_y) / micro_res_scale);
             } else {
                 loc = micro_render_prog.uniform_location("u_debug_pixel");
                 if (loc >= 0) glProgramUniform2i(micro_render_prog.handle(), loc, -1, -1);
