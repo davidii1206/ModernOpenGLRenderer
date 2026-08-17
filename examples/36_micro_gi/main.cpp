@@ -1465,7 +1465,7 @@ int main() {
             loc = micro_render_prog.uniform_location("gbuf_alb");
             if (loc >= 0) glProgramUniform1i(micro_render_prog.handle(), loc, 2);
 
-            gl::dispatch_compute((fw + 7) / 8, (fh + 7) / 8, 1);
+            gl::dispatch_compute(fw, fh, 1);
             glMemoryBarrier(GL_ALL_BARRIER_BITS);
 
             auto t1m = std::chrono::steady_clock::now();
