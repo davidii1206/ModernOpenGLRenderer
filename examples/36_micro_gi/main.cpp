@@ -35,6 +35,20 @@ constexpr int LOG2N = 14;
 constexpr int N = 1 << LOG2N;       // 16384
 constexpr int BEST_K = 32;
 constexpr float COVERAGE = 1.4f;
+constexpr float LOD_THRESHOLD = 0.15f;
+
+// Morton code helpers for space-filling curve dispatch
+uint32_t part1by2(uint32_t x) {
+    x &= 0x000003ff;
+    x = (x | (x << 16)) & 0x000f000f;
+    x = (x | (x << 8)) & 0x00f000f0;
+    x = (x | (x << 4)) & 0x0c0c0c0c;
+    x = (x | (x << 2)) & 0x22222222;
+    return x;
+}
+uint32_t morton2d(uint32_t x, uint32_t y) {
+    return part1by2(x) | (part1by2(y) << 1);
+}
 
 // ===========================================================================
 // Shaders
@@ -279,6 +293,52 @@ void main() {
 )";
 
 // ===========================================================================
+// Stage C+ — Sphere/cone reorder: heap order → DFS order
+// ===========================================================================
+
+const char* sphere_reorder_cs = R"(
+#version 460 core
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 6) readonly buffer SphHeap  { vec4 sph_heap[];  };
+layout(std430, binding = 7) readonly buffer ConeHeap { vec4 cone_heap[]; };
+layout(std430, binding = 16) writeonly buffer SphDfs  { vec4 sph_dfs[];  };
+layout(std430, binding = 17) writeonly buffer ConeDfs { vec4 cone_dfs[]; };
+layout(std430, binding = 21) readonly buffer N2O     { uint new_to_old[]; };
+
+uniform uint u_tree_size;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= u_tree_size) return;
+    uint h = new_to_old[i];
+    sph_dfs[i]  = sph_heap[h];
+    cone_dfs[i] = cone_heap[h];
+}
+)";
+
+// ===========================================================================
+// Stage D — Radiance reorder: heap order → DFS order
+// ===========================================================================
+
+const char* radiance_reorder_cs = R"(
+#version 460 core
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 8) readonly buffer RadHeap { vec4 rad_heap[]; };
+layout(std430, binding = 20) writeonly buffer RadDfs { vec4 rad_dfs[]; };
+layout(std430, binding = 21) readonly buffer N2O    { uint new_to_old[]; };
+
+uniform uint u_tree_size;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= u_tree_size) return;
+    rad_dfs[i] = rad_heap[new_to_old[i]];
+}
+)";
+
+// ===========================================================================
 // Stage D — Direct lighting (emissive point sources) + radiance pull-up
 // ===========================================================================
 
@@ -331,6 +391,99 @@ void main() {
 }
 )";
 
+// ===========================================================================
+// Stage D — Hierarchical multi-bounce gather (DFS traversal, O(N log N))
+// ===========================================================================
+
+const char* hierarchical_bounce_cs = R"(
+#version 460 core
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer PGeom    { vec4 pgeom[];    };
+layout(std430, binding = 1) readonly buffer PNrm     { vec4 pnrm[];     };
+layout(std430, binding = 2) readonly buffer PAlb     { vec4 palb[];     };
+layout(std430, binding = 3) readonly buffer PEmit    { vec4 pemit[];    };
+layout(std430, binding = 16) readonly buffer Spheres { vec4 sph[];      };
+layout(std430, binding = 17) readonly buffer Cones   { vec4 cone[];     };
+layout(std430, binding = 18) readonly buffer LChild  { uint left_ch[];  };
+layout(std430, binding = 19) readonly buffer RChild  { uint right_ch[]; };
+layout(std430, binding = 20) readonly buffer RadDfs  { vec4 rad_dfs[];  };
+layout(std430, binding = 10) writeonly buffer RadDst { vec4 rad_dst[];  };
+
+uniform uint u_num_leaves;
+uniform uint u_tree_offset;
+uniform float u_leaf_area;
+uniform float u_emissive_gain;
+
+const float PI = 3.14159265358979;
+const uint STACK_DEPTH = 32;
+
+void main() {
+    uint recv = gl_GlobalInvocationID.x;
+    if (recv >= u_num_leaves) return;
+
+    vec3 pos = pgeom[recv].xyz;
+    vec3 nrm = normalize(pnrm[recv].xyz);
+    vec3 alb = palb[recv].rgb;
+    vec3 emissive = pemit[recv].rgb * u_emissive_gain;
+
+    vec3 incoming = vec3(0.0);
+
+    uint stack[STACK_DEPTH];
+    int sp = 0;
+    stack[sp++] = 0u;
+
+    while (sp > 0) {
+        uint node = stack[--sp];
+
+        vec3 center = sph[node].xyz;
+        float radius = sph[node].w;
+        vec3 to_center = center - pos;
+        float dist2 = dot(to_center, to_center);
+
+        if (dot(to_center, nrm) < 0.0) continue;
+
+        vec4 cn = cone[node];
+        float dot_oc_axis = dot(to_center, cn.xyz);
+        if (dot_oc_axis > 0.0 && cn.w > 0.0 &&
+            dot_oc_axis * dot_oc_axis > dist2 * (1.0 - cn.w * cn.w))
+            continue;
+
+        float cz = dot(to_center, nrm);
+        if (cz <= 0.0) continue;
+
+        bool is_leaf = (left_ch[node] == 0xFFFFFFFFu);
+
+        if (is_leaf) {
+            if (dist2 < u_leaf_area * 0.25) continue;
+            vec3 wi = to_center / sqrt(dist2);
+            vec3 leaf_nrm = cone[node].xyz;
+            float cos_recv = max(dot(nrm, wi), 0.0);
+            float cos_emit = max(dot(leaf_nrm, -wi), 0.0);
+            incoming += rad_dfs[node].rgb * cos_emit * cos_recv / dist2 * u_leaf_area;
+        } else {
+            float angular_size = radius / max(sqrt(dist2), 1e-10);
+            if (angular_size < 0.15) {
+                if (dist2 < 1e-8) continue;
+                vec3 wi = to_center / sqrt(dist2);
+                vec3 node_axis = cn.xyz;
+                float cos_recv = max(dot(nrm, wi), 0.0);
+                float cos_emit = max(dot(node_axis, -wi), 0.0);
+                float node_area = rad_dfs[node].w;
+                incoming += rad_dfs[node].rgb * cos_emit * cos_recv / dist2 * node_area;
+            } else {
+                if (sp + 2 <= STACK_DEPTH) {
+                    stack[sp++] = left_ch[node];
+                    stack[sp++] = right_ch[node];
+                }
+            }
+        }
+    }
+
+    rad_dst[u_tree_offset + recv] = vec4(emissive + alb / PI * incoming, u_leaf_area);
+}
+)";
+
 const char* radiance_pullup_cs = R"(
 #version 460 core
 layout(local_size_x = 256) in;
@@ -369,10 +522,14 @@ layout(local_size_x = 8, local_size_y = 8) in;
 layout(binding = 0) uniform sampler2D gbuf_pos;
 layout(binding = 1) uniform sampler2D gbuf_nrm;
 layout(binding = 2) uniform sampler2D gbuf_alb;
+layout(binding = 3) uniform sampler2D u_warp_tex;
 
-layout(std430, binding = 6) readonly buffer Spheres { vec4 sphere_buf[]; };
-layout(std430, binding = 7) readonly buffer Cones   { vec4 cone_buf[];   };
-layout(std430, binding = 8) readonly buffer Rad     { vec4 rad_buf[];    };
+layout(std430, binding = 16) readonly buffer Spheres { vec4 sphere_buf[]; };
+layout(std430, binding = 17) readonly buffer Cones   { vec4 cone_buf[];   };
+layout(std430, binding = 18) readonly buffer LChild  { uint left_child[];  };
+layout(std430, binding = 19) readonly buffer RChild  { uint right_child[]; };
+layout(std430, binding = 20) readonly buffer Rad     { vec4 rad_buf[];    };
+layout(std430, binding = 22) readonly buffer MortonTbl { uvec4 morton_tbl[]; };
 
 layout(std430, binding = 10) writeonly buffer DebugPos { vec4 debug_pos[]; };
 layout(std430, binding = 11) writeonly buffer DebugCol { vec4 debug_col[]; };
@@ -395,15 +552,22 @@ uniform ivec2 u_debug_pixel;
 uniform float u_self_eps2;
 uniform int u_low_res_w;
 uniform int u_low_res_h;
+uniform float u_roughness;
+uniform vec3 u_camera_pos;
+uniform uint u_jitter_seed;
 
 #define NPHASES 4
 #define STACK_DEPTH 32
+#define POST_LIST_CAP 16
 
 void main() {
     ivec2 local = ivec2(gl_LocalInvocationID.xy);
     uint lid = uint(local.x) + uint(local.y) * 8u;
 
-    ivec2 pixel_lr = ivec2(gl_WorkGroupID.xy) * 8 + local;
+    // Space-filling curve dispatch: map workgroup index → tile via Morton table
+    uvec4 morton_entry = morton_tbl[gl_WorkGroupID.x];
+    ivec2 tile = ivec2(morton_entry.y, morton_entry.z);
+    ivec2 pixel_lr = tile * 8 + local;
 
     if (pixel_lr.x >= u_low_res_w || pixel_lr.y >= u_low_res_h) return;
 
@@ -413,9 +577,16 @@ void main() {
     uint g_idx = uint(pixel_lr.x) + uint(pixel_lr.y) * uint(u_low_res_w);
     uint base = g_idx * NPHASES;
 
-    vec3 pos = texelFetch(gbuf_pos, pixel, 0).xyz;
-    vec3 nrm = normalize(texelFetch(gbuf_nrm, pixel, 0).xyz);
-    vec3 alb = texelFetch(gbuf_alb, pixel, 0).rgb;
+    // Jittered gather point within tile for bilateral upsample (Stage H)
+    uint seed = u_jitter_seed + g_idx * 2654435761u;
+    float jx = float(seed % 65536u) / 65536.0 * float(u_scale);
+    float jy = float((seed / 65536u) % 65536u) / 65536.0 * float(u_scale);
+    ivec2 pixel_sample = pixel_lr * int(u_scale) + ivec2(int(jx), int(jy));
+    pixel_sample = min(pixel_sample, ivec2(u_screen_size) - 1);
+
+    vec3 pos = texelFetch(gbuf_pos, pixel_sample, 0).xyz;
+    vec3 nrm = normalize(texelFetch(gbuf_nrm, pixel_sample, 0).xyz);
+    vec3 alb = texelFetch(gbuf_alb, pixel_sample, 0).rgb;
 
     if (dot(pos, pos) < 1e-6) {
         imageStore(u_output, pixel_lr, vec4(0.0));
@@ -430,6 +601,14 @@ void main() {
     vec3 up = abs(nrm.y) < 0.999 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
     vec3 T = normalize(cross(up, nrm));
     vec3 B = cross(nrm, T);
+
+    // BRDF importance warping: blend tangent-frame pole toward reflection direction
+    vec3 view_dir = normalize(u_camera_pos - pos);
+    vec3 refl_dir = reflect(-view_dir, nrm);
+    vec3 warp_dir = normalize(mix(nrm, refl_dir, 1.0 - u_roughness));
+    vec3 up_w = abs(warp_dir.y) < 0.999 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    vec3 Tw = normalize(cross(up_w, warp_dir));
+    vec3 Bw = cross(warp_dir, Tw);
 
     float half_ms = float(u_micro_size) * 0.5;
     float ms_f = float(u_micro_size);
@@ -446,7 +625,11 @@ void main() {
         my_node[i] = 0u;
     }
 
-    // ---- Per-thread iterative DFS (no shared state, no barriers) ----
+    // ---- Stage F: Post-traversal leaf list for ray-disc fallback ----
+    uint post_list[POST_LIST_CAP];
+    uint post_count = 0u;
+
+    // ---- Per-thread iterative DFS using DFS-ordered BVH (no shared state, no barriers) ----
     uint my_stack[STACK_DEPTH];
     int  my_sp = 0;
     my_stack[my_sp++] = 0u;
@@ -480,25 +663,29 @@ void main() {
         float distSafe2 = max(dist2, 1e-10);
         float invDist = inversesqrt(distSafe2);
 
-        if (distSafe2 < u_self_eps2) continue;
-
-        float dx = dot(to_center, T) * invDist;
-        float dy = dot(to_center, B) * invDist;
-        float cosTheta = cz * invDist;
+        float dx = dot(to_center, Tw) * invDist;
+        float dy = dot(to_center, Bw) * invDist;
+        float cosTheta = dot(to_center, warp_dir) * invDist;
 
         float px_f = (dx + 1.0) * half_ms;
         float py_f = (dy + 1.0) * half_ms;
 
         float angularRadius = radius * invDist;
-        float r_proj = angularRadius * cosTheta * half_ms;
+        float r_proj = min(angularRadius * half_ms, half_ms);
 
         if (px_f + r_proj < 0.0 || px_f - r_proj >= ms_f ||
             py_f + r_proj < 0.0 || py_f - r_proj >= ms_f)
             continue;
 
-        bool is_leaf = node >= (u_num_leaves - 1u);
+        // DFS-ordered leaf check: leaf has no children
+        bool is_leaf = (left_child[node] == 0xFFFFFFFFu);
         if (is_leaf || r_proj <= 0.5) {
             float dist = sqrt(dist2);
+
+            // Self-epsilon: only skip individual LEAVES too close to receiver,
+            // NOT internal BVH nodes (which would cull entire subtrees).
+            if (is_leaf && dist2 < u_self_eps2) continue;
+
             int ms = int(u_micro_size);
             int ir = max(1, int(ceil(r_proj)));
             int px_i = int(px_f);
@@ -522,23 +709,84 @@ void main() {
                     }
                 }
             }
+
+            // Stage F: collect leaves into post-traversal list
+            if (is_leaf && post_count < POST_LIST_CAP) {
+                post_list[post_count++] = node;
+            }
         } else {
-            uint left  = 2u * node + 1u;
-            uint right = 2u * node + 2u;
+            // DFS-ordered children via explicit child-pointer arrays
+            uint lc = left_child[node];
+            uint rc = right_child[node];
             if (my_sp + 2 <= STACK_DEPTH) {
-                my_stack[my_sp++] = left;
-                my_stack[my_sp++] = right;
+                my_stack[my_sp++] = lc;
+                my_stack[my_sp++] = rc;
             }
         }
     }
 
     prof_data[base + 1] = uint(clockARB());
 
-    // ---- Read radiance for each micro-pixel's closest surfel ----
+    // ---- Stage F: Ray-disc intersection for unresolved micro-pixels ----
+    // For any micro-pixel not hit by rasterization, ray-cast against collected leaves.
+    for (uint i = 0u; i < micro_total; i++) {
+        if (my_node[i] > 0u) continue;  // already resolved
+
+        // Reconstruct ray direction from micro-pixel center via warp table
+        float mu = (float(i % uint(u_micro_size)) + 0.5 - half_ms) / half_ms;
+        float mv = (float(i / uint(u_micro_size)) + 0.5 - half_ms) / half_ms;
+        vec2 warp_uv = vec2(mu, mv) * 0.5 + 0.5;
+        vec3 warp_dir_tan = texture(u_warp_tex, warp_uv).xyz;
+        vec3 ray_dir = normalize(Tw * warp_dir_tan.x + Bw * warp_dir_tan.y + warp_dir * warp_dir_tan.z);
+
+        for (uint li = 0u; li < post_count; li++) {
+            uint lnode = post_list[li];
+            vec4 lsph = sphere_buf[lnode];
+            vec3 lc = lsph.xyz;
+            float lr = lsph.w;
+
+            // Ray-sphere intersection
+            vec3 oc = pos - lc;
+            float b = dot(oc, ray_dir);
+            float c = dot(oc, oc) - lr * lr;
+            float disc = b * b - c;
+            if (disc < 0.0) continue;
+
+            float t = -b - sqrt(disc);
+            if (t < 0.0) t = -b + sqrt(disc);
+            if (t < 0.0) continue;
+
+            vec3 hit = pos + ray_dir * t;
+
+            // Oriented disc test: project onto plane, check radius
+            vec4 lc_data = cone_buf[lnode];
+            vec3 leaf_nrm = lc_data.xyz;
+            float cosHalf = lc_data.w;
+            float hdotn = dot(hit - lc, leaf_nrm);
+            if (hdotn < 0.0) continue;
+            vec3 proj = (hit - lc) - leaf_nrm * hdotn;
+            if (dot(proj, proj) > lr * lr) continue;
+
+            // Self-epsilon
+            if (t * t < u_self_eps2) continue;
+
+            if (t < my_depth[i]) {
+                my_depth[i] = t;
+                my_node[i] = lnode;
+            }
+        }
+    }
+
+    // ---- Read radiance for each micro-pixel's closest surfel, with Jacobian weighting ----
     vec3 sum = vec3(0.0);
     for (uint i = 0u; i < micro_total; i++) {
-        if (my_node[i] > 0u)
-            sum += rad_buf[my_node[i]].rgb;
+        if (my_node[i] > 0u) {
+            float mu = (float(i % uint(u_micro_size)) + 0.5 - half_ms) / half_ms;
+            float mv = (float(i / uint(u_micro_size)) + 0.5 - half_ms) / half_ms;
+            vec2 warp_uv = vec2(mu, mv) * 0.5 + 0.5;
+            float jacobian = texture(u_warp_tex, warp_uv).w;
+            sum += rad_buf[my_node[i]].rgb * jacobian;
+        }
     }
 
     prof_data[base + 2] = uint(clockARB());
@@ -550,7 +798,14 @@ void main() {
             debug_col[i] = vec4(r, 1.0);
             debug_pos[i] = my_node[i] > 0u ? vec4(sphere_buf[my_node[i]].xyz, 1.0) : vec4(0.0);
         }
-        imageStore(u_debug_img, local, vec4(sum / max(1.0, float(micro_total)), 1.0));
+        // Write all 64 micro-pixel radiance values to the 8×8 debug image
+        for (uint dy = 0u; dy < 8u; dy++) {
+            for (uint dx = 0u; dx < 8u; dx++) {
+                uint mid = dx + dy * 8u;
+                vec3 r = my_node[mid] > 0u ? rad_buf[my_node[mid]].rgb : vec3(0.3, 0.0, 0.0);
+                imageStore(u_debug_img, ivec2(dx, dy), vec4(r, 1.0));
+            }
+        }
     }
 
     // ---- Write output ----
@@ -561,7 +816,78 @@ void main() {
 
     prof_data[base + 3] = uint(clockARB());
 
-    visit_stats[g_idx] = uvec4(visited, max_sp, 0u, 0u);
+    visit_stats[g_idx] = uvec4(visited, max_sp, post_count, 0u);
+}
+)";
+
+// ===========================================================================
+// Stage H — Bilateral upsampling compute shader
+// ===========================================================================
+
+const char* bilateral_upsample_cs = R"(
+#version 460 core
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0, rgba16f) readonly  uniform image2D u_low_res;
+layout(binding = 1, rgba16f) writeonly uniform image2D u_hi_res;
+
+layout(binding = 0) uniform sampler2D gbuf_pos;
+layout(binding = 1) uniform sampler2D gbuf_nrm;
+
+uniform ivec2 u_low_size;
+uniform ivec2 u_hi_size;
+uniform float u_depth_sigma;
+uniform float u_normal_exp;
+
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= u_hi_size.x || px.y >= u_hi_size.y) return;
+
+    vec2 uv = (vec2(px) + 0.5) / vec2(u_hi_size);
+    vec3 pos_hi = texture(gbuf_pos, uv).xyz;
+    vec3 nrm_hi = normalize(texture(gbuf_nrm, uv).xyz);
+
+    // Map full-res pixel to low-res continuous coordinate
+    vec2 low_f = (vec2(px) + 0.5) / vec2(u_hi_size) * vec2(u_low_size) - 0.5;
+    ivec2 base = ivec2(floor(low_f));
+
+    float depth_sq_inv = 1.0 / max(u_depth_sigma * u_depth_sigma, 1e-10);
+    float normal_exp = u_normal_exp;
+
+    vec3  sum  = vec3(0.0);
+    float wsum = 0.0;
+
+    for (int dy = -1; dy <= 2; dy++) {
+        for (int dx = -1; dx <= 2; dx++) {
+            ivec2 lpx = base + ivec2(dx, dy);
+            if (lpx.x < 0 || lpx.x >= u_low_size.x ||
+                lpx.y < 0 || lpx.y >= u_low_size.y) continue;
+
+            vec3 val = imageLoad(u_low_res, lpx).rgb;
+            float brightness = dot(val, vec3(0.2126, 0.7152, 0.0722));
+            if (brightness < 1e-6) continue;
+
+            // Bilateral weights
+            vec2 diff = vec2(lpx) - low_f;
+            float ws = exp(-dot(diff, diff) * 0.5);
+
+            vec2 sample_uv = (vec2(lpx) + 0.5) / vec2(u_low_size);
+            vec3 pos_low = texture(gbuf_pos, sample_uv).xyz;
+            vec3 nrm_low = normalize(texture(gbuf_nrm, sample_uv).xyz);
+
+            float depth_diff = length(pos_hi - pos_low);
+            float wd = exp(-depth_diff * depth_diff * depth_sq_inv);
+
+            float wn = pow(max(0.0, dot(nrm_hi, nrm_low)), normal_exp);
+
+            float w = ws * wd * wn;
+            sum  += val * w;
+            wsum += w;
+        }
+    }
+
+    vec3 result = wsum > 0.0 ? sum / wsum : vec3(0.0);
+    imageStore(u_hi_res, px, vec4(result, 1.0));
 }
 )";
 
@@ -835,6 +1161,64 @@ std::vector<SamplePoint> sample_points_mitchell(
 }
 
 // ===========================================================================
+// Stage G — GGX BRDF importance-sampled warp table generation
+//   For a given roughness alpha, tabulates the inverse CDF of the GGX NDF
+//   to map uniform (u,v) → importance-sampled hemisphere direction + Jacobian.
+//   For Lambertian BRDF: jacobian = (1/pi) * cos(theta_i) / p(omega)
+//   where p(omega) = D(H)*cos(theta_H) / (4 * wo.H)
+// ===========================================================================
+
+void compute_brdf_warp_table(float alpha, int W, std::vector<float>& data) {
+    data.resize(W * W * 4);
+    float a2 = alpha * alpha;
+
+    for (int j = 0; j < W; j++) {
+        for (int i = 0; i < W; i++) {
+            float u = (float(i) + 0.5f) / float(W);
+            float v = (float(j) + 0.5f) / float(W);
+
+            // GGX importance sampling: inverse CDF for polar angle of half-vector
+            float cos_h = std::sqrt((1.0f - u) / (1.0f + (a2 - 1.0f) * u + 1e-10f));
+            float sin_h = std::sqrt(std::max(0.0f, 1.0f - cos_h * cos_h));
+            float phi_h = 2.0f * PI * v;
+
+            // Half-vector in tangent space
+            glm::vec3 H(sin_h * std::cos(phi_h), sin_h * std::sin(phi_h), cos_h);
+
+            // View direction along +Z (tangent space)
+            glm::vec3 Wo(0.0f, 0.0f, 1.0f);
+            float VoH = glm::max(glm::dot(Wo, H), 0.0f);
+
+            // Reflect view direction around half-vector
+            glm::vec3 Wi = 2.0f * VoH * H - Wo;
+
+            // Ensure upper hemisphere
+            if (Wi.z < 0.0f) {
+                Wi = -Wi;
+                H = -H;
+                VoH = glm::max(glm::dot(Wo, H), 0.0f);
+            }
+
+            // GGX NDF: D(H)
+            float d = cos_h * cos_h * (a2 - 1.0f) + 1.0f;
+            float D = a2 / (PI * d * d);
+
+            // Sampling PDF: p(omega) = D(H) * cos(theta_H) / (4 * wo.H)
+            float pdf = D * cos_h / (4.0f * VoH + 1e-10f);
+
+            // For Lambertian BRDF (1/pi), Jacobian = f_r * cos(theta_i) / pdf
+            float jacobian = (1.0f / PI) * glm::max(Wi.z, 0.0f) / (pdf + 1e-10f);
+
+            int idx = (j * W + i) * 4;
+            data[idx + 0] = Wi.x;
+            data[idx + 1] = Wi.y;
+            data[idx + 2] = Wi.z;
+            data[idx + 3] = jacobian;
+        }
+    }
+}
+
+// ===========================================================================
 // Stage B — Tree hierarchy build (recursive median split)
 //   - N must be a power of two
 //   - Leaf j at heap index (N-1)+j
@@ -971,6 +1355,7 @@ struct DfsBvh {
     std::vector<glm::vec4> cone;         // DFS-reordered (tree_size)
     std::vector<uint32_t>  left_child;   // new-index of left child  (0xFFFFFFFF = leaf)
     std::vector<uint32_t>  right_child;  // new-index of right child
+    std::vector<uint32_t>  new_to_old;   // DFS index → heap index mapping
     int tree_size = 0;
 };
 
@@ -983,6 +1368,7 @@ DfsBvh dfs_reorder_bvh(const PointHierarchy& ph) {
     r.cone.resize(tree_size);
     r.left_child.resize(tree_size, 0xFFFFFFFFu);
     r.right_child.resize(tree_size, 0xFFFFFFFFu);
+    r.new_to_old.resize(tree_size);
 
     std::vector<int> old_to_new(tree_size);
     int next = 0;
@@ -996,6 +1382,11 @@ DfsBvh dfs_reorder_bvh(const PointHierarchy& ph) {
         }
     };
     dfs(0);
+
+    // Compute inverse mapping: new_to_old[dfs_idx] = heap_idx
+    for (int i = 0; i < tree_size; i++) {
+        r.new_to_old[old_to_new[i]] = uint32_t(i);
+    }
 
     // Pass 2: copy data into new order, build child pointers
     for (int old_node = 0; old_node < tree_size; old_node++) {
@@ -1401,16 +1792,21 @@ int main() {
     };
     gl::Program leaf_update_prog = make_compute(leaf_update_cs);
     gl::Program tree_refit_prog  = make_compute(tree_refit_cs);
+    gl::Program sph_reorder_prog = make_compute(sphere_reorder_cs);
+    gl::Program rad_reorder_prog = make_compute(radiance_reorder_cs);
     gl::Program direct_light_prog = make_compute(direct_lighting_cs);
+    gl::Program bounce_gather_prog = make_compute(hierarchical_bounce_cs);
     gl::Program radiance_pull_prog = make_compute(radiance_pullup_cs);
     gl::Program micro_render_prog  = make_compute(micro_render_cs);
+    gl::Program bilateral_prog     = make_compute(bilateral_upsample_cs);
     gl::Program sphere_prog      = make_program(sphere_vs, sphere_fs);
     gl::Program debug_surfel_prog = make_program(debug_surfel_vs, debug_surfel_fs);
 
     if (!gbuf_prog.linked() || !display_prog.linked() || !pc_prog.linked() ||
         !leaf_update_prog.linked() || !tree_refit_prog.linked() ||
-        !direct_light_prog.linked() || !radiance_pull_prog.linked() ||
-        !micro_render_prog.linked() || !sphere_prog.linked() ||
+        !sph_reorder_prog.linked() || !rad_reorder_prog.linked() ||
+        !direct_light_prog.linked() || !bounce_gather_prog.linked() || !radiance_pull_prog.linked() ||
+        !micro_render_prog.linked() || !bilateral_prog.linked() || !sphere_prog.linked() ||
         !debug_surfel_prog.linked()) {
         gllib::log(gllib::LogLevel::error, "Shader compilation failed");
         return EXIT_FAILURE;
@@ -1565,6 +1961,19 @@ int main() {
     dfs_left_buf.bind_base(18);
     dfs_right_buf.bind_base(19);
 
+    // --- New_to_old mapping SSBO (binding 21) ---
+    gl::Buffer new_to_old_buf(gl::BufferType::shader, gl::BufferUsage::static_draw);
+    new_to_old_buf.data(dfs_bvh.new_to_old.data(), dfs_bvh.new_to_old.size() * sizeof(uint32_t));
+    new_to_old_buf.bind_base(21);
+
+    // --- DFS-ordered radiance buffer (binding 20) ---
+    gl::Buffer dfs_rad_buf(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);
+    dfs_rad_buf.data(nullptr, size_t(2 * N - 1) * sizeof(glm::vec4));
+    dfs_rad_buf.bind_base(20);
+
+    // --- Morton dispatch table SSBO (binding 22) ---
+    gl::Buffer morton_buf(gl::BufferType::shader, gl::BufferUsage::static_draw);
+
     // --- Stage D: Extract emitter leaf indices + create radiance buffer ---
     std::vector<uint32_t> emitter_indices;
     for (int i = 0; i < N; ++i) {
@@ -1581,6 +1990,12 @@ int main() {
     gl::Buffer radiance_buf(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);
     radiance_buf.data(nullptr, size_t(2 * N - 1) * sizeof(glm::vec4));
     radiance_buf.bind_base(8);
+
+    // Ping-pong buffer for multi-bounce gather
+    gl::Buffer radiance_b_buf(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);
+    radiance_b_buf.data(nullptr, size_t(2 * N - 1) * sizeof(glm::vec4));
+
+    int num_bounces = 2;
 
     float leaf_area = (emitter_indices.empty() || N == 0) ? 0.0f : ph.total_area / float(N);
 
@@ -1609,6 +2024,21 @@ int main() {
     };
     create_indirect_tex(window.framebuffer_width(), window.framebuffer_height());
 
+    // --- Full-res bilateral upsample output texture (Stage H) ---
+    gl::Texture indirect_upsampled_tex{gl::TextureType::tex_2d};
+    auto create_upsampled_tex = [&](int w, int h) {
+        indirect_upsampled_tex.image_2d(0, GL_RGBA16F, w, h, GL_RGBA, GL_FLOAT, nullptr, 1);
+        indirect_upsampled_tex.parameter(GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        indirect_upsampled_tex.parameter(GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        indirect_upsampled_tex.parameter(GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        indirect_upsampled_tex.parameter(GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    };
+    create_upsampled_tex(window.framebuffer_width(), window.framebuffer_height());
+
+    bool use_bilateral_upsample = true;
+    float bilateral_depth_sigma = 0.01f;
+    float bilateral_normal_exp = 32.0f;
+
     // --- Debug micro-buffer texture (8×8) ---
     gl::Texture debug_tex{gl::TextureType::tex_2d};
     debug_tex.image_2d(0, GL_RGBA16F, 8, 8, GL_RGBA, GL_FLOAT, nullptr, 1);
@@ -1616,6 +2046,19 @@ int main() {
     debug_tex.parameter(GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     debug_tex.parameter(GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     debug_tex.parameter(GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    // --- BRDF importance warp table (64×64 RGBA32F) ---
+    // GGX importance-sampled warp: maps (u,v) to hemisphere direction + Jacobian.
+    // For roughness=1 (alpha=1), this degenerates to cosine-weighted hemisphere.
+    gl::Texture warp_tex{gl::TextureType::tex_2d};
+    constexpr int WARP_SIZE = 64;
+    std::vector<float> warp_data(WARP_SIZE * WARP_SIZE * 4);
+    compute_brdf_warp_table(1.0f, WARP_SIZE, warp_data);
+    warp_tex.image_2d(0, GL_RGBA32F, WARP_SIZE, WARP_SIZE, GL_RGBA, GL_FLOAT, warp_data.data(), 1);
+    warp_tex.parameter(GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    warp_tex.parameter(GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    warp_tex.parameter(GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    warp_tex.parameter(GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
     // --- Debug surfel SSBOs (64 samples for micro-buffer overlay) ---
     gl::Buffer debug_pos_buf(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);
@@ -1663,6 +2106,8 @@ int main() {
     bool run_micro_render = true;
     int micro_size = 8;
     float micro_gain = 1.0f;
+    float micro_roughness = 1.0f;
+    float last_roughness = -1.0f;  // track for warp table regeneration
     int tile_size = 2;
     bool show_micro_debug = false;
     uint64_t frame_counter = 0;
@@ -1707,6 +2152,7 @@ int main() {
         if (fw != gbuf.w || fh != gbuf.h || micro_res_scale != prev_scale) {
             create_gbuffer(gbuf, fw, fh);
             create_indirect_tex(fw, fh);
+            create_upsampled_tex(fw, fh);
             prev_scale = micro_res_scale;
         }
 
@@ -1821,6 +2267,68 @@ int main() {
                 gl::dispatch_compute((count + 255) / 256, 1, 1);
                 glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
             }
+
+            float self_eps = 0.5f * ph.leaf_radius;
+
+            // --- Multi-bounce: hierarchical DFS gather (paper Fig. 3 right half) ---
+            // First, reorder heap data → DFS order (sphere/cone don't change, only once)
+            sph_reorder_prog.use();
+            loc_c = sph_reorder_prog.uniform_location("u_tree_size");
+            if (loc_c >= 0) glProgramUniform1ui(sph_reorder_prog.handle(), loc_c, GLuint(2 * N - 1));
+            gl::dispatch_compute((2 * N - 1 + 255) / 256, 1, 1);
+            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+            for (int bounce = 0; bounce < num_bounces; ++bounce) {
+                // Reorder radiance to DFS order
+                rad_reorder_prog.use();
+                loc_c = rad_reorder_prog.uniform_location("u_tree_size");
+                if (loc_c >= 0) glProgramUniform1ui(rad_reorder_prog.handle(), loc_c, GLuint(2 * N - 1));
+                gl::dispatch_compute((2 * N - 1 + 255) / 256, 1, 1);
+                glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+                // Ping-pong: src at binding 8, dst at binding 10
+                bounce_gather_prog.use();
+                loc_c = bounce_gather_prog.uniform_location("u_num_leaves");
+                if (loc_c >= 0) glProgramUniform1ui(bounce_gather_prog.handle(), loc_c, GLuint(N));
+                loc_c = bounce_gather_prog.uniform_location("u_leaf_area");
+                if (loc_c >= 0) glProgramUniform1f(bounce_gather_prog.handle(), loc_c, leaf_area);
+                loc_c = bounce_gather_prog.uniform_location("u_emissive_gain");
+                if (loc_c >= 0) glProgramUniform1f(bounce_gather_prog.handle(), loc_c, emissive_gain);
+                loc_c = bounce_gather_prog.uniform_location("u_self_eps2");
+                if (loc_c >= 0) glProgramUniform1f(bounce_gather_prog.handle(), loc_c, self_eps * self_eps);
+
+                if (bounce % 2 == 0) {
+                    radiance_buf.bind_base(8);
+                    radiance_b_buf.bind_base(10);
+                } else {
+                    radiance_b_buf.bind_base(8);
+                    radiance_buf.bind_base(10);
+                }
+                gl::dispatch_compute((N + 255) / 256, 1, 1);
+                glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+                // Pullup on the destination buffer
+                gl::Buffer& dst_buf = (bounce % 2 == 0) ? radiance_b_buf : radiance_buf;
+                dst_buf.bind_base(8);
+                radiance_pull_prog.use();
+                for (int level = 0; level < LOG2N; ++level) {
+                    uint32_t count = uint32_t(N) >> (level + 1);
+                    if (count == 0) break;
+                    uint32_t level_start = count - 1;
+                    loc_c = radiance_pull_prog.uniform_location("u_count");
+                    if (loc_c >= 0) glProgramUniform1ui(radiance_pull_prog.handle(), loc_c, count);
+                    loc_c = radiance_pull_prog.uniform_location("u_level_start");
+                    if (loc_c >= 0) glProgramUniform1ui(radiance_pull_prog.handle(), loc_c, level_start);
+                    gl::dispatch_compute((count + 255) / 256, 1, 1);
+                    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+                }
+            }
+            // Ensure binding 8 has the final radiance for micro-render
+            if (num_bounces > 0 && (num_bounces % 2 == 1))
+                radiance_b_buf.bind_base(8);
+            else
+                radiance_buf.bind_base(8);
+
             t_direct.end();
         }
 
@@ -1838,10 +2346,40 @@ int main() {
             gbuf.normal.bind(1);
             gbuf.albedo.bind(2);
 
-            palb_buf.bind_base(2);
+            // Regenerate GGX warp table if roughness changed
+            if (std::abs(micro_roughness - last_roughness) > 0.001f) {
+                float alpha = std::max(0.001f, micro_roughness * micro_roughness);
+                compute_brdf_warp_table(alpha, WARP_SIZE, warp_data);
+                warp_tex.image_2d(0, GL_RGBA32F, WARP_SIZE, WARP_SIZE, GL_RGBA, GL_FLOAT, warp_data.data(), 1);
+                last_roughness = micro_roughness;
+            }
+            warp_tex.bind(3);
+
+            // Reorder heap → DFS for micro-render
             sphere_buf.bind_base(6);
             cone_buf.bind_base(7);
-            radiance_buf.bind_base(8);
+            sph_reorder_prog.use();
+            loc = sph_reorder_prog.uniform_location("u_tree_size");
+            if (loc >= 0) glProgramUniform1ui(sph_reorder_prog.handle(), loc, GLuint(2 * N - 1));
+            gl::dispatch_compute((2 * N - 1 + 255) / 256, 1, 1);
+            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+            // Reorder radiance heap → DFS for micro-render
+            // Binding 8 is the final radiance from the bounce loop (or direct lighting)
+            rad_reorder_prog.use();
+            loc = rad_reorder_prog.uniform_location("u_tree_size");
+            if (loc >= 0) glProgramUniform1ui(rad_reorder_prog.handle(), loc, GLuint(2 * N - 1));
+            gl::dispatch_compute((2 * N - 1 + 255) / 256, 1, 1);
+            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+            // Bind DFS-ordered buffers for micro-render
+            dfs_sphere_buf.bind_base(16);
+            dfs_cone_buf.bind_base(17);
+            dfs_left_buf.bind_base(18);
+            dfs_right_buf.bind_base(19);
+            dfs_rad_buf.bind_base(20);
+            morton_buf.bind_base(22);
+            // radiance already in dfs_rad_buf (binding 20) after bounce loop reorder
 
             debug_pos_buf.bind_base(10);
             debug_col_buf.bind_base(11);
@@ -1857,6 +2395,12 @@ int main() {
             visit_stats_buf.bind_base(15);
 
             debug_tex.bind_image(1, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
+
+            // Clear debug tex to black before dispatch so stale data doesn't persist
+            {
+                float zeros[4] = {0, 0, 0, 0};
+                glClearTexImage(debug_tex.handle(), 0, GL_RGBA, GL_FLOAT, zeros);
+            }
 
             micro_render_prog.use();
             loc = micro_render_prog.uniform_location("u_num_leaves");
@@ -1875,11 +2419,10 @@ int main() {
             loc = micro_render_prog.uniform_location("u_low_res_h");
             if (loc >= 0) glProgramUniform1i(micro_render_prog.handle(), loc, rh);
 
-            // Squared threshold below which a node is treated as coincident with
-            // the receiver and skipped (see orthographic-mapping fix above).
-            // Derived from average per-leaf area rather than a fixed world-space
-            // constant, so it scales with scene/point density automatically.
-            float self_eps = 0.5f * std::sqrt(leaf_area / 3.14159265f);
+            // Squared threshold below which a leaf surfel is treated as coincident
+            // with the receiver and skipped.  Use 0.5× the leaf radius — only
+            // prevents exact self-intersection, not neighbor culling.
+            float self_eps = 0.5f * ph.leaf_radius;
             loc = micro_render_prog.uniform_location("u_self_eps2");
             if (loc >= 0) glProgramUniform1f(micro_render_prog.handle(), loc, self_eps * self_eps);
 
@@ -1900,6 +2443,18 @@ int main() {
             if (loc >= 0) glProgramUniform1i(micro_render_prog.handle(), loc, 1);
             loc = micro_render_prog.uniform_location("gbuf_alb");
             if (loc >= 0) glProgramUniform1i(micro_render_prog.handle(), loc, 2);
+            loc = micro_render_prog.uniform_location("u_warp_tex");
+            if (loc >= 0) glProgramUniform1i(micro_render_prog.handle(), loc, 3);
+
+            loc = micro_render_prog.uniform_location("u_roughness");
+            if (loc >= 0) glProgramUniform1f(micro_render_prog.handle(), loc, micro_roughness);
+            loc = micro_render_prog.uniform_location("u_camera_pos");
+            if (loc >= 0) {
+                glm::vec3 cp = cam.position();
+                glProgramUniform3f(micro_render_prog.handle(), loc, cp.x, cp.y, cp.z);
+            }
+            loc = micro_render_prog.uniform_location("u_jitter_seed");
+            if (loc >= 0) glProgramUniform1ui(micro_render_prog.handle(), loc, GLuint(frame_counter));
 
             if (show_micro_debug && debug_pixel_x >= 0) {
                 loc = micro_render_prog.uniform_location("u_debug_pixel");
@@ -1912,7 +2467,30 @@ int main() {
 
             int dispatch_w = (rw + 7) / 8;
             int dispatch_h = (rh + 7) / 8;
-            gl::dispatch_compute(dispatch_w, dispatch_h, 1);
+            int num_workgroups = dispatch_w * dispatch_h;
+
+            // Generate Morton order dispatch table: uvec4(morton_code, tile_x, tile_y, 0)
+            {
+                std::vector<uint32_t> morton_entries(num_workgroups * 4);
+                for (int ty = 0; ty < dispatch_h; ty++) {
+                    for (int tx = 0; tx < dispatch_w; tx++) {
+                        uint32_t mc = morton2d(uint32_t(tx), uint32_t(ty));
+                        int idx = (ty * dispatch_w + tx) * 4;
+                        morton_entries[idx + 0] = mc;
+                        morton_entries[idx + 1] = uint32_t(tx);
+                        morton_entries[idx + 2] = uint32_t(ty);
+                        morton_entries[idx + 3] = 0;
+                    }
+                }
+                // Sort by Morton code for cache-friendly dispatch ordering
+                struct MortonEntry { uint32_t code, tx, ty, pad; };
+                auto* entries = reinterpret_cast<MortonEntry*>(morton_entries.data());
+                std::sort(entries, entries + num_workgroups,
+                    [](const MortonEntry& a, const MortonEntry& b) { return a.code < b.code; });
+                morton_buf.data(morton_entries.data(), num_workgroups * 4 * sizeof(uint32_t));
+            }
+
+            gl::dispatch_compute(num_workgroups, 1, 1);
 
             // Profiling readback: always run for console logging, but
             // only do the expensive glFinish+map when profiling or logging.
@@ -1971,6 +2549,35 @@ int main() {
         }
         t_micro.end();
 
+        // ===================================================================
+        // 1f. Bilateral upsampling (Stage H)
+        // ===================================================================
+        if (run_micro_render && use_bilateral_upsample && micro_res_scale > 1) {
+            glMemoryBarrier(GL_ALL_BARRIER_BITS);
+
+            int rw = std::max(1, fw / micro_res_scale);
+            int rh = std::max(1, fh / micro_res_scale);
+
+            indirect_tex.bind_image(0, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA16F);
+            indirect_upsampled_tex.bind_image(1, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
+
+            gbuf.position.bind(0);
+            gbuf.normal.bind(1);
+
+            bilateral_prog.use();
+            loc = bilateral_prog.uniform_location("u_low_size");
+            if (loc >= 0) glProgramUniform2i(bilateral_prog.handle(), loc, rw, rh);
+            loc = bilateral_prog.uniform_location("u_hi_size");
+            if (loc >= 0) glProgramUniform2i(bilateral_prog.handle(), loc, fw, fh);
+            loc = bilateral_prog.uniform_location("u_depth_sigma");
+            if (loc >= 0) glProgramUniform1f(bilateral_prog.handle(), loc, bilateral_depth_sigma);
+            loc = bilateral_prog.uniform_location("u_normal_exp");
+            if (loc >= 0) glProgramUniform1f(bilateral_prog.handle(), loc, bilateral_normal_exp);
+
+            gl::dispatch_compute((fw + 7) / 8, (fh + 7) / 8, 1);
+            glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT);
+        }
+
     // ===================================================================
         // 2. Display pass — fullscreen triangle showing selected G-buffer target
         // ===================================================================
@@ -1985,7 +2592,10 @@ int main() {
         gl::Texture* targets[] = { &gbuf.albedo, &gbuf.normal, &gbuf.position,
                                     &gbuf.emissive, &gbuf.depth };
         if (view_mode == 5) {
-            indirect_tex.bind(0);
+            if (use_bilateral_upsample && micro_res_scale > 1)
+                indirect_upsampled_tex.bind(0);
+            else
+                indirect_tex.bind(0);
         } else {
             targets[view_mode]->bind(0);
         }
@@ -2175,6 +2785,7 @@ int main() {
             ImGui::Text("  Emitters: %zu / %d", emitter_indices.size(), N);
             ImGui::Text("  Leaf area: %.6f", leaf_area);
             ImGui::SliderFloat("Emissive gain", &emissive_gain, 0.1f, 50.0f, "%.1f");
+            ImGui::SliderInt("Bounces", &num_bounces, 0, 8);
             ImGui::Text("  Switch to 'Radiance' color mode to visualize");
 
             // Stage E — Micro-rendering
@@ -2189,6 +2800,14 @@ int main() {
             ImGui::SliderInt("Render scale", &micro_res_scale, 1, 8);
             ImGui::SliderInt("Tile size", &tile_size, 1, 8);
             ImGui::SliderFloat("Gain", &micro_gain, 0.1f, 20.0f, "%.1f");
+            ImGui::SliderFloat("Roughness", &micro_roughness, 0.0f, 1.0f, "%.2f");
+            if (micro_res_scale > 1) {
+                ImGui::Checkbox("Bilateral upsample", &use_bilateral_upsample);
+                if (use_bilateral_upsample) {
+                    ImGui::SliderFloat("Depth sigma", &bilateral_depth_sigma, 0.001f, 0.5f, "%.3f");
+                    ImGui::SliderFloat("Normal exp", &bilateral_normal_exp, 1.0f, 128.0f, "%.0f");
+                }
+            }
             ImGui::Text("  Internal: %dx%d", std::max(1, fw / micro_res_scale), std::max(1, fh / micro_res_scale));
             ImGui::Text("  Select 'Indirect' in G-Buffer View to visualize");
             ImGui::Checkbox("Debug micro-buffer", &show_micro_debug);
