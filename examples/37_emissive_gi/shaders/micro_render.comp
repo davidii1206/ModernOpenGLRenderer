@@ -1,0 +1,131 @@
+#version 460 core
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D gbuf_pos;
+layout(binding = 1) uniform sampler2D gbuf_nrm;
+layout(binding = 2) uniform sampler2D gbuf_alb;
+
+// Packed leaf records (16 B): .x = pos.xy | radius, .y = pos.z, .z = albedo, .w = normal.
+layout(std430, binding = 4) readonly buffer Leaves { uvec4 leaf_packed[]; };
+// Per-node radiance (RGBA16F); leaf nodes live at [u_rad_offset, u_rad_offset + u_num_leaves).
+layout(std430, binding = 8) readonly buffer Rad { vec4 rad[]; };
+
+// Micro-buffer atlas: one u_micro_size^2 tile per gather point, each texel a packed
+// (depth_q13 << 19) | node index. Cleared to 0xFFFFFFFF on the host; depth-sorted here
+// with imageAtomicMin (smaller depth = closer = wins).
+layout(binding = 1, r32ui) coherent uniform uimage2D u_micro;
+// Low-res gather output.
+layout(binding = 0, rgba16f) writeonly uniform image2D u_indirect;
+
+uniform ivec2 u_screen_size;   // gather grid size
+uniform ivec2 u_full_size;     // full-res G-buffer size (jitter clamp)
+uniform uint u_micro_size;
+uniform uint u_m_valid;
+uniform uint u_scale;
+uniform float u_gain;
+uniform uint u_jitter_seed;
+uniform vec3 u_scene_min;
+uniform vec3 u_scene_size;
+uniform float u_radius_scale;
+uniform uint u_num_leaves;
+uniform uint u_rad_offset;
+
+vec3 dec_leaf_pos(uvec4 L) {
+    uint px = L.x >> 16u;
+    uint py = L.y >> 16u;
+    uint pz = L.y & 0xFFFFu;
+    return u_scene_min + u_scene_size * (vec3(float(px), float(py), float(pz)) / 65535.0);
+}
+float dec_leaf_radius(uvec4 L) {
+    return float(L.x & 0xFFFFu) / 65535.0 * u_radius_scale;
+}
+vec3 dec_leaf_nrm(uvec4 L) {
+    int hi = int(L.w >> 16u);  hi = hi > 32767 ? hi - 65536 : hi;
+    int lo = int(L.w & 0xFFFFu); lo = lo > 32767 ? lo - 65536 : lo;
+    vec2 p = vec2(float(hi), float(lo)) / 32767.0;
+    vec3 n = vec3(p, 1.0 - abs(p.x) - abs(p.y));
+    if (n.z < 0.0) n.xy = (1.0 - abs(vec2(n.y, n.x))) * sign(n.xy);
+    return normalize(n);
+}
+
+void main() {
+    // One thread = one gather point: rasterize all surfels into its micro-buffer
+    // (flat brute-force splat; no hierarchy traversal).
+    ivec2 gather = ivec2(gl_GlobalInvocationID.xy);
+    if (gather.x >= u_screen_size.x || gather.y >= u_screen_size.y) return;
+
+    ivec2 sp = gather * ivec2(int(u_scale));
+    if (u_scale > 1u) {
+        uint seed = u_jitter_seed + uint(gather.x + gather.y * u_screen_size.x) * 2654435761u;
+        float jx = float((seed >> 8) & 0xFFFFu) / 65535.0;
+        float jy = float((seed >> 24) & 0xFFFFu) / 65535.0;
+        sp += ivec2(int(jx * float(u_scale)), int(jy * float(u_scale)));
+        sp = min(sp, u_full_size - 1);
+    }
+    vec3 pos = texelFetch(gbuf_pos, sp, 0).xyz;
+    vec3 nrm = normalize(texelFetch(gbuf_nrm, sp, 0).xyz);
+    vec3 alb = texelFetch(gbuf_alb, sp, 0).rgb;
+
+    if (dot(pos, pos) < 1e-8 || dot(nrm, nrm) < 1e-8) {
+        imageStore(u_indirect, gather, vec4(0.0));
+        return;
+    }
+
+    // Micro camera tangent frame; +n is the view axis.
+    vec3 up = abs(nrm.y) < 0.999 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    vec3 T = normalize(cross(up, nrm));
+    vec3 B = cross(nrm, T);
+    float half_ms = float(u_micro_size) * 0.5;
+
+    ivec2 tile = gather * ivec2(int(u_micro_size));
+    int m = int(u_micro_size) - 1;
+
+    // Splat every leaf into the disk (tangent-plane) projection, hardware-style
+    // depth sort via atomicMin on the packed (depth | node) key.
+    for (uint i = 0u; i < u_num_leaves; ++i) {
+        uvec4 L = leaf_packed[i];
+        vec3 d = dec_leaf_pos(L) - pos;
+        float lr = dec_leaf_radius(L);
+        // Plane bias: skip the gather surface's own leaves (grazing, ~zero height
+        // above the tangent plane). Without this they clobber the whole tile at
+        // near-zero depth with black radiance.
+        if (dot(d, nrm) <= lr) continue;
+
+        float d2 = dot(d, d);
+        if (d2 < 1e-10) continue;
+        float dist = sqrt(d2);
+        vec3 dir = d / dist;
+        // Backface cull (parity with the old normal-cone test).
+        if (dot(dir, dec_leaf_nrm(L)) >= 0.0) continue;
+
+        // Disk (orthographic/sin) projection, radius 1 at the hemisphere rim.
+        float ux = dot(dir, T);
+        float vy = dot(dir, B);
+        if (ux * ux + vy * vy > 1.0) continue;
+
+        // Projected footprint of the surfel disk (round, sub-pixel for typical leaves).
+        int pr = clamp(int(0.5 + lr / dist * half_ms), 0, m);
+        int px = clamp(int((ux + 1.0) * half_ms), 0, m);
+        int py = clamp(int((vy + 1.0) * half_ms), 0, m);
+
+        uint qd = min(uint(dist * 1024.0 + 0.5), 8191u);
+        uint key = (qd << 19) | ((u_rad_offset + i) & 0x7FFFFu);
+
+        for (int sy = max(0, py - pr); sy <= min(m, py + pr); ++sy)
+            for (int sx = max(0, px - pr); sx <= min(m, px + pr); ++sx)
+                imageAtomicMin(u_micro, tile + ivec2(sx, sy), key);
+    }
+
+    // Convolve the tile (cosine disk mapping cancels the BRDF weight).
+    vec3 indir = vec3(0.0);
+    for (uint y = 0u; y < u_micro_size; ++y)
+        for (uint x = 0u; x < u_micro_size; ++x) {
+            float uu = (float(x) + 0.5) / half_ms - 1.0;
+            float vv = (float(y) + 0.5) / half_ms - 1.0;
+            if (uu * uu + vv * vv > 1.0) continue;
+            uint key = imageLoad(u_micro, tile + ivec2(x, y)).x;
+            if (key == 0xFFFFFFFFu) continue;
+            indir += alb * rad[key & 0x7FFFFu].rgb * u_gain / float(u_m_valid);
+        }
+    imageStore(u_indirect, gather, vec4(indir, 1.0));
+}

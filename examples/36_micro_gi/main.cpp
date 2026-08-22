@@ -1,10 +1,13 @@
-// Example 36 — Micro Rendering: Stage A+B
+// Example 36 — Micro Rendering: Stage A+B (+C/D/E)
 //
 // Stage A: G-buffer geometry pass (position, normal, albedo, emissive, depth)
 //          with fullscreen display and ImGui visualization.
 // Stage B: Offline best-candidate point sampling (Mitchell 1991) + complete
 //          binary tree hierarchy (recursive median split, bounding spheres,
 //          normal cones).  Debug point-cloud overlay.
+// Stage E: Micro-rendering via rasterized point splatting — every gather
+//          pixel gets its own micro camera; leaf surfels are splatted into a
+//          micro-buffer atlas and depth-sorted by the hardware depth buffer.
 
 #include <gl/gl.hpp>
 #include <gl/query.hpp>
@@ -36,19 +39,6 @@ constexpr int N = 1 << LOG2N;       // 16384
 constexpr int BEST_K = 32;
 constexpr float COVERAGE = 1.4f;
 constexpr float LOD_THRESHOLD = 0.15f;
-
-// Morton code helpers for space-filling curve dispatch
-uint32_t part1by2(uint32_t x) {
-    x &= 0x000003ff;
-    x = (x | (x << 16)) & 0x000f000f;
-    x = (x | (x << 8)) & 0x00f000f0;
-    x = (x | (x << 4)) & 0x0c0c0c0c;
-    x = (x | (x << 2)) & 0x22222222;
-    return x;
-}
-uint32_t morton2d(uint32_t x, uint32_t y) {
-    return part1by2(x) | (part1by2(y) << 1);
-}
 
 // ===========================================================================
 // Shaders
@@ -122,6 +112,23 @@ uniform float u_far;
 uniform float u_exposure;
 uniform float u_gamma;
 
+// Final composite inputs (u_mode == 7)
+uniform sampler2D u_gbuf_pos;
+uniform sampler2D u_gbuf_nrm;
+uniform sampler2D u_gbuf_alb;
+uniform sampler2D u_gbuf_emit;
+uniform int u_num_emitters;
+uniform float u_emissive_gain;
+uniform float u_leaf_area;
+uniform float u_direct_scale;
+
+layout(std430, binding = 0) readonly buffer PGeomF { vec4 pgeom[]; };
+layout(std430, binding = 1) readonly buffer PNrmF  { vec4 pnrm[];  };
+layout(std430, binding = 3) readonly buffer PEmitF { vec4 pemit[]; };
+layout(std430, binding = 9) readonly buffer EmitF  { uint emitters[]; };
+
+const float PI = 3.14159265358979;
+
 vec3 aces(vec3 x) {
     const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
     return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
@@ -140,6 +147,31 @@ void main() {
         c = vec4(vec3(c.r / u_far), 1.0);
     } else if (u_mode == 6) {
         // indirect — pass through
+    } else if (u_mode == 7) {
+        // Final composite: emissive + direct (unshadowed) + indirect
+        vec3 pos = texture(u_gbuf_pos, v_uv).xyz;
+        vec3 nrm = normalize(texture(u_gbuf_nrm, v_uv).xyz);
+        vec3 alb = texture(u_gbuf_alb, v_uv).rgb;
+        vec3 emit = texture(u_gbuf_emit, v_uv).rgb * u_emissive_gain;
+        vec3 indirect = texture(u_tex, v_uv).rgb;
+
+        vec3 direct = vec3(0.0);
+        if (dot(pos, pos) > 1e-6) {
+            for (int i = 0; i < u_num_emitters; ++i) {
+                uint e = emitters[i];
+                vec3 e_pos = pgeom[e].xyz;
+                vec3 e_nrm = normalize(pnrm[e].xyz);
+                vec3 e_emit = pemit[e].rgb * u_emissive_gain;
+                vec3 dir = e_pos - pos;
+                float dist2 = max(dot(dir, dir), 1e-4);
+                float dist = sqrt(dist2);
+                vec3 wi = dir / dist;
+                float cos_recv = max(dot(nrm, wi), 0.0);
+                float cos_emit = max(dot(e_nrm, -wi), 0.0);
+                direct += e_emit * cos_emit * cos_recv / dist2 * u_leaf_area;
+            }
+        }
+        c = vec4(emit + u_direct_scale * alb / PI * direct + indirect, 1.0);
     }
 
     vec3 col = c.rgb * u_exposure;
@@ -405,8 +437,7 @@ layout(std430, binding = 2) readonly buffer PAlb     { vec4 palb[];     };
 layout(std430, binding = 3) readonly buffer PEmit    { vec4 pemit[];    };
 layout(std430, binding = 16) readonly buffer Spheres { vec4 sph[];      };
 layout(std430, binding = 17) readonly buffer Cones   { vec4 cone[];     };
-layout(std430, binding = 18) readonly buffer LChild  { uint left_ch[];  };
-layout(std430, binding = 19) readonly buffer RChild  { uint right_ch[]; };
+layout(std430, binding = 18) readonly buffer Children { uvec2 children[]; };
 layout(std430, binding = 20) readonly buffer RadDfs  { vec4 rad_dfs[];  };
 layout(std430, binding = 10) writeonly buffer RadDst { vec4 rad_dst[];  };
 
@@ -414,6 +445,7 @@ uniform uint u_num_leaves;
 uniform uint u_tree_offset;
 uniform float u_leaf_area;
 uniform float u_emissive_gain;
+uniform float u_cutoff;
 
 const float PI = 3.14159265358979;
 const uint STACK_DEPTH = 32;
@@ -449,10 +481,7 @@ void main() {
             dot_oc_axis * dot_oc_axis > dist2 * (1.0 - cn.w * cn.w))
             continue;
 
-        float cz = dot(to_center, nrm);
-        if (cz <= 0.0) continue;
-
-        bool is_leaf = (left_ch[node] == 0xFFFFFFFFu);
+        bool is_leaf = (children[node].x == 0xFFFFFFFFu);
 
         if (is_leaf) {
             if (dist2 < u_leaf_area * 0.25) continue;
@@ -463,7 +492,7 @@ void main() {
             incoming += rad_dfs[node].rgb * cos_emit * cos_recv / dist2 * u_leaf_area;
         } else {
             float angular_size = radius / max(sqrt(dist2), 1e-10);
-            if (angular_size < 0.15) {
+            if (angular_size < u_cutoff) {
                 if (dist2 < 1e-8) continue;
                 vec3 wi = to_center / sqrt(dist2);
                 vec3 node_axis = cn.xyz;
@@ -473,8 +502,8 @@ void main() {
                 incoming += rad_dfs[node].rgb * cos_emit * cos_recv / dist2 * node_area;
             } else {
                 if (sp + 2 <= STACK_DEPTH) {
-                    stack[sp++] = left_ch[node];
-                    stack[sp++] = right_ch[node];
+                    stack[sp++] = children[node].x;
+                    stack[sp++] = children[node].y;
                 }
             }
         }
@@ -511,98 +540,61 @@ void main() {
 )";
 
 // ===========================================================================
-// Stage E — Micro-rendering compute shader
+// Stage E — Rasterized micro-rendering (point splatting)
+//
+// Replaces the original per-pixel BVH traversal: every gather pixel gets a
+// "micro camera" (position + BRDF-warped tangent frame).  All leaf surfels
+// are then splatted into that pixel's tile of a micro-buffer atlas using the
+// hardware rasterizer, and a hardware depth buffer performs the depth sort
+// (nearest surfel per micro pixel).  A final compute pass convolves each
+// tile with the BRDF Jacobian.
 // ===========================================================================
 
-const char* micro_render_cs = R"(
+// --- Pass 1: per-gather-pixel micro camera setup --------------------------
+const char* cam_setup_cs = R"(
 #version 460 core
-#extension GL_ARB_shader_clock : require
-layout(local_size_x = 8, local_size_y = 8) in;
+layout(local_size_x = 256) in;
 
 layout(binding = 0) uniform sampler2D gbuf_pos;
 layout(binding = 1) uniform sampler2D gbuf_nrm;
 layout(binding = 2) uniform sampler2D gbuf_alb;
-layout(binding = 3) uniform sampler2D u_warp_tex;
 
-layout(std430, binding = 16) readonly buffer Spheres { vec4 sphere_buf[]; };
-layout(std430, binding = 17) readonly buffer Cones   { vec4 cone_buf[];   };
-layout(std430, binding = 18) readonly buffer LChild  { uint left_child[];  };
-layout(std430, binding = 19) readonly buffer RChild  { uint right_child[]; };
-layout(std430, binding = 20) readonly buffer Rad     { vec4 rad_buf[];    };
-layout(std430, binding = 22) readonly buffer MortonTbl { uvec4 morton_tbl[]; };
+// 7 vec4 per gather pixel: pos+valid, Tw, Bw, warp_dir, albedo, normal, tile_xy+pad
+layout(std430, binding = 23) writeonly buffer Cams { vec4 cams[]; };
 
-layout(std430, binding = 10) writeonly buffer DebugPos { vec4 debug_pos[]; };
-layout(std430, binding = 11) writeonly buffer DebugCol { vec4 debug_col[]; };
-layout(std430, binding = 12) writeonly buffer ProfBuf { uint prof_data[]; };
-layout(std430, binding = 15) writeonly buffer VisitStats { uvec4 visit_stats[]; };
-// visit_stats: x = total nodes visited (DFS pops), y = max stack depth reached
-//   (== STACK_DEPTH means the stack overflowed and children were dropped),
-//   z = unused, w = unused.
-
-layout(binding = 0, rgba16f) writeonly uniform image2D u_output;
-layout(binding = 1, rgba16f) writeonly uniform image2D u_debug_img;
-
-uniform uint u_num_leaves;
 uniform ivec2 u_screen_size;
-uniform uint u_micro_size;
-uniform uint u_m_valid;
-uniform uint u_scale;
-uniform float u_gain;
-uniform ivec2 u_debug_pixel;
-uniform float u_self_eps2;
 uniform int u_low_res_w;
 uniform int u_low_res_h;
-uniform float u_roughness;
+uniform uint u_scale;
 uniform vec3 u_camera_pos;
+uniform float u_roughness;
 uniform uint u_jitter_seed;
 
-#define NPHASES 4
-#define STACK_DEPTH 32
-#define POST_LIST_CAP 16
-
 void main() {
-    ivec2 local = ivec2(gl_LocalInvocationID.xy);
-    uint lid = uint(local.x) + uint(local.y) * 8u;
+    uint g = gl_GlobalInvocationID.x;
+    if (g >= uint(u_low_res_w) * uint(u_low_res_h)) return;
 
-    // Space-filling curve dispatch: map workgroup index → tile via Morton table
-    uvec4 morton_entry = morton_tbl[gl_WorkGroupID.x];
-    ivec2 tile = ivec2(morton_entry.y, morton_entry.z);
-    ivec2 pixel_lr = tile * 8 + local;
+    ivec2 pixel_lr = ivec2(int(g % uint(u_low_res_w)), int(g / uint(u_low_res_w)));
 
-    if (pixel_lr.x >= u_low_res_w || pixel_lr.y >= u_low_res_h) return;
-
-    ivec2 pixel = pixel_lr * int(u_scale);
-    if (pixel.x >= u_screen_size.x || pixel.y >= u_screen_size.y) return;
-
-    uint g_idx = uint(pixel_lr.x) + uint(pixel_lr.y) * uint(u_low_res_w);
-    uint base = g_idx * NPHASES;
-
-    // Jittered gather point within tile for bilateral upsample (Stage H)
-    uint seed = u_jitter_seed + g_idx * 2654435761u;
+    // Jittered gather point within the tile (matches bilateral upsampling)
+    uint seed = u_jitter_seed + g * 2654435761u;
     float jx = float(seed % 65536u) / 65536.0 * float(u_scale);
     float jy = float((seed / 65536u) % 65536u) / 65536.0 * float(u_scale);
     ivec2 pixel_sample = pixel_lr * int(u_scale) + ivec2(int(jx), int(jy));
-    pixel_sample = min(pixel_sample, ivec2(u_screen_size) - 1);
+    pixel_sample = min(pixel_sample, u_screen_size - 1);
 
     vec3 pos = texelFetch(gbuf_pos, pixel_sample, 0).xyz;
     vec3 nrm = normalize(texelFetch(gbuf_nrm, pixel_sample, 0).xyz);
     vec3 alb = texelFetch(gbuf_alb, pixel_sample, 0).rgb;
 
+    uint b = g * 7u;
     if (dot(pos, pos) < 1e-6) {
-        imageStore(u_output, pixel_lr, vec4(0.0));
-        visit_stats[g_idx] = uvec4(0u);
-        prof_data[base + 0] = uint(clockARB());
-        prof_data[base + 1] = uint(clockARB());
-        prof_data[base + 2] = uint(clockARB());
-        prof_data[base + 3] = uint(clockARB());
+        cams[b] = vec4(0.0);   // w = 0 → invalid gather pixel
         return;
     }
 
-    vec3 up = abs(nrm.y) < 0.999 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
-    vec3 T = normalize(cross(up, nrm));
-    vec3 B = cross(nrm, T);
-
-    // BRDF importance warping: blend tangent-frame pole toward reflection direction
+    // BRDF importance warping: blend the surface normal toward the reflection
+    // direction, then build an orthonormal frame around it (the micro camera).
     vec3 view_dir = normalize(u_camera_pos - pos);
     vec3 refl_dir = reflect(-view_dir, nrm);
     vec3 warp_dir = normalize(mix(nrm, refl_dir, 1.0 - u_roughness));
@@ -610,213 +602,343 @@ void main() {
     vec3 Tw = normalize(cross(up_w, warp_dir));
     vec3 Bw = cross(warp_dir, Tw);
 
+    cams[b + 0u] = vec4(pos, 1.0);
+    cams[b + 1u] = vec4(Tw, 0.0);
+    cams[b + 2u] = vec4(Bw, 0.0);
+    cams[b + 3u] = vec4(warp_dir, 0.0);
+    cams[b + 4u] = vec4(alb, 0.0);
+    cams[b + 5u] = vec4(nrm, 0.0);
+    cams[b + 6u] = vec4(float(pixel_lr.x), float(pixel_lr.y), 0.0, 0.0);
+}
+)";
+
+// --- Pass 2: point splatting into the micro-buffer atlas ------------------
+// One instance per gather pixel; gl_VertexID selects a tree node at the
+// configured LOD level (level LOG2N = leaf surfels).  Interior nodes carry
+// the pulled-up (area-weighted) radiance, so they are valid splats too —
+// this is the rasterized equivalent of the traversal's adaptive cut.
+const char* splat_vs = R"(
+#version 460 core
+
+layout(std430, binding = 6) readonly buffer Spheres { vec4 sphere_buf[]; };
+layout(std430, binding = 7) readonly buffer Cones   { vec4 cone_buf[];   };
+layout(std430, binding = 23) readonly buffer Cams   { vec4 cams[];       };
+
+uniform uint  u_node_base;     // first node index of the splatted LOD level
+uniform uint  u_cam_offset;    // index of this chunk's first gather pixel
+uniform uint  u_row0;          // low-res row of this chunk's first row
+uniform float u_ms;            // micro-buffer tile size (pixels)
+uniform vec2  u_ndc_scale;     // = 2.0 / atlas_size
+uniform float u_self_eps2;
+
+flat out uint  v_node;
+flat out float v_dist;
+
+void main() {
+    uint node = u_node_base + uint(gl_VertexID);
+    uint gidx = u_cam_offset + uint(gl_InstanceID);
+    uint b = gidx * 6u;
+    vec4 cpos = cams[b + 0u];
+
+    v_node = node;
+    v_dist = 0.0;
+
+    // Default: position behind the clip volume → point is culled
+    gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+    gl_PointSize = 1.0;
+
+    if (cpos.w < 0.5) return;                        // invalid gather pixel
+
+    vec4 sph = sphere_buf[node];
+    vec3 V = sph.xyz - cpos.xyz;
+    float dist2 = dot(V, V);
+
+    // Self-exclusion: cull any node whose bounding sphere contains the gather
+    // point — that node is the receiver's own local surface region.  Splatting
+    // it would flood the tile with a near-full-size disk that wins the depth
+    // sort and occludes the whole hemisphere (the "massive surfel" blobs).
+    // The old constant epsilon only excluded the receiver's own leaf, which is
+    // far too small for interior nodes.
+    if (dist2 < max(sph.w * sph.w, u_self_eps2)) return;
+    if (dot(V, cams[b + 5u].xyz) <= 0.0) return;     // behind receiver hemisphere
+    if (dot(V, cams[b + 3u].xyz) <= 0.0) return;     // outside warped mapping
+
+    // Backface cull, accounting for the normal-cone half-angle.  The current
+    // node is culled only if the WHOLE cone faces away from the gather point:
+    //   cull iff dot(normalize(V), axis) > sin(half-angle)
+    // A half-angle >= 90 degrees (w <= 0) is never backfacing.
+    vec4 cone = cone_buf[node];
+    float sin_a = sqrt(max(1.0 - cone.w * cone.w, 0.0));
+    float invDist = inversesqrt(max(dist2, 1e-12));
+    if (cone.w > 0.0 && dot(V, cone.xyz) * invDist > sin_a) return;
+
+    // Hemispherical disk mapping in the micro camera frame.  This projection
+    // is non-linear (it needs a Euclidean normalize), so it cannot be written
+    // as a literal 4x4 matrix — the per-pixel camera frame is applied directly.
+    float half_ms = u_ms * 0.5;
+    float px = (dot(V, cams[b + 1u].xyz) * invDist + 1.0) * half_ms;
+    float py = (dot(V, cams[b + 2u].xyz) * invDist + 1.0) * half_ms;
+
+    // Projected splat radius in micro pixels (clamped to half a tile).
+    // Foreshorten only for narrow cones (leaves / near-leaves): using the
+    // average cone axis for broad interior nodes over-shrinks them and leaves
+    // gaps.  For broad nodes we splat as a full disk and rely on self-exclusion.
+    float cos_orient = (sin_a < 0.1) ? abs(dot(V, cone.xyz) * invDist) : 1.0;
+    float r_px = min(sph.w * invDist * half_ms * cos_orient, half_ms);
+
+    if (px + r_px < 0.0 || px - r_px >= u_ms ||
+        py + r_px < 0.0 || py - r_px >= u_ms) return;
+    if (r_px < 0.5) return;   // sub-pixel; skip point setup
+
+    vec2 tile = cams[b + 6u].xy;
+    vec2 atlas_px = tile * u_ms + vec2(px, py) - vec2(0.0, float(u_row0) * u_ms);
+    vec2 ndc = atlas_px * u_ndc_scale - 1.0;
+
+    gl_Position = vec4(ndc, 0.0, 1.0);
+    gl_PointSize = 2.0 * r_px;
+    v_dist = 1.0 / invDist;
+}
+)";
+
+const char* splat_fs = R"(
+#version 460 core
+
+layout(std430, binding = 8) readonly buffer Rad { vec4 rad[]; };
+
+flat in uint  v_node;
+flat in float v_dist;
+
+layout(location = 0) out vec4 out_color;
+
+uniform float u_inv_max_dist;
+
+void main() {
+    // Round splat footprint (point sprites are square)
+    vec2 pc = gl_PointCoord * 2.0 - 1.0;
+    if (dot(pc, pc) > 1.0) discard;
+
+    // Hardware depth buffer performs the depth sort: nearest surfel wins
+    float d_norm = clamp(v_dist * u_inv_max_dist, 0.0, 1.0);
+    gl_FragDepth = d_norm;
+    // Store normalized depth in alpha so the compute pass can occlusion-cull
+    // sub-pixel far-field nodes against the rasterized nearest surfel.
+    out_color = vec4(rad[v_node].rgb, d_norm);
+}
+)";
+
+// --- Debug: high-res reproduction of one micro-buffer tile ----------------
+// Renders exactly what a gather pixel's micro buffer sees (same LOD level,
+// same disk mapping, same culls, same depth sort) into a square texture,
+// from a single camera passed as uniforms — no dependence on the main view.
+const char* micro_view_vs = R"(
+#version 460 core
+
+layout(std430, binding = 6) readonly buffer Spheres { vec4 sphere_buf[]; };
+layout(std430, binding = 7) readonly buffer Cones   { vec4 cone_buf[];   };
+
+uniform uint  u_node_base;
+uniform vec3  u_eye;
+uniform vec3  u_tw;
+uniform vec3  u_bw;
+uniform vec3  u_warp;
+uniform vec3  u_nrm;
+uniform float u_half;       // half the debug image size in pixels
+uniform float u_self_eps2;
+uniform float u_inv_max_dist;
+
+flat out uint  v_node;
+flat out float v_dist;
+
+void main() {
+    uint node = u_node_base + uint(gl_VertexID);
+    vec4 sph = sphere_buf[node];
+    vec3 V = sph.xyz - u_eye;
+    float dist2 = dot(V, V);
+
+    v_node = node;
+    v_dist = 0.0;
+
+    gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+    gl_PointSize = 1.0;
+
+    // Self-exclusion (same rule as splat_vs): cull nodes whose bounding
+    // sphere contains the camera, so the receiver's own surface region does
+    // not flood the tile with a full-size disk that wins the depth sort.
+    if (dist2 < max(sph.w * sph.w, u_self_eps2)) return;
+    if (dot(V, u_nrm) <= 0.0) return;
+    if (dot(V, u_warp) <= 0.0) return;
+
+    vec4 cone = cone_buf[node];
+    float sin_a = sqrt(max(1.0 - cone.w * cone.w, 0.0));
+    float invDist = inversesqrt(max(dist2, 1e-12));
+    if (cone.w > 0.0 && dot(V, cone.xyz) * invDist > sin_a) return;
+
+    float px = (dot(V, u_tw) * invDist + 1.0) * u_half;
+    float py = (dot(V, u_bw) * invDist + 1.0) * u_half;
+    // Same orientation foreshortening as the main splat pass: only narrow cones
+    // (leaves / near-leaves) are foreshortened to avoid self-occlusion.
+    float cos_orient = (sin_a < 0.1) ? abs(dot(V, cone.xyz) * invDist) : 1.0;
+    float r_px = min(sph.w * invDist * u_half * cos_orient, u_half);
+
+    if (px + r_px < 0.0 || px - r_px >= 2.0 * u_half ||
+        py + r_px < 0.0 || py - r_px >= 2.0 * u_half) return;
+
+    // NDC; y flipped so the ImGui widget top shows +Bw (matches the tile).
+    gl_Position = vec4(px / u_half - 1.0, -(py / u_half - 1.0), 0.0, 1.0);
+    gl_PointSize = max(2.0 * r_px, 1.0);
+    v_dist = 1.0 / invDist;
+}
+)";
+
+const char* micro_view_fs = R"(
+#version 460 core
+
+layout(std430, binding = 8) readonly buffer Rad { vec4 rad[]; };
+
+flat in uint  v_node;
+flat in float v_dist;
+
+layout(location = 0) out vec4 out_color;
+
+uniform float u_inv_max_dist;
+
+void main() {
+    vec2 pc = gl_PointCoord * 2.0 - 1.0;
+    if (dot(pc, pc) > 1.0) discard;
+    gl_FragDepth = clamp(v_dist * u_inv_max_dist, 0.0, 1.0);
+    out_color = vec4(rad[v_node].rgb, 1.0);
+}
+)";
+
+// --- Pass 3: per-pixel convolution of the rasterized micro-buffer ---------
+const char* micro_sum_cs = R"(
+#version 460 core
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0, rgba16f) readonly  uniform image2D u_atlas;
+layout(binding = 1, rgba16f) writeonly uniform image2D u_output;
+layout(binding = 2, rgba16f) writeonly uniform image2D u_debug_img;
+
+layout(binding = 0) uniform sampler2D u_warp_tex;
+
+layout(std430, binding = 6) readonly buffer Spheres { vec4 sphere_buf[]; };
+layout(std430, binding = 7) readonly buffer Cones   { vec4 cone_buf[];   };
+layout(std430, binding = 8) readonly buffer Rad     { vec4 rad[];        };
+layout(std430, binding = 23) readonly buffer Cams   { vec4 cams[];       };
+
+uniform int   u_low_res_w;
+uniform int   u_low_res_h;
+uniform uint  u_row0;
+uniform uint  u_micro_size;
+uniform uint  u_m_valid;
+uniform float u_gain;
+uniform ivec2 u_debug_pixel;
+
+uniform uint  u_node_base;
+uniform uint  u_node_count;
+uniform float u_self_eps2;
+uniform float u_inv_max_dist;
+uniform int   u_accum_subpixel;
+
+const float PI = 3.14159265358979;
+
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    int rx = px.x;
+    int ry = int(u_row0) + px.y;
+    if (rx >= u_low_res_w || ry >= u_low_res_h) return;
+
+    uint g = uint(rx) + uint(ry) * uint(u_low_res_w);
+    uint b = g * 7u;
+
+    ivec2 out_px = ivec2(rx, ry);
+    if (cams[b + 0u].w < 0.5) {
+        imageStore(u_output, out_px, vec4(0.0));
+        return;
+    }
+
+    vec3 cpos = cams[b + 0u].xyz;
+    vec3 nrm  = cams[b + 5u].xyz;
+    vec3 warp = cams[b + 3u].xyz;
+    vec3 Tw   = cams[b + 1u].xyz;
+    vec3 Bw   = cams[b + 2u].xyz;
+    vec3 alb  = cams[b + 4u].rgb;
+
+    int ms = int(u_micro_size);
     float half_ms = float(u_micro_size) * 0.5;
-    float ms_f = float(u_micro_size);
-    uint micro_total = u_micro_size * u_micro_size;
+    ivec2 tile0 = ivec2(rx * ms, px.y * ms);
 
-    prof_data[base + 0] = uint(clockARB());
-
-    // ---- Per-thread micro-buffer (private arrays → local memory) ----
-    // Each thread tracks the closest surfel for each micro-pixel independently.
-    float my_depth[64];
-    uint  my_node[64];
-    for (uint i = 0u; i < 64u; i++) {
-        my_depth[i] = 1e30;
-        my_node[i] = 0u;
-    }
-
-    // ---- Stage F: Post-traversal leaf list for ray-disc fallback ----
-    uint post_list[POST_LIST_CAP];
-    uint post_count = 0u;
-
-    // ---- Per-thread iterative DFS using DFS-ordered BVH (no shared state, no barriers) ----
-    uint my_stack[STACK_DEPTH];
-    int  my_sp = 0;
-    my_stack[my_sp++] = 0u;
-
-    uint visited = 0u;
-    uint max_sp = 0u;
-
-    while (my_sp > 0) {
-        max_sp = max(max_sp, uint(my_sp));
-        uint node = my_stack[--my_sp];
-        visited++;
-
-        vec4 sph = sphere_buf[node];
-        vec3 center = sph.xyz;
-        float radius = sph.w;
-
-        vec3 to_center = center - pos;
-        float dist2 = dot(to_center, to_center);
-
-        if (dot(to_center, nrm) < 0.0) continue;
-
-        vec4 cn = cone_buf[node];
-        float dot_oc_axis = dot(to_center, cn.xyz);
-        if (dot_oc_axis > 0.0 && cn.w > 0.0 &&
-            dot_oc_axis * dot_oc_axis > dist2 * (1.0 - cn.w * cn.w))
-            continue;
-
-        float cz = dot(to_center, nrm);
-        if (cz <= 0.0) continue;
-
-        float distSafe2 = max(dist2, 1e-10);
-        float invDist = inversesqrt(distSafe2);
-
-        float dx = dot(to_center, Tw) * invDist;
-        float dy = dot(to_center, Bw) * invDist;
-        float cosTheta = dot(to_center, warp_dir) * invDist;
-
-        float px_f = (dx + 1.0) * half_ms;
-        float py_f = (dy + 1.0) * half_ms;
-
-        float angularRadius = radius * invDist;
-        float r_proj = min(angularRadius * half_ms, half_ms);
-
-        if (px_f + r_proj < 0.0 || px_f - r_proj >= ms_f ||
-            py_f + r_proj < 0.0 || py_f - r_proj >= ms_f)
-            continue;
-
-        // DFS-ordered leaf check: leaf has no children
-        bool is_leaf = (left_child[node] == 0xFFFFFFFFu);
-        if (is_leaf || r_proj <= 0.5) {
-            float dist = sqrt(dist2);
-
-            // Self-epsilon: only skip individual LEAVES too close to receiver,
-            // NOT internal BVH nodes (which would cull entire subtrees).
-            if (is_leaf && dist2 < u_self_eps2) continue;
-
-            int ms = int(u_micro_size);
-            int ir = max(1, int(ceil(r_proj)));
-            int px_i = int(px_f);
-            int py_i = int(py_f);
-            int xmin = max(0, px_i - ir);
-            int xmax = min(ms - 1, px_i + ir);
-            int ymin = max(0, py_i - ir);
-            int ymax = min(ms - 1, py_i + ir);
-            float r2 = r_proj * r_proj;
-
-            for (int my = ymin; my <= ymax; my++) {
-                for (int mx = xmin; mx <= xmax; mx++) {
-                    float ddx = float(mx) + 0.5 - px_f;
-                    float ddy = float(my) + 0.5 - py_f;
-                    if (ddx * ddx + ddy * ddy <= r2) {
-                        uint mid = uint(mx) + uint(my) * u_micro_size;
-                        if (dist < my_depth[mid]) {
-                            my_depth[mid] = dist;
-                            my_node[mid] = node;
-                        }
-                    }
-                }
-            }
-
-            // Stage F: collect leaves into post-traversal list
-            if (is_leaf && post_count < POST_LIST_CAP) {
-                post_list[post_count++] = node;
-            }
-        } else {
-            // DFS-ordered children via explicit child-pointer arrays
-            uint lc = left_child[node];
-            uint rc = right_child[node];
-            if (my_sp + 2 <= STACK_DEPTH) {
-                my_stack[my_sp++] = lc;
-                my_stack[my_sp++] = rc;
-            }
-        }
-    }
-
-    prof_data[base + 1] = uint(clockARB());
-
-    // ---- Stage F: Ray-disc intersection for unresolved micro-pixels ----
-    // For any micro-pixel not hit by rasterization, ray-cast against collected leaves.
-    for (uint i = 0u; i < micro_total; i++) {
-        if (my_node[i] > 0u) continue;  // already resolved
-
-        // Reconstruct ray direction from micro-pixel center via warp table
-        float mu = (float(i % uint(u_micro_size)) + 0.5 - half_ms) / half_ms;
-        float mv = (float(i / uint(u_micro_size)) + 0.5 - half_ms) / half_ms;
-        vec2 warp_uv = vec2(mu, mv) * 0.5 + 0.5;
-        vec3 warp_dir_tan = texture(u_warp_tex, warp_uv).xyz;
-        vec3 ray_dir = normalize(Tw * warp_dir_tan.x + Bw * warp_dir_tan.y + warp_dir * warp_dir_tan.z);
-
-        for (uint li = 0u; li < post_count; li++) {
-            uint lnode = post_list[li];
-            vec4 lsph = sphere_buf[lnode];
-            vec3 lc = lsph.xyz;
-            float lr = lsph.w;
-
-            // Ray-sphere intersection
-            vec3 oc = pos - lc;
-            float b = dot(oc, ray_dir);
-            float c = dot(oc, oc) - lr * lr;
-            float disc = b * b - c;
-            if (disc < 0.0) continue;
-
-            float t = -b - sqrt(disc);
-            if (t < 0.0) t = -b + sqrt(disc);
-            if (t < 0.0) continue;
-
-            vec3 hit = pos + ray_dir * t;
-
-            // Oriented disc test: project onto plane, check radius
-            vec4 lc_data = cone_buf[lnode];
-            vec3 leaf_nrm = lc_data.xyz;
-            float cosHalf = lc_data.w;
-            float hdotn = dot(hit - lc, leaf_nrm);
-            if (hdotn < 0.0) continue;
-            vec3 proj = (hit - lc) - leaf_nrm * hdotn;
-            if (dot(proj, proj) > lr * lr) continue;
-
-            // Self-epsilon
-            if (t * t < u_self_eps2) continue;
-
-            if (t < my_depth[i]) {
-                my_depth[i] = t;
-                my_node[i] = lnode;
-            }
-        }
-    }
-
-    // ---- Read radiance for each micro-pixel's closest surfel, with Jacobian weighting ----
+    // Convolve the rasterized micro-buffer with the BRDF Jacobian.
+    // c.a now holds the normalized depth of the nearest rasterized surfel.
     vec3 sum = vec3(0.0);
-    for (uint i = 0u; i < micro_total; i++) {
-        if (my_node[i] > 0u) {
-            float mu = (float(i % uint(u_micro_size)) + 0.5 - half_ms) / half_ms;
-            float mv = (float(i / uint(u_micro_size)) + 0.5 - half_ms) / half_ms;
-            vec2 warp_uv = vec2(mu, mv) * 0.5 + 0.5;
-            float jacobian = texture(u_warp_tex, warp_uv).w;
-            sum += rad_buf[my_node[i]].rgb * jacobian;
-        }
-    }
-
-    prof_data[base + 2] = uint(clockARB());
-
-    // ---- Debug pixel overlay ----
-    if (u_debug_pixel.x >= 0 && pixel_lr == u_debug_pixel) {
-        for (uint i = 0u; i < micro_total; i++) {
-            vec3 r = my_node[i] > 0u ? rad_buf[my_node[i]].rgb : vec3(0.3, 0.0, 0.0);
-            debug_col[i] = vec4(r, 1.0);
-            debug_pos[i] = my_node[i] > 0u ? vec4(sphere_buf[my_node[i]].xyz, 1.0) : vec4(0.0);
-        }
-        // Write all 64 micro-pixel radiance values to the 8×8 debug image
-        for (uint dy = 0u; dy < 8u; dy++) {
-            for (uint dx = 0u; dx < 8u; dx++) {
-                uint mid = dx + dy * 8u;
-                vec3 r = my_node[mid] > 0u ? rad_buf[my_node[mid]].rgb : vec3(0.3, 0.0, 0.0);
-                imageStore(u_debug_img, ivec2(dx, dy), vec4(r, 1.0));
+    for (int my = 0; my < ms; ++my) {
+        for (int mx = 0; mx < ms; ++mx) {
+            vec4 c = imageLoad(u_atlas, tile0 + ivec2(mx, my));
+            if (c.a > 0.0) {
+                float mu = (float(mx) + 0.5 - half_ms) / half_ms;
+                float mv = (float(my) + 0.5 - half_ms) / half_ms;
+                float jacobian = texture(u_warp_tex, vec2(mu, mv) * 0.5 + 0.5).w;
+                sum += c.rgb * jacobian;
             }
         }
     }
 
-    // ---- Write output ----
-    vec3 indirect = u_m_valid > 0u
-        ? u_gain * alb * sum / float(u_m_valid)
-        : vec3(0.0);
-    imageStore(u_output, pixel_lr, vec4(indirect, 1.0));
+    // Far-field / sub-pixel accumulation: nodes too small to rasterize are
+    // added analytically so we don't lose their energy.  Occlusion is tested
+    // against the nearest rasterized depth at the projected pixel center.
+    if (u_accum_subpixel != 0) {
+    for (uint n = 0u; n < u_node_count; ++n) {
+        uint node = u_node_base + n;
+        vec4 sph = sphere_buf[node];
+        vec3 V = sph.xyz - cpos;
+        float dist2 = dot(V, V);
 
-    prof_data[base + 3] = uint(clockARB());
+        if (dist2 < max(sph.w * sph.w, u_self_eps2)) continue;
+        if (dot(V, nrm) <= 0.0) continue;
+        if (dot(V, warp) <= 0.0) continue;
 
-    visit_stats[g_idx] = uvec4(visited, max_sp, post_count, 0u);
+        vec4 cone = cone_buf[node];
+        float sin_a = sqrt(max(1.0 - cone.w * cone.w, 0.0));
+        float invDist = inversesqrt(max(dist2, 1e-12));
+        if (cone.w > 0.0 && dot(V, cone.xyz) * invDist > sin_a) continue;
+
+        float cos_orient = (sin_a < 0.1) ? abs(dot(V, cone.xyz) * invDist) : 1.0;
+        float r_px = sph.w * invDist * half_ms * cos_orient;
+        if (r_px >= 0.5 || r_px <= 0.0) continue;   // rasterized or invisible
+
+        float px_proj = (dot(V, Tw) * invDist + 1.0) * half_ms;
+        float py_proj = (dot(V, Bw) * invDist + 1.0) * half_ms;
+        if (px_proj + r_px < 0.0 || px_proj - r_px >= float(ms) ||
+            py_proj + r_px < 0.0 || py_proj - r_px >= float(ms)) continue;
+
+        // Occlusion test: sample the nearest rasterized depth at our center.
+        ivec2 ipx = ivec2(clamp(int(px_proj), 0, ms - 1), clamp(int(py_proj), 0, ms - 1));
+        float nearest_depth = imageLoad(u_atlas, tile0 + ipx).a;
+        float node_depth = clamp(1.0 / invDist * u_inv_max_dist, 0.0, 1.0);
+        if (nearest_depth > 0.0 && node_depth > nearest_depth) continue;
+
+        float mu = (px_proj + 0.5 - half_ms) / half_ms;
+        float mv = (py_proj + 0.5 - half_ms) / half_ms;
+        float jacobian = texture(u_warp_tex, vec2(mu, mv) * 0.5 + 0.5).w;
+
+        // Disk area in micro-pixels times BRDF weight
+        sum += rad[node].rgb * (PI * r_px * r_px) * jacobian;
+    }
+    }
+
+    vec3 indirect = u_gain * alb * sum / float(u_m_valid);
+    imageStore(u_output, out_px, vec4(indirect, 1.0));
+
+    // Debug overlay: dump this pixel's rasterized micro-buffer tile
+    if (u_debug_pixel.x >= 0 && out_px == u_debug_pixel) {
+        for (int dy = 0; dy < ms; ++dy) {
+            for (int dx = 0; dx < ms; ++dx) {
+                vec4 c = imageLoad(u_atlas, tile0 + ivec2(dx, dy));
+                vec3 r = c.a > 0.0 ? c.rgb : vec3(0.3, 0.0, 0.0);
+                imageStore(u_debug_img, ivec2(dx, ms - 1 - dy), vec4(r, 1.0));
+            }
+        }
+    }
 }
 )";
 
@@ -864,8 +986,6 @@ void main() {
                 lpx.y < 0 || lpx.y >= u_low_size.y) continue;
 
             vec3 val = imageLoad(u_low_res, lpx).rgb;
-            float brightness = dot(val, vec3(0.2126, 0.7152, 0.0722));
-            if (brightness < 1e-6) continue;
 
             // Bilateral weights
             vec2 diff = vec2(lpx) - low_f;
@@ -915,34 +1035,6 @@ uniform vec4 u_color;
 out vec4 frag_color;
 void main() {
     frag_color = u_color;
-}
-)";
-
-// ===========================================================================
-// Stage E — Debug surfel overlay (64 colored dots for micro-buffer samples)
-// ===========================================================================
-
-const char* debug_surfel_vs = R"(
-#version 460 core
-layout(std430, binding = 10) readonly buffer DebugPos { vec4 d_pos[]; };
-layout(std430, binding = 11) readonly buffer DebugCol { vec4 d_col[]; };
-uniform mat4 u_view_proj;
-out vec4 v_color;
-void main() {
-    v_color = d_col[gl_VertexID];
-    gl_Position = u_view_proj * vec4(d_pos[gl_VertexID].xyz, 1.0);
-    gl_PointSize = 10.0;
-}
-)";
-
-const char* debug_surfel_fs = R"(
-#version 460 core
-in vec4 v_color;
-out vec4 frag_color;
-void main() {
-    vec2 pc = gl_PointCoord * 2.0 - 1.0;
-    if (dot(pc, pc) > 1.0) discard;
-    frag_color = v_color;
 }
 )";
 
@@ -1177,6 +1269,32 @@ void compute_brdf_warp_table(float alpha, int W, std::vector<float>& data) {
             float u = (float(i) + 0.5f) / float(W);
             float v = (float(j) + 0.5f) / float(W);
 
+            int idx = (j * W + i) * 4;
+
+            // Diffuse / Lambertian: use uniform disk parametrization that matches
+            // the hemispherical disk projection Phi(x,y) used for splatting.
+            // For Lambertian, cos(theta)*dOmega = du*dv, so the per-sample
+            // Monte-Carlo weight is exactly 1; the sum in micro_sum is just an
+            // average over disk samples times the receiver albedo.
+            if (alpha >= 0.99f) {
+                float sx = 2.0f * u - 1.0f;
+                float sy = 2.0f * v - 1.0f;
+                float r2 = sx * sx + sy * sy;
+                if (r2 > 1.0f) {
+                    data[idx + 0] = 0.0f;
+                    data[idx + 1] = 0.0f;
+                    data[idx + 2] = 1.0f;
+                    data[idx + 3] = 0.0f;
+                } else {
+                    float sz = std::sqrt(std::max(0.0f, 1.0f - r2));
+                    data[idx + 0] = sx;
+                    data[idx + 1] = sy;
+                    data[idx + 2] = sz;
+                    data[idx + 3] = 1.0f;
+                }
+                continue;
+            }
+
             // GGX importance sampling: inverse CDF for polar angle of half-vector
             float cos_h = std::sqrt((1.0f - u) / (1.0f + (a2 - 1.0f) * u + 1e-10f));
             float sin_h = std::sqrt(std::max(0.0f, 1.0f - cos_h * cos_h));
@@ -1209,7 +1327,6 @@ void compute_brdf_warp_table(float alpha, int W, std::vector<float>& data) {
             // For Lambertian BRDF (1/pi), Jacobian = f_r * cos(theta_i) / pdf
             float jacobian = (1.0f / PI) * glm::max(Wi.z, 0.0f) / (pdf + 1e-10f);
 
-            int idx = (j * W + i) * 4;
             data[idx + 0] = Wi.x;
             data[idx + 1] = Wi.y;
             data[idx + 2] = Wi.z;
@@ -1752,11 +1869,71 @@ void create_gbuffer(GBuffer& g, int w, int h) {
 }
 
 // ===========================================================================
+// Stage E — Micro-buffer atlas (one micro_size² tile per gather pixel)
+//   Color: nearest surfel radiance per micro pixel (RGBA16F, alpha=coverage)
+//   Depth: hardware depth buffer performs the per-micro-pixel depth sort
+// ===========================================================================
+struct MicroAtlas {
+    int w = 0, h = 0;
+    gl::Texture color{gl::TextureType::tex_2d};
+    gl::Renderbuffer depth_rbo;
+    gl::Framebuffer fbo;
+};
+
+void create_micro_atlas(MicroAtlas& a, int w, int h) {
+    a.w = w;
+    a.h = h;
+
+    a.color.image_2d(0, GL_RGBA16F, w, h, GL_RGBA, GL_FLOAT, nullptr, 1);
+    a.color.parameter(GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    a.color.parameter(GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    a.color.parameter(GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    a.color.parameter(GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    a.depth_rbo.storage(GL_DEPTH_COMPONENT32F, w, h);
+
+    a.fbo.bind();
+    a.fbo.attach_texture(GL_COLOR_ATTACHMENT0, a.color);
+    a.fbo.attach_renderbuffer(GL_DEPTH_ATTACHMENT, a.depth_rbo);
+    if (!a.fbo.check())
+        gllib::log(gllib::LogLevel::error, "Micro-atlas framebuffer incomplete");
+    gl::Framebuffer::unbind(gl::FramebufferType::both);
+}
+
+// Debug FBO: high-res square reproduction of one micro-buffer tile.
+struct MicroCamFbo {
+    int w = 0, h = 0;
+    gl::Texture color{gl::TextureType::tex_2d};
+    gl::Renderbuffer depth_rbo;
+    gl::Framebuffer fbo;
+};
+
+void create_micro_cam_fbo(MicroCamFbo& f, int w, int h) {
+    f.w = w;
+    f.h = h;
+
+    f.color.image_2d(0, GL_RGBA16F, w, h, GL_RGBA, GL_FLOAT, nullptr, 1);
+    f.color.parameter(GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    f.color.parameter(GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    f.color.parameter(GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    f.color.parameter(GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    f.depth_rbo.storage(GL_DEPTH_COMPONENT32F, w, h);
+
+    f.fbo.bind();
+    f.fbo.attach_texture(GL_COLOR_ATTACHMENT0, f.color);
+    f.fbo.attach_renderbuffer(GL_DEPTH_ATTACHMENT, f.depth_rbo);
+    if (!f.fbo.check())
+        gllib::log(gllib::LogLevel::error, "Micro-cam framebuffer incomplete");
+    gl::Framebuffer::unbind(gl::FramebufferType::both);
+}
+
+// ===========================================================================
 // Main
 // ===========================================================================
 int main() {
     gllib::log_to_stderr(gllib::LogLevel::info);
-    gfx::Window window({"36 Micro Rendering — Stage A+B+C+D+E", 1600, 900});
+    gfx::Window window({"36 Micro Rendering — Raster Point Splatting", 1600, 900});
     window.vsync(false);
 
     gfx::ImGuiOverlay gui;
@@ -1797,17 +1974,20 @@ int main() {
     gl::Program direct_light_prog = make_compute(direct_lighting_cs);
     gl::Program bounce_gather_prog = make_compute(hierarchical_bounce_cs);
     gl::Program radiance_pull_prog = make_compute(radiance_pullup_cs);
-    gl::Program micro_render_prog  = make_compute(micro_render_cs);
-    gl::Program bilateral_prog     = make_compute(bilateral_upsample_cs);
+    gl::Program cam_setup_prog   = make_compute(cam_setup_cs);
+    gl::Program splat_prog       = make_program(splat_vs, splat_fs);
+    gl::Program micro_view_prog  = make_program(micro_view_vs, micro_view_fs);
+    gl::Program micro_sum_prog   = make_compute(micro_sum_cs);
+    gl::Program bilateral_prog   = make_compute(bilateral_upsample_cs);
     gl::Program sphere_prog      = make_program(sphere_vs, sphere_fs);
-    gl::Program debug_surfel_prog = make_program(debug_surfel_vs, debug_surfel_fs);
 
     if (!gbuf_prog.linked() || !display_prog.linked() || !pc_prog.linked() ||
         !leaf_update_prog.linked() || !tree_refit_prog.linked() ||
         !sph_reorder_prog.linked() || !rad_reorder_prog.linked() ||
         !direct_light_prog.linked() || !bounce_gather_prog.linked() || !radiance_pull_prog.linked() ||
-        !micro_render_prog.linked() || !bilateral_prog.linked() || !sphere_prog.linked() ||
-        !debug_surfel_prog.linked()) {
+        !cam_setup_prog.linked() || !splat_prog.linked() || !micro_view_prog.linked() ||
+        !micro_sum_prog.linked() ||
+        !bilateral_prog.linked() || !sphere_prog.linked()) {
         gllib::log(gllib::LogLevel::error, "Shader compilation failed");
         return EXIT_FAILURE;
     }
@@ -1948,18 +2128,20 @@ int main() {
 
     gl::Buffer dfs_sphere_buf(gl::BufferType::shader, gl::BufferUsage::static_draw);
     gl::Buffer dfs_cone_buf(gl::BufferType::shader, gl::BufferUsage::static_draw);
-    gl::Buffer dfs_left_buf(gl::BufferType::shader, gl::BufferUsage::static_draw);
-    gl::Buffer dfs_right_buf(gl::BufferType::shader, gl::BufferUsage::static_draw);
+    gl::Buffer dfs_child_buf(gl::BufferType::shader, gl::BufferUsage::static_draw);
 
     dfs_sphere_buf.data(dfs_bvh.sphere.data(), dfs_bvh.sphere.size() * sizeof(glm::vec4));
     dfs_cone_buf.data(dfs_bvh.cone.data(), dfs_bvh.cone.size() * sizeof(glm::vec4));
-    dfs_left_buf.data(dfs_bvh.left_child.data(), dfs_bvh.left_child.size() * sizeof(uint32_t));
-    dfs_right_buf.data(dfs_bvh.right_child.data(), dfs_bvh.right_child.size() * sizeof(uint32_t));
+    {
+        std::vector<glm::uvec2> children(dfs_bvh.left_child.size());
+        for (size_t i = 0; i < children.size(); ++i)
+            children[i] = glm::uvec2(dfs_bvh.left_child[i], dfs_bvh.right_child[i]);
+        dfs_child_buf.data(children.data(), children.size() * sizeof(glm::uvec2));
+    }
 
     dfs_sphere_buf.bind_base(16);
     dfs_cone_buf.bind_base(17);
-    dfs_left_buf.bind_base(18);
-    dfs_right_buf.bind_base(19);
+    dfs_child_buf.bind_base(18);
 
     // --- New_to_old mapping SSBO (binding 21) ---
     gl::Buffer new_to_old_buf(gl::BufferType::shader, gl::BufferUsage::static_draw);
@@ -1971,8 +2153,11 @@ int main() {
     dfs_rad_buf.data(nullptr, size_t(2 * N - 1) * sizeof(glm::vec4));
     dfs_rad_buf.bind_base(20);
 
-    // --- Morton dispatch table SSBO (binding 22) ---
-    gl::Buffer morton_buf(gl::BufferType::shader, gl::BufferUsage::static_draw);
+    // --- Stage E: per-gather-pixel micro cameras (binding 23) + splat atlas ---
+    gl::Buffer cams_buf(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);
+    MicroAtlas micro_atlas;
+    int atlas_rows = 0;   // low-res rows per splat chunk (set on resize)
+    MicroCamFbo micro_cam_fbo;
 
     // --- Stage D: Extract emitter leaf indices + create radiance buffer ---
     std::vector<uint32_t> emitter_indices;
@@ -2011,7 +2196,8 @@ int main() {
     create_gbuffer(gbuf, window.framebuffer_width(), window.framebuffer_height());
 
     // --- Indirect illumination texture (Stage E) ---
-    int micro_res_scale = 1;
+    int micro_res_scale = 5;
+    int splat_lod = 10;   // splat tree level: 2^LOD nodes (LOG2N = leaf surfels)
     gl::Texture indirect_tex{gl::TextureType::tex_2d};
     auto create_indirect_tex = [&](int w, int h) {
         int rw = std::max(1, w / micro_res_scale);
@@ -2039,14 +2225,6 @@ int main() {
     float bilateral_depth_sigma = 0.01f;
     float bilateral_normal_exp = 32.0f;
 
-    // --- Debug micro-buffer texture (8×8) ---
-    gl::Texture debug_tex{gl::TextureType::tex_2d};
-    debug_tex.image_2d(0, GL_RGBA16F, 8, 8, GL_RGBA, GL_FLOAT, nullptr, 1);
-    debug_tex.parameter(GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    debug_tex.parameter(GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    debug_tex.parameter(GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    debug_tex.parameter(GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-
     // --- BRDF importance warp table (64×64 RGBA32F) ---
     // GGX importance-sampled warp: maps (u,v) to hemisphere direction + Jacobian.
     // For roughness=1 (alpha=1), this degenerates to cosine-weighted hemisphere.
@@ -2060,34 +2238,18 @@ int main() {
     warp_tex.parameter(GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     warp_tex.parameter(GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
-    // --- Debug surfel SSBOs (64 samples for micro-buffer overlay) ---
-    gl::Buffer debug_pos_buf(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);
-    debug_pos_buf.data(nullptr, 64 * sizeof(glm::vec4));
-    gl::Buffer debug_col_buf(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);
-    debug_col_buf.data(nullptr, 64 * sizeof(glm::vec4));
-
-    // --- Micro-rendering intra-shader profiling SSBO ---
-    gl::Buffer prof_buf(gl::BufferType::shader, gl::BufferUsage::stream_read);
-    std::vector<uint32_t> prof_readback;
-
-    gl::Buffer visit_stats_buf(gl::BufferType::shader, gl::BufferUsage::stream_read);
-    std::vector<uint32_t> visit_stats_readback; // uvec4 per workgroup, flattened
-    double visit_avg = 0.0, visit_max = 0.0;
-    double iters_avg = 0.0, iters_maxed_pct = 0.0; // % of pixels that hit MAX_BFS_ITERS
-    double frontier_avg = 0.0, frontier_saturated_pct = 0.0; // % that hit Q_CAP
-
     // --- Fullscreen triangle VAO ---
     gl::VertexArray fsq_vao;
 
     // --- State ---
-    int view_mode = 0;
+    int view_mode = 6;
     float exposure = 1.0f;
     float gamma = 2.2f;
     const float far_plane = 1000.0f;
     bool captured = false;
 
     // Point cloud debug state
-    bool show_points = true;
+    bool show_points = false;
     float point_size = 5.0f;
     int pc_color_mode = 0;  // 0=albedo 1=emissive 2=normal 3=position
 
@@ -2101,34 +2263,56 @@ int main() {
 
     // Stage D state
     float emissive_gain = 8.0f;
+    float bounce_cutoff = 0.5f;  // angular cutoff (rad): smaller = finer/slower gather
 
     // Stage E state
     bool run_micro_render = true;
-    int micro_size = 8;
+    int micro_size = 16;
+    int prev_micro_size = micro_size;
     float micro_gain = 1.0f;
     float micro_roughness = 1.0f;
     float last_roughness = -1.0f;  // track for warp table regeneration
-    int tile_size = 2;
+    float direct_scale = 0.0f;     // 0 = rely purely on micro-buffer (shadowed), 1 = add unshadowed direct
+    bool accum_subpixel = false;   // accumulate sub-pixel far-field nodes in micro_sum
+
+    // --- Debug micro-buffer texture (matches micro_size) ---
+    gl::Texture debug_tex{gl::TextureType::tex_2d};
+    debug_tex.image_2d(0, GL_RGBA16F, micro_size, micro_size, GL_RGBA, GL_FLOAT, nullptr, 1);
+    debug_tex.parameter(GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    debug_tex.parameter(GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    debug_tex.parameter(GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    debug_tex.parameter(GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
     bool show_micro_debug = false;
+    bool show_micro_camera = false;
+    glm::vec4 mic_pos(0.0f), mic_tw(0.0f), mic_bw(0.0f), mic_warp(0.0f), mic_nrm(0.0f);
+    bool mic_valid = false;
     uint64_t frame_counter = 0;
-    // Even with the debug panel open, only pay for the profiling stall
-    // periodically -- readback data doesn't need to be per-frame to be useful,
-    // and this keeps the debug view from itself becoming the bottleneck.
-    constexpr uint64_t kProfileEveryNFrames = 30;
     int debug_pixel_x = -1, debug_pixel_y = -1;
 
-    // Intra-shader micro profiling results (ticks, displayed as %)
-    static const char* phase_names[] = {"traversal", "radiance", "accumulate"};
-    double phase_avg[3] = {};
-    double phase_pct[3] = {};
-    uint64_t prof_clock_period_ns = 1;
+    // Allocate the micro-atlas + per-gather-pixel camera buffer for the
+    // current framebuffer size / render scale.
+    auto setup_micro_atlas = [&](int fw, int fh) {
+        int rw = std::max(1, fw / micro_res_scale);
+        int rh = std::max(1, fh / micro_res_scale);
+        const int64_t budget = 32ll << 20;  // max atlas pixels per chunk
+        int64_t per_row = int64_t(rw) * micro_size * micro_size;
+        atlas_rows = std::max(1, std::min(rh, int(budget / std::max<int64_t>(per_row, 1))));
+        create_micro_atlas(micro_atlas, rw * micro_size, atlas_rows * micro_size);
+        cams_buf.data(nullptr, size_t(rw) * size_t(rh) * 7 * sizeof(glm::vec4));
+    };
+    setup_micro_atlas(window.framebuffer_width(), window.framebuffer_height());
+    create_micro_cam_fbo(micro_cam_fbo, std::min(window.framebuffer_width(), window.framebuffer_height()),
+                         std::min(window.framebuffer_width(), window.framebuffer_height()));
 
     // Profiling timers
     PassTimer t_frame("frame", false);
     PassTimer t_geo("geometry");
     PassTimer t_refit("gpu refit");
     PassTimer t_direct("direct light");
-    PassTimer t_micro("micro render");
+    PassTimer t_msetup("micro setup");
+    PassTimer t_splat("micro splat");
+    PassTimer t_sum("micro sum");
     PassTimer t_display("display");
     PassTimer t_pointcloud("point cloud");
     PassTimer t_imgui("imgui", false);
@@ -2138,7 +2322,6 @@ int main() {
 
     while (!window.should_close()) {
         ++frame_counter;
-        const bool profile_this_frame = (frame_counter % kProfileEveryNFrames) == 0;
         double now = window.time();
         float dt = float(now - last);
         last = now;
@@ -2149,14 +2332,18 @@ int main() {
 
         int fw = window.framebuffer_width(), fh = window.framebuffer_height();
         static int prev_scale = micro_res_scale;
-        if (fw != gbuf.w || fh != gbuf.h || micro_res_scale != prev_scale) {
+        if (fw != gbuf.w || fh != gbuf.h || micro_res_scale != prev_scale || micro_size != prev_micro_size) {
             create_gbuffer(gbuf, fw, fh);
             create_indirect_tex(fw, fh);
             create_upsampled_tex(fw, fh);
+            setup_micro_atlas(fw, fh);
+            create_micro_cam_fbo(micro_cam_fbo, std::min(fw, fh), std::min(fw, fh));
             prev_scale = micro_res_scale;
+            prev_micro_size = micro_size;
         }
 
         glm::mat4 vp = cam.view_projection();
+        glm::mat4 viewM = cam.view();
 
         t_frame.begin();
 
@@ -2175,7 +2362,7 @@ int main() {
         auto g_loc = [&](const char* n) { return gbuf_prog.uniform_location(n); };
         GLint loc;
         loc = g_loc("u_view_proj"); if (loc >= 0) gbuf_prog.uniform_matrix4fv(loc, glm::value_ptr(vp));
-        loc = g_loc("u_view");      if (loc >= 0) gbuf_prog.uniform_matrix4fv(loc, glm::value_ptr(cam.view()));
+        loc = g_loc("u_view");      if (loc >= 0) gbuf_prog.uniform_matrix4fv(loc, glm::value_ptr(viewM));
         loc = g_loc("u_model");     if (loc >= 0) gbuf_prog.uniform_matrix4fv(loc, glm::value_ptr(model_mat));
         glm::mat3 normal_mat = glm::transpose(glm::inverse(glm::mat3(model_mat)));
         loc = g_loc("u_normal_mat"); if (loc >= 0) gbuf_prog.uniform_matrix3fv(loc, glm::value_ptr(normal_mat));
@@ -2296,6 +2483,8 @@ int main() {
                 if (loc_c >= 0) glProgramUniform1f(bounce_gather_prog.handle(), loc_c, emissive_gain);
                 loc_c = bounce_gather_prog.uniform_location("u_self_eps2");
                 if (loc_c >= 0) glProgramUniform1f(bounce_gather_prog.handle(), loc_c, self_eps * self_eps);
+                loc_c = bounce_gather_prog.uniform_location("u_cutoff");
+                if (loc_c >= 0) glProgramUniform1f(bounce_gather_prog.handle(), loc_c, bounce_cutoff);
 
                 if (bounce % 2 == 0) {
                     radiance_buf.bind_base(8);
@@ -2323,6 +2512,7 @@ int main() {
                     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
                 }
             }
+
             // Ensure binding 8 has the final radiance for micro-render
             if (num_bounces > 0 && (num_bounces % 2 == 1))
                 radiance_b_buf.bind_base(8);
@@ -2333,14 +2523,11 @@ int main() {
         }
 
         // ===================================================================
-        // 1e. Micro-rendering (Stage E)
+        // 1e. Micro-rendering (Stage E) — rasterized point splatting
         // ===================================================================
-        t_micro.begin();
         if (run_micro_render) {
             int rw = std::max(1, fw / micro_res_scale);
             int rh = std::max(1, fh / micro_res_scale);
-
-            indirect_tex.bind_image(0, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
 
             gbuf.position.bind(0);
             gbuf.normal.bind(1);
@@ -2353,79 +2540,8 @@ int main() {
                 warp_tex.image_2d(0, GL_RGBA32F, WARP_SIZE, WARP_SIZE, GL_RGBA, GL_FLOAT, warp_data.data(), 1);
                 last_roughness = micro_roughness;
             }
-            warp_tex.bind(3);
 
-            // Reorder heap → DFS for micro-render
-            sphere_buf.bind_base(6);
-            cone_buf.bind_base(7);
-            sph_reorder_prog.use();
-            loc = sph_reorder_prog.uniform_location("u_tree_size");
-            if (loc >= 0) glProgramUniform1ui(sph_reorder_prog.handle(), loc, GLuint(2 * N - 1));
-            gl::dispatch_compute((2 * N - 1 + 255) / 256, 1, 1);
-            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-
-            // Reorder radiance heap → DFS for micro-render
-            // Binding 8 is the final radiance from the bounce loop (or direct lighting)
-            rad_reorder_prog.use();
-            loc = rad_reorder_prog.uniform_location("u_tree_size");
-            if (loc >= 0) glProgramUniform1ui(rad_reorder_prog.handle(), loc, GLuint(2 * N - 1));
-            gl::dispatch_compute((2 * N - 1 + 255) / 256, 1, 1);
-            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-
-            // Bind DFS-ordered buffers for micro-render
-            dfs_sphere_buf.bind_base(16);
-            dfs_cone_buf.bind_base(17);
-            dfs_left_buf.bind_base(18);
-            dfs_right_buf.bind_base(19);
-            dfs_rad_buf.bind_base(20);
-            morton_buf.bind_base(22);
-            // radiance already in dfs_rad_buf (binding 20) after bounce loop reorder
-
-            debug_pos_buf.bind_base(10);
-            debug_col_buf.bind_base(11);
-
-            // Intra-shader profiling buffer
-            size_t prof_count = size_t(rw) * size_t(rh) * 4;
-            prof_buf.data(nullptr, prof_count * sizeof(uint32_t));
-            prof_buf.bind_base(12);
-
-            // Node-visit instrumentation buffer (uvec4 per workgroup)
-            size_t visit_count = size_t(rw) * size_t(rh) * 4;
-            visit_stats_buf.data(nullptr, visit_count * sizeof(uint32_t));
-            visit_stats_buf.bind_base(15);
-
-            debug_tex.bind_image(1, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
-
-            // Clear debug tex to black before dispatch so stale data doesn't persist
-            {
-                float zeros[4] = {0, 0, 0, 0};
-                glClearTexImage(debug_tex.handle(), 0, GL_RGBA, GL_FLOAT, zeros);
-            }
-
-            micro_render_prog.use();
-            loc = micro_render_prog.uniform_location("u_num_leaves");
-            if (loc >= 0) glProgramUniform1ui(micro_render_prog.handle(), loc, GLuint(N));
-            loc = micro_render_prog.uniform_location("u_screen_size");
-            if (loc >= 0) glProgramUniform2i(micro_render_prog.handle(), loc, fw, fh);
-            loc = micro_render_prog.uniform_location("u_micro_size");
-            if (loc >= 0) glProgramUniform1ui(micro_render_prog.handle(), loc, GLuint(micro_size));
-            loc = micro_render_prog.uniform_location("u_scale");
-            if (loc >= 0) glProgramUniform1ui(micro_render_prog.handle(), loc, GLuint(micro_res_scale));
-            loc = micro_render_prog.uniform_location("u_gain");
-            if (loc >= 0) glProgramUniform1f(micro_render_prog.handle(), loc, micro_gain);
-
-            loc = micro_render_prog.uniform_location("u_low_res_w");
-            if (loc >= 0) glProgramUniform1i(micro_render_prog.handle(), loc, rw);
-            loc = micro_render_prog.uniform_location("u_low_res_h");
-            if (loc >= 0) glProgramUniform1i(micro_render_prog.handle(), loc, rh);
-
-            // Squared threshold below which a leaf surfel is treated as coincident
-            // with the receiver and skipped.  Use 0.5× the leaf radius — only
-            // prevents exact self-intersection, not neighbor culling.
-            float self_eps = 0.5f * ph.leaf_radius;
-            loc = micro_render_prog.uniform_location("u_self_eps2");
-            if (loc >= 0) glProgramUniform1f(micro_render_prog.handle(), loc, self_eps * self_eps);
-
+            // Number of micro pixels inside the unit disk (normalization)
             int m_valid = 0;
             for (int ly = 0; ly < micro_size; ly++) {
                 for (int lx = 0; lx < micro_size; lx++) {
@@ -2434,120 +2550,185 @@ int main() {
                     if (mu * mu + mv * mv <= 1.0f) m_valid++;
                 }
             }
-            loc = micro_render_prog.uniform_location("u_m_valid");
-            if (loc >= 0) glProgramUniform1ui(micro_render_prog.handle(), loc, GLuint(m_valid));
 
-            loc = micro_render_prog.uniform_location("gbuf_pos");
-            if (loc >= 0) glProgramUniform1i(micro_render_prog.handle(), loc, 0);
-            loc = micro_render_prog.uniform_location("gbuf_nrm");
-            if (loc >= 0) glProgramUniform1i(micro_render_prog.handle(), loc, 1);
-            loc = micro_render_prog.uniform_location("gbuf_alb");
-            if (loc >= 0) glProgramUniform1i(micro_render_prog.handle(), loc, 2);
-            loc = micro_render_prog.uniform_location("u_warp_tex");
-            if (loc >= 0) glProgramUniform1i(micro_render_prog.handle(), loc, 3);
-
-            loc = micro_render_prog.uniform_location("u_roughness");
-            if (loc >= 0) glProgramUniform1f(micro_render_prog.handle(), loc, micro_roughness);
-            loc = micro_render_prog.uniform_location("u_camera_pos");
-            if (loc >= 0) {
+            // --- Pass 1: per-gather-pixel micro camera setup ---
+            t_msetup.begin();
+            cams_buf.bind_base(23);
+            cam_setup_prog.use();
+            auto c_loc = [&](const char* n) { return cam_setup_prog.uniform_location(n); };
+            GLint cloc;
+            cloc = c_loc("u_screen_size");  if (cloc >= 0) glProgramUniform2i(cam_setup_prog.handle(), cloc, fw, fh);
+            cloc = c_loc("u_low_res_w");   if (cloc >= 0) glProgramUniform1i(cam_setup_prog.handle(), cloc, rw);
+            cloc = c_loc("u_low_res_h");   if (cloc >= 0) glProgramUniform1i(cam_setup_prog.handle(), cloc, rh);
+            cloc = c_loc("u_scale");       if (cloc >= 0) glProgramUniform1ui(cam_setup_prog.handle(), cloc, GLuint(micro_res_scale));
+            cloc = c_loc("u_roughness");   if (cloc >= 0) glProgramUniform1f(cam_setup_prog.handle(), cloc, micro_roughness);
+            cloc = c_loc("u_camera_pos");  if (cloc >= 0) {
                 glm::vec3 cp = cam.position();
-                glProgramUniform3f(micro_render_prog.handle(), loc, cp.x, cp.y, cp.z);
+                glProgramUniform3f(cam_setup_prog.handle(), cloc, cp.x, cp.y, cp.z);
             }
-            loc = micro_render_prog.uniform_location("u_jitter_seed");
-            if (loc >= 0) glProgramUniform1ui(micro_render_prog.handle(), loc, GLuint(frame_counter));
+            cloc = c_loc("u_jitter_seed"); if (cloc >= 0) glProgramUniform1ui(cam_setup_prog.handle(), cloc, GLuint(frame_counter));
+            gl::dispatch_compute(GLuint(rw * rh + 255) / 256u, 1, 1);
+            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+            t_msetup.end();
 
-            if (show_micro_debug && debug_pixel_x >= 0) {
-                loc = micro_render_prog.uniform_location("u_debug_pixel");
-                if (loc >= 0) glProgramUniform2i(micro_render_prog.handle(), loc,
-                    debug_pixel_x / micro_res_scale, (fh - 1 - debug_pixel_y) / micro_res_scale);
-            } else {
-                loc = micro_render_prog.uniform_location("u_debug_pixel");
-                if (loc >= 0) glProgramUniform2i(micro_render_prog.handle(), loc, -1, -1);
-            }
-
-            int dispatch_w = (rw + 7) / 8;
-            int dispatch_h = (rh + 7) / 8;
-            int num_workgroups = dispatch_w * dispatch_h;
-
-            // Generate Morton order dispatch table: uvec4(morton_code, tile_x, tile_y, 0)
+            // Clear debug tex so stale data doesn't persist
             {
-                std::vector<uint32_t> morton_entries(num_workgroups * 4);
-                for (int ty = 0; ty < dispatch_h; ty++) {
-                    for (int tx = 0; tx < dispatch_w; tx++) {
-                        uint32_t mc = morton2d(uint32_t(tx), uint32_t(ty));
-                        int idx = (ty * dispatch_w + tx) * 4;
-                        morton_entries[idx + 0] = mc;
-                        morton_entries[idx + 1] = uint32_t(tx);
-                        morton_entries[idx + 2] = uint32_t(ty);
-                        morton_entries[idx + 3] = 0;
+                float zeros[4] = {0, 0, 0, 0};
+                glClearTexImage(debug_tex.handle(), 0, GL_RGBA, GL_FLOAT, zeros);
+            }
+
+            // Debug pixel in low-res coordinates
+            int dbg_x = -1, dbg_y = -1;
+            if (show_micro_debug && debug_pixel_x >= 0) {
+                dbg_x = debug_pixel_x / micro_res_scale;
+                dbg_y = (fh - 1 - debug_pixel_y) / micro_res_scale;
+            }
+
+            // Micro-camera debug view: read the hovered pixel's micro frame
+            // every frame so the high-res reproduction tracks the live
+            // (jittered) gather point.
+            if (show_micro_camera && debug_pixel_x >= 0 && debug_pixel_y >= 0) {
+                int cdbg_x = debug_pixel_x / micro_res_scale;
+                int cdbg_y = (fh - 1 - debug_pixel_y) / micro_res_scale;
+                mic_valid = false;
+                if (cdbg_x >= 0 && cdbg_x < rw && cdbg_y >= 0 && cdbg_y < rh) {
+                    uint32_t g = uint32_t(cdbg_y) * uint32_t(rw) + uint32_t(cdbg_x);
+                    glm::vec4 mcam[6];
+                    glGetNamedBufferSubData(cams_buf.handle(),
+                        GLintptr(size_t(g) * 6u * sizeof(glm::vec4)), sizeof(mcam), mcam);
+                    if (mcam[0].w > 0.5f) {
+                        mic_pos  = mcam[0];
+                        mic_tw   = mcam[1];
+                        mic_bw   = mcam[2];
+                        mic_warp = mcam[3];
+                        mic_nrm  = mcam[5];
+                        mic_valid = true;
                     }
                 }
-                // Sort by Morton code for cache-friendly dispatch ordering
-                struct MortonEntry { uint32_t code, tx, ty, pad; };
-                auto* entries = reinterpret_cast<MortonEntry*>(morton_entries.data());
-                std::sort(entries, entries + num_workgroups,
-                    [](const MortonEntry& a, const MortonEntry& b) { return a.code < b.code; });
-                morton_buf.data(morton_entries.data(), num_workgroups * 4 * sizeof(uint32_t));
             }
 
-            gl::dispatch_compute(num_workgroups, 1, 1);
+            float self_eps = 0.5f * ph.leaf_radius;
+            float self_eps2 = self_eps * self_eps;
+            float inv_max_dist = 0.25f / glm::length(hi - lo);
 
-            // Profiling readback: always run for console logging, but
-            // only do the expensive glFinish+map when profiling or logging.
-            if (profile_this_frame) {
-                glMemoryBarrier(GL_ALL_BARRIER_BITS);
-                glFinish();
+            // --- Passes 2+3: splat + convolve, chunked over low-res rows ---
+            for (int r0 = 0; r0 < rh; r0 += atlas_rows) {
+                int rows = std::min(atlas_rows, rh - r0);
+                uint32_t cam_offset = uint32_t(r0 * rw);
+                uint32_t cam_count = uint32_t(rows * rw);
 
-                prof_readback.resize(prof_count);
-                void* ptr = prof_buf.map_range(0, prof_count * sizeof(uint32_t), GL_MAP_READ_BIT);
-                if (ptr) {
-                    memcpy(prof_readback.data(), ptr, prof_count * sizeof(uint32_t));
-                    prof_buf.unmap();
-                }
-                double sums[3] = {};
-                uint64_t total = 0;
-                for (size_t wg = 0; wg < size_t(rw) * size_t(rh); ++wg) {
-                    uint32_t t0 = prof_readback[wg * 4 + 0];
-                    uint32_t t1 = prof_readback[wg * 4 + 1];
-                    uint32_t t2 = prof_readback[wg * 4 + 2];
-                    uint32_t t3 = prof_readback[wg * 4 + 3];
-                    sums[0] += (t1 - t0);
-                    sums[1] += (t2 - t1);
-                    sums[2] += (t3 - t2);
-                    total   += (t3 - t0);
-                }
-                size_t nwg = size_t(rw) * size_t(rh);
-                for (int i = 0; i < 3; ++i) {
-                    phase_avg[i] = sums[i] / double(nwg);
-                    phase_pct[i] = total > 0 ? sums[i] * 100.0 / double(total) : 0.0;
-                }
+                // --- Pass 2: rasterize leaf surfels into the micro-atlas ---
+                t_splat.begin();
+                micro_atlas.fbo.bind();
+                gl::viewport(0, 0, micro_atlas.w, micro_atlas.h);
+                gl::clear_color(0.0f, 0.0f, 0.0f, 0.0f);
+                gl::clear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+                gl::enable(GL_DEPTH_TEST);
+                gl::depth_func(GL_LESS);
+                gl::depth_mask(GL_TRUE);
+                gl::enable(GL_PROGRAM_POINT_SIZE);
 
-                // --- Node-visit instrumentation summary (DFS) ---
-                visit_stats_readback.resize(visit_count);
-                void* vptr = visit_stats_buf.map_range(0, visit_count * sizeof(uint32_t), GL_MAP_READ_BIT);
-                if (vptr) {
-                    memcpy(visit_stats_readback.data(), vptr, visit_count * sizeof(uint32_t));
-                    visit_stats_buf.unmap();
-                }
-                uint64_t visitedSum = 0, visitedMax = 0;
-                uint64_t stackSum = 0, stackOverflowCount = 0;
-                for (size_t wg = 0; wg < nwg; ++wg) {
-                    uint32_t visited  = visit_stats_readback[wg * 4 + 0];
-                    uint32_t maxSp    = visit_stats_readback[wg * 4 + 1];
-                    visitedSum += visited;
-                    visitedMax = std::max<uint64_t>(visitedMax, visited);
-                    stackSum += maxSp;
-                    if (maxSp >= 32) stackOverflowCount++; // hit STACK_DEPTH
-                }
-                visit_avg    = double(visitedSum) / double(nwg);
-                visit_max    = double(visitedMax);
-                frontier_avg = double(stackSum) / double(nwg);  // reuse as avg max stack depth
-                frontier_saturated_pct = 100.0 * double(stackOverflowCount) / double(nwg); // reuse as stack overflow %
-            } else {
+                pgeom_buf.bind_base(0);
+                pnrm_buf.bind_base(1);
+                sphere_buf.bind_base(6);
+                cone_buf.bind_base(7);
+                cams_buf.bind_base(23);
+                // SSBO binding 8 already holds the final radiance buffer.
+
+                splat_prog.use();
+                auto s_loc = [&](const char* n) { return splat_prog.uniform_location(n); };
+                GLint sloc;
+                sloc = s_loc("u_node_base");     if (sloc >= 0) glProgramUniform1ui(splat_prog.handle(), sloc, GLuint((1u << splat_lod) - 1u));
+                sloc = s_loc("u_cam_offset");   if (sloc >= 0) glProgramUniform1ui(splat_prog.handle(), sloc, cam_offset);
+                sloc = s_loc("u_row0");         if (sloc >= 0) glProgramUniform1ui(splat_prog.handle(), sloc, uint32_t(r0));
+                sloc = s_loc("u_ms");           if (sloc >= 0) glProgramUniform1f(splat_prog.handle(), sloc, float(micro_size));
+                sloc = s_loc("u_ndc_scale");    if (sloc >= 0) glProgramUniform2f(splat_prog.handle(), sloc,
+                    2.0f / float(micro_atlas.w), 2.0f / float(micro_atlas.h));
+                sloc = s_loc("u_self_eps2");    if (sloc >= 0) glProgramUniform1f(splat_prog.handle(), sloc, self_eps2);
+                sloc = s_loc("u_inv_max_dist"); if (sloc >= 0) glProgramUniform1f(splat_prog.handle(), sloc, inv_max_dist);
+
+                pc_vao.bind();
+                gl::draw_arrays_instanced(GL_POINTS, 0, GLsizei(1u << splat_lod), GLsizei(cam_count));
+                gl::disable(GL_PROGRAM_POINT_SIZE);
+                gl::Framebuffer::unbind(gl::FramebufferType::both);
+                t_splat.end();
+
+                glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
+                                GL_TEXTURE_FETCH_BARRIER_BIT);
+
+                // --- Pass 3: convolve micro-buffers with the BRDF Jacobian ---
+                t_sum.begin();
+                micro_atlas.color.bind_image(0, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA16F);
+                indirect_tex.bind_image(1, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
+                debug_tex.bind_image(2, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
+                warp_tex.bind(0);
+
+                sphere_buf.bind_base(6);
+                cone_buf.bind_base(7);
+                // SSBO binding 8 already holds the final radiance buffer.
+
+                micro_sum_prog.use();
+                auto m_loc = [&](const char* n) { return micro_sum_prog.uniform_location(n); };
+                GLint mloc;
+                mloc = m_loc("u_low_res_w");   if (mloc >= 0) glProgramUniform1i(micro_sum_prog.handle(), mloc, rw);
+                mloc = m_loc("u_low_res_h");   if (mloc >= 0) glProgramUniform1i(micro_sum_prog.handle(), mloc, rh);
+                mloc = m_loc("u_row0");        if (mloc >= 0) glProgramUniform1ui(micro_sum_prog.handle(), mloc, uint32_t(r0));
+                mloc = m_loc("u_micro_size");  if (mloc >= 0) glProgramUniform1ui(micro_sum_prog.handle(), mloc, GLuint(micro_size));
+                mloc = m_loc("u_m_valid");     if (mloc >= 0) glProgramUniform1ui(micro_sum_prog.handle(), mloc, GLuint(m_valid));
+                mloc = m_loc("u_node_base");   if (mloc >= 0) glProgramUniform1ui(micro_sum_prog.handle(), mloc, GLuint((1u << splat_lod) - 1u));
+                mloc = m_loc("u_node_count");  if (mloc >= 0) glProgramUniform1ui(micro_sum_prog.handle(), mloc, GLuint(1u << splat_lod));
+                mloc = m_loc("u_self_eps2");   if (mloc >= 0) glProgramUniform1f(micro_sum_prog.handle(), mloc, self_eps2);
+                mloc = m_loc("u_inv_max_dist");if (mloc >= 0) glProgramUniform1f(micro_sum_prog.handle(), mloc, inv_max_dist);
+                mloc = m_loc("u_accum_subpixel"); if (mloc >= 0) glProgramUniform1i(micro_sum_prog.handle(), mloc, accum_subpixel ? 1 : 0);
+                mloc = m_loc("u_gain");        if (mloc >= 0) glProgramUniform1f(micro_sum_prog.handle(), mloc, micro_gain);
+                mloc = m_loc("u_debug_pixel"); if (mloc >= 0) glProgramUniform2i(micro_sum_prog.handle(), mloc, dbg_x, dbg_y);
+                mloc = m_loc("u_warp_tex");    if (mloc >= 0) glProgramUniform1i(micro_sum_prog.handle(), mloc, 0);
+
+                gl::dispatch_compute(GLuint((rw + 7) / 8), GLuint((rows + 7) / 8), 1);
                 glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+                t_sum.end();
+            }
+
+            // --- Debug: high-res reproduction of the hovered pixel's micro buffer ---
+            if (show_micro_camera && mic_valid) {
+                float half = float(micro_cam_fbo.w) * 0.5f;
+                micro_cam_fbo.fbo.bind();
+                gl::viewport(0, 0, micro_cam_fbo.w, micro_cam_fbo.h);
+                gl::clear_color(0.0f, 0.0f, 0.0f, 0.0f);
+                gl::clear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+                gl::enable(GL_DEPTH_TEST);
+                gl::depth_func(GL_LESS);
+                gl::depth_mask(GL_TRUE);
+                gl::enable(GL_PROGRAM_POINT_SIZE);
+
+                pgeom_buf.bind_base(0);
+                pnrm_buf.bind_base(1);
+                sphere_buf.bind_base(6);
+                cone_buf.bind_base(7);
+                if (num_bounces > 0 && (num_bounces % 2 == 1))
+                    radiance_b_buf.bind_base(8);
+                else
+                    radiance_buf.bind_base(8);
+                pc_vao.bind();
+
+                micro_view_prog.use();
+                auto vloc = [&](const char* n) { return micro_view_prog.uniform_location(n); };
+                GLint vl;
+                vl = vloc("u_node_base");     if (vl >= 0) glProgramUniform1ui(micro_view_prog.handle(), vl, GLuint((1u << splat_lod) - 1u));
+                vl = vloc("u_eye");           if (vl >= 0) glProgramUniform3f(micro_view_prog.handle(), vl, mic_pos.x, mic_pos.y, mic_pos.z);
+                vl = vloc("u_tw");            if (vl >= 0) glProgramUniform3f(micro_view_prog.handle(), vl, mic_tw.x, mic_tw.y, mic_tw.z);
+                vl = vloc("u_bw");            if (vl >= 0) glProgramUniform3f(micro_view_prog.handle(), vl, mic_bw.x, mic_bw.y, mic_bw.z);
+                vl = vloc("u_warp");          if (vl >= 0) glProgramUniform3f(micro_view_prog.handle(), vl, mic_warp.x, mic_warp.y, mic_warp.z);
+                vl = vloc("u_nrm");           if (vl >= 0) glProgramUniform3f(micro_view_prog.handle(), vl, mic_nrm.x, mic_nrm.y, mic_nrm.z);
+                vl = vloc("u_half");          if (vl >= 0) glProgramUniform1f(micro_view_prog.handle(), vl, half);
+                vl = vloc("u_self_eps2");     if (vl >= 0) glProgramUniform1f(micro_view_prog.handle(), vl, self_eps2);
+                vl = vloc("u_inv_max_dist");  if (vl >= 0) glProgramUniform1f(micro_view_prog.handle(), vl, inv_max_dist);
+
+                gl::draw_arrays(GL_POINTS, 0, GLsizei(1u << splat_lod));
+                gl::disable(GL_PROGRAM_POINT_SIZE);
+                gl::Framebuffer::unbind(gl::FramebufferType::both);
             }
         }
-        t_micro.end();
 
         // ===================================================================
         // 1f. Bilateral upsampling (Stage H)
@@ -2596,6 +2777,28 @@ int main() {
                 indirect_upsampled_tex.bind(0);
             else
                 indirect_tex.bind(0);
+        } else if (view_mode == 6) {
+            // Final composite: u_tex = indirect, plus G-buffer + emitter buffers
+            if (use_bilateral_upsample && micro_res_scale > 1)
+                indirect_upsampled_tex.bind(0);
+            else
+                indirect_tex.bind(0);
+            gbuf.position.bind(1);
+            gbuf.normal.bind(2);
+            gbuf.albedo.bind(3);
+            gbuf.emissive.bind(4);
+            pgeom_buf.bind_base(0);
+            pnrm_buf.bind_base(1);
+            pemit_buf.bind_base(3);
+            emitters_buf.bind_base(9);
+            loc = display_prog.uniform_location("u_gbuf_pos");  if (loc >= 0) display_prog.uniform1i(loc, 1);
+            loc = display_prog.uniform_location("u_gbuf_nrm");  if (loc >= 0) display_prog.uniform1i(loc, 2);
+            loc = display_prog.uniform_location("u_gbuf_alb");  if (loc >= 0) display_prog.uniform1i(loc, 3);
+            loc = display_prog.uniform_location("u_gbuf_emit"); if (loc >= 0) display_prog.uniform1i(loc, 4);
+            loc = display_prog.uniform_location("u_num_emitters");  if (loc >= 0) display_prog.uniform1i(loc, int(emitter_indices.size()));
+            loc = display_prog.uniform_location("u_emissive_gain"); if (loc >= 0) display_prog.uniform1f(loc, emissive_gain);
+            loc = display_prog.uniform_location("u_leaf_area");     if (loc >= 0) display_prog.uniform1f(loc, leaf_area);
+            loc = display_prog.uniform_location("u_direct_scale");  if (loc >= 0) display_prog.uniform1f(loc, direct_scale);
         } else {
             targets[view_mode]->bind(0);
         }
@@ -2672,23 +2875,6 @@ int main() {
         }
 
         // ===================================================================
-        // 2d. Debug surfel overlay (micro-buffer sample points)
-        // ===================================================================
-        if (show_micro_debug && run_micro_render) {
-            debug_surfel_prog.use();
-            loc = debug_surfel_prog.uniform_location("u_view_proj");
-            if (loc >= 0) debug_surfel_prog.uniform_matrix4fv(loc, glm::value_ptr(vp));
-
-            debug_pos_buf.bind_base(10);
-            debug_col_buf.bind_base(11);
-
-            gl::enable(GL_PROGRAM_POINT_SIZE);
-            pc_vao.bind();
-            glDrawArrays(GL_POINTS, 0, 64);
-            gl::disable(GL_PROGRAM_POINT_SIZE);
-        }
-
-        // ===================================================================
         // 3. ImGui
         // ===================================================================
         t_imgui.begin();
@@ -2701,7 +2887,7 @@ int main() {
 
             // G-buffer view
             ImGui::Combo("G-Buffer View", &view_mode,
-                         "Albedo\0Normal\0Position\0Emissive\0Depth\0Indirect\0");
+                         "Albedo\0Normal\0Position\0Emissive\0Depth\0Indirect\0Final\0");
             ImGui::SliderFloat("Exposure", &exposure, 0.05f, 5.0f);
             ImGui::SliderFloat("Gamma", &gamma, 1.0f, 3.0f);
 
@@ -2785,6 +2971,7 @@ int main() {
             ImGui::Text("  Emitters: %zu / %d", emitter_indices.size(), N);
             ImGui::Text("  Leaf area: %.6f", leaf_area);
             ImGui::SliderFloat("Emissive gain", &emissive_gain, 0.1f, 50.0f, "%.1f");
+            ImGui::SliderFloat("Bounce cutoff (rad)", &bounce_cutoff, 0.1f, 1.0f, "%.2f");
             ImGui::SliderInt("Bounces", &num_bounces, 0, 8);
             ImGui::Text("  Switch to 'Radiance' color mode to visualize");
 
@@ -2794,12 +2981,19 @@ int main() {
             ImGui::Checkbox("Run micro-render", &run_micro_render);
             if (run_micro_render) {
                 ImGui::SameLine();
-                ImGui::Text("  %.2f ms", t_micro.disp_gpu());
+                ImGui::Text("  setup %.2f + splat %.2f + sum %.2f ms",
+                            t_msetup.disp_gpu(), t_splat.disp_gpu(), t_sum.disp_gpu());
             }
             ImGui::Text("  Micro-res: %dx%d (%d valid disk px)", micro_size, micro_size, micro_size * micro_size);
             ImGui::SliderInt("Render scale", &micro_res_scale, 1, 8);
-            ImGui::SliderInt("Tile size", &tile_size, 1, 8);
+            ImGui::SliderInt("Splat LOD", &splat_lod, 1, LOG2N);
+            ImGui::Text("  Splats/px: %d (%s)", 1 << splat_lod,
+                        splat_lod == LOG2N ? "leaf surfels" : "interior nodes");
+            ImGui::SliderInt("Micro size", &micro_size, 4, 32);
             ImGui::SliderFloat("Gain", &micro_gain, 0.1f, 20.0f, "%.1f");
+            ImGui::Checkbox("Accum sub-pixel", &accum_subpixel);
+            ImGui::SliderFloat("Direct scale", &direct_scale, 0.0f, 2.0f, "%.2f");
+            ImGui::Text("  0 = pure micro-buffer (shadowed), 1 = add unshadowed direct");
             ImGui::SliderFloat("Roughness", &micro_roughness, 0.0f, 1.0f, "%.2f");
             if (micro_res_scale > 1) {
                 ImGui::Checkbox("Bilateral upsample", &use_bilateral_upsample);
@@ -2811,41 +3005,29 @@ int main() {
             ImGui::Text("  Internal: %dx%d", std::max(1, fw / micro_res_scale), std::max(1, fh / micro_res_scale));
             ImGui::Text("  Select 'Indirect' in G-Buffer View to visualize");
             ImGui::Checkbox("Debug micro-buffer", &show_micro_debug);
-            if (show_micro_debug) {
+            if (show_micro_debug || show_micro_camera) {
                 auto& io = ImGui::GetIO();
                 debug_pixel_x = int(io.MousePos.x);
                 debug_pixel_y = int(io.MousePos.y);
+            }
+            if (show_micro_debug) {
                 ImGui::Text("  Hover pixel: (%d, %d)", debug_pixel_x, debug_pixel_y);
                 if (debug_pixel_x >= 0 && debug_pixel_y >= 0) {
-                    ImGui::Text("  Leaf albedo (R/G/B):");
+                    ImGui::Text("  Rasterized micro-buffer tile:");
                     ImVec2 sz(192, 192);
                     ImGui::Image((ImTextureID)(intptr_t)debug_tex.handle(), sz);
                 }
             }
-
-            if (run_micro_render && !prof_readback.empty()) {
-                ImGui::Separator();
-                ImGui::Text("  Shader phases:");
-                ImU32 pcols[] = {
-                    IM_COL32(100,180,255,255), IM_COL32(255,200,60,255), IM_COL32(100,220,120,255)
-                };
-                ImVec2 bp = ImGui::GetCursorScreenPos();
-                ImVec2 bs(ImGui::GetContentRegionAvail().x, 16.0f);
-                float pvals[3] = { float(phase_pct[0]), float(phase_pct[1]), float(phase_pct[2]) };
-                imgui_stacked_bar(bp, bs, pvals, pcols, 3);
-                ImGui::Dummy(bs);
-                float tot_avg = float(phase_avg[0] + phase_avg[1] + phase_avg[2]);
-                imgui_stacked_legend("##microphases", phase_names, pvals, pcols, 3, tot_avg);
-
-                ImGui::Separator();
-                ImGui::Text("  DFS traversal instrumentation:");
-                ImGui::Text("    Nodes visited/px: avg %.0f, max %.0f",
-                             visit_avg, visit_max);
-                ImGui::Text("    Max stack depth: avg %.1f  |  hit STACK_DEPTH(32): %.1f%% of px",
-                             frontier_avg, frontier_saturated_pct);
-                if (frontier_saturated_pct > 5.0) {
-                    ImGui::TextColored(ImVec4(1, 0.4f, 0.3f, 1),
-                        "    -> stack overflow on a meaningful fraction of pixels!");
+            ImGui::Checkbox("Show micro camera view", &show_micro_camera);
+            if (show_micro_camera) {
+                ImGui::Text("  High-res reproduction of the hovered pixel's micro buffer");
+                ImGui::Text("  (same LOD level, disk mapping, depth sort; radiance-colored)");
+                if (mic_valid) {
+                    float aw = ImGui::GetContentRegionAvail().x;
+                    if (aw > 512.0f) aw = 512.0f;
+                    ImGui::Image((ImTextureID)(intptr_t)micro_cam_fbo.color.handle(), ImVec2(aw, aw));
+                } else {
+                    ImGui::Text("  (hover over a surface)");
                 }
             }
 
@@ -2853,15 +3035,18 @@ int main() {
             ImGui::Text("Profiling");
             {
                 static const PassTimer* timers[] = {
-                    &t_geo, &t_refit, &t_direct, &t_micro, &t_display, &t_pointcloud, &t_imgui, &t_frame
+                    &t_geo, &t_refit, &t_direct, &t_msetup, &t_splat, &t_sum,
+                    &t_display, &t_pointcloud, &t_imgui, &t_frame
                 };
                 static const ImU32 colors[] = {
                     IM_COL32(100,180,255,255), IM_COL32(255,120,100,255), IM_COL32(255,200,60,255),
-                    IM_COL32(100,220,120,255), IM_COL32(180,130,255,255), IM_COL32(255,160,200,255),
-                    IM_COL32(120,220,220,255), IM_COL32(200,200,200,255)
+                    IM_COL32(100,220,120,255), IM_COL32(255,160,200,255), IM_COL32(120,220,220,255),
+                    IM_COL32(180,130,255,255), IM_COL32(255,120,180,255), IM_COL32(160,160,160,255),
+                    IM_COL32(200,200,200,255)
                 };
                 static const char* names[] = {
-                    "geo", "refit", "direct", "micro", "display", "pointcloud", "imgui", "frame"
+                    "geo", "refit", "direct", "setup", "splat", "sum",
+                    "display", "pointcloud", "imgui", "frame"
                 };
                 constexpr int NT = sizeof(timers) / sizeof(timers[0]);
                 float total = timers[NT-1]->disp_cpu();
@@ -2885,7 +3070,9 @@ int main() {
         // Readback all timers
         t_refit.readback();
         t_direct.readback();
-        t_micro.readback();
+        t_msetup.readback();
+        t_splat.readback();
+        t_sum.readback();
         t_display.readback();
         t_pointcloud.readback();
         t_frame.readback();
@@ -2894,7 +3081,9 @@ int main() {
         if (now - win_start >= 0.5) {
             t_refit.flush_window();
             t_direct.flush_window();
-            t_micro.flush_window();
+            t_msetup.flush_window();
+            t_splat.flush_window();
+            t_sum.flush_window();
             t_display.flush_window();
             t_pointcloud.flush_window();
             t_frame.flush_window();
@@ -2902,22 +3091,16 @@ int main() {
             win_start = now;
 
             gllib::logf(gllib::LogLevel::info,
-                "PERF  frame=%.1fms  geo=%.1f  refit=%.1f  direct=%.1f  micro=%.1f  display=%.1f  imgui=%.1f  |  "
-                "phase: trav=%.2fms(%.0f%%) rad=%.2fms(%.0f%%) accum=%.2fms(%.0f%%)  |  "
-                "nodes: avg=%.0f max=%.0f  max_stack: avg=%.0f  |  "
-                "scale=%d  dispatch=%dx%d  (%d wg)  screen=%dx%d",
+                "PERF  frame=%.1fms  geo=%.1f  refit=%.1f  direct=%.1f  "
+                "setup=%.2f  splat=%.2f  sum=%.2f  display=%.1f  imgui=%.1f  |  "
+                "scale=%d  lowres=%dx%d  chunks=%d  screen=%dx%d",
                 t_frame.disp_cpu(),
                 t_geo.disp_gpu(), t_refit.disp_gpu(), t_direct.disp_gpu(),
-                t_micro.disp_gpu(), t_display.disp_gpu(), t_imgui.disp_cpu(),
-                t_micro.disp_gpu() * phase_pct[0] / 100.0, phase_pct[0],
-                t_micro.disp_gpu() * phase_pct[1] / 100.0, phase_pct[1],
-                t_micro.disp_gpu() * phase_pct[2] / 100.0, phase_pct[2],
-                visit_avg, visit_max,
-                frontier_avg,
+                t_msetup.disp_gpu(), t_splat.disp_gpu(), t_sum.disp_gpu(),
+                t_display.disp_gpu(), t_imgui.disp_cpu(),
                 micro_res_scale,
-                std::max(1, (fw / micro_res_scale + 7) / 8),
-                std::max(1, (fh / micro_res_scale + 7) / 8),
-                std::max(1, (fw / micro_res_scale + 7) / 8) * std::max(1, (fh / micro_res_scale + 7) / 8),
+                std::max(1, fw / micro_res_scale), std::max(1, fh / micro_res_scale),
+                (std::max(1, fh / micro_res_scale) + atlas_rows - 1) / atlas_rows,
                 fw, fh);
         }
 

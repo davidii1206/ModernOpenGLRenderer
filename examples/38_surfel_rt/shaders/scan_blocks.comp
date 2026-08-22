@@ -1,0 +1,28 @@
+#version 460 core
+layout(local_size_x = 1024) in;
+
+// Pass 2b: exclusive prefix sum of the block sums (single workgroup; requires
+// u_nblocks <= 1024, enforced on the host). Result stored back into bsum as
+// exclusive block offsets.
+layout(std430, binding = 0) buffer BlockSum { uint bsum[]; };
+
+uniform uint u_nblocks;
+
+shared uint s[1024];
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    s[lid] = (lid < u_nblocks) ? bsum[lid] : 0u;
+    barrier();
+
+    for (uint stride = 1u; stride < 1024u; stride <<= 1u) {
+        uint v = 0u;
+        if (lid >= stride) v = s[lid - stride];
+        barrier();
+        s[lid] += v;
+        barrier();
+    }
+
+    uint excl = (lid == 0u) ? 0u : s[lid - 1u];
+    if (lid < u_nblocks) bsum[lid] = excl;
+}

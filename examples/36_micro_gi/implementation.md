@@ -103,26 +103,57 @@ Two compute passes, run once per frame before lighting/gathering:
 - **Deliverable:** point cloud renders with correct direct shading (instanced point/disc
   splat renderer for debug visualization).
 
-### Stage E — Micro-rendering core (compute shader, no importance warping yet)
-This is the heart of the algorithm and where we start simple per your priority order.
-- One workgroup per gather point (e.g. local size 8×8 or 16×16 matching micro-buffer
-  resolution). Shared/local memory holds the micro-buffer: `uint index` + `float depth`
-  per pixel (matches paper's packed 32-bit index+depth micro-buffer).
-- **Fixed hemispherical mapping first** (Nusselt/cosine-weighted disk mapping): Φ(x,y) =
-  (x, y, sqrt(1-x²-y²)) in the local gather-point tangent frame. This gets Stage E working
-  and testable before we add BRDF warping (Stage G).
-- Traversal: depth-first from root, same criterion as the paper — project node's bounding
-  sphere, compute subtended solid angle Ω vs. the pixel's Ω(x,y); if node fits in ≤1 pixel,
-  rasterize (atomic-min style depth test into shared memory) and stop; else recurse into
-  children. GLSL compute doesn't have a call stack, so implement traversal with an explicit
-  local array used as a stack (max size = tree depth, small, fine for shared/private memory).
-- Leaves that still cover >1 pixel go into a **post-traversal list** (small local array).
-- **Convolution**: sum micro-buffer contents (reflected radiance of the referenced node,
-  fetched from `RadianceBuf`) weighted by Ω(x,y) and BRDF (since we're not warped yet, do
-  the multiply explicitly here) → write to `OutputImage`.
-- **Deliverable:** flat/diffuse one-bounce indirect illumination in a static scene, full
-  resolution, no upsampling — compare visually against a simple reference (e.g. a quick
-  CPU/compute path-traced brute force over the same point cloud).
+### Stage E — Micro-rendering core (GPU rasterization point splatting)
+> **IMPLEMENTED** (current code). The original design called for a compute-shader BVH
+> traversal per gather sample; that has been replaced by **real GPU rasterization** of the
+> point hierarchy, per the user's request. This is closer to the hardware-tessellated
+> variant the paper discusses, and it gives us true hardware depth sorting for free.
+
+Three passes, run once per frame:
+
+1. **Per-gather-pixel micro camera setup** (`cam_setup_cs`), one thread per low-res gather
+   pixel. Builds a per-pixel micro camera from the G-buffer (position, normal, albedo,
+   roughness, view direction):
+   - Tangent frame `T/B/N` from the geometric normal and the view direction.
+   - Warped sampling direction via the GGX BRDF warp: `warp_dir = normalize(mix(N, R, 1 - roughness))`
+     where `R` is the specular reflection of the view about `N`.
+   - Outputs `6 × vec4` per gather pixel into `cams_buf` (SSBO binding 23):
+     `pos+valid, T, B, warp_dir, albedo, normal`.
+   - Also regenerates the per-roughness warp table texture when the material roughness
+     slider changes.
+
+2. **Instanced point splatting into a micro-atlas** (`splat_vs`/`splat_fs`), the heart of
+   the change. One `glDrawArraysInstanced(GL_POINTS)` per atlas row-chunk:
+   - Instance = one gather pixel; vertex = one hierarchy node from the selected tree level
+     `L = splat_lod` (range `[2^L-1, 2^(L+1)-1)`, interior nodes carry pulled-up radiance;
+     `L = LOG2N` means leaf surfels). This is the rasterized equivalent of the traversal
+     "cut".
+   - The vertex shader applies the **hemispherical disk mapping** Φ(x,y) =
+     (x, y, sqrt(1-x²-y²)) in the gather pixel's tangent frame — non-linear, so it is
+     implemented manually in the shader rather than as a literal 4×4 matrix.
+   - Culls per splat: invalid gather pixel, self-epsilon (`0.5 × leaf radius`), behind the
+     receiver's hemisphere, outside the warped mapping, and backfacing nodes (via the node's
+     normal-cone axis).
+   - Splat radius in micro pixels: `r_px = min(nodeRadius · invDist · microSize/2, microSize/2)`.
+   - The fragment shader discards outside the round point footprint (`gl_PointCoord`) and
+     writes `gl_FragDepth` from the warped distance — the GPU does the **depth sorting**
+     (micro-buffer depth test) natively.
+   - Output goes to a **micro-atlas**: one RGBA16F color texture + DEPTH_COMPONENT32F
+     renderbuffer, tiled over `atlas_rows` low-res rows per chunk to bound memory
+     (32M pixels per chunk budget).
+   - The splat level is a runtime slider (`splat_lod`), so cost scales like
+     `2^L × gatherPixels`.
+
+3. **Convolution** (`micro_sum_cs`), one thread per gather pixel. Convolves its 8×8 micro
+   tile with the GGX warp Jacobian (same math as the compute-only design) and writes the
+   indirect result to `indirect_tex`. Optionally dumps the tile to `debug_tex` for the
+   `show_micro_debug` overlay.
+
+Bilateral upsampling (Stage H) runs after this to lift the low-res indirect result to full
+resolution.
+
+Measured on an RTX 3060 Laptop GPU (scale=4 → 400×225 gather pixels, LOD 10 → 1024 nodes,
+≈92M splat instances): `setup ≈ 0.03ms`, `splat ≈ 9–11ms`, `sum ≈ 0.10ms`.
 
 ### Stage F — On-demand ray casting for post-traversal list
 - After rasterization, for each pixel with an unresolved leaf-list entry, ray-cast (simple
@@ -188,7 +219,8 @@ This is the heart of the algorithm and where we start simple per your priority o
 - Per-gather-sample warp table computation: start with per-material precomputed tables;
   the fully spatially-varying version is a later refinement (Stage G note above).
 - Morton-order dispatch reordering for coherence (paper's space-filling-curve scheduling,
-  Fig. 13): a performance tweak, not correctness-critical — add once Stage E is correct.
+  Fig. 13): **moot now** — the micro pass is rasterized point splatting, so the GPU's own
+  primitive/VS scheduling handles coherence.
 
 ## 4. Repo layout
 ```

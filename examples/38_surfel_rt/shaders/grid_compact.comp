@@ -1,0 +1,26 @@
+#version 460 core
+layout(local_size_x = 256) in;
+
+// Pass 3: compact surfels into cell order. packed_idx[cell_start[ci] + slot] = s.
+layout(std430, binding = 0) readonly buffer SurfPos { vec4 surfel_pos[]; };
+layout(std430, binding = 1) readonly buffer SurfelSlot { uint surfel_slot[]; };
+layout(std430, binding = 2) readonly buffer CellStart { uint cell_start[]; };
+layout(std430, binding = 3) buffer PackedIdx { uint packed_idx[]; };
+
+uniform vec3 u_grid_min;
+uniform float u_inv_cell;
+uniform ivec3 u_grid_res;
+uniform uint u_num_surfels;
+
+uint cell_index(ivec3 c) {
+    return uint(c.x + u_grid_res.x * (c.y + u_grid_res.y * c.z));
+}
+
+void main() {
+    uint s = gl_GlobalInvocationID.x;
+    if (s >= u_num_surfels) return;
+    vec3 p = surfel_pos[s].xyz;
+    ivec3 c = clamp(ivec3(floor((p - u_grid_min) * u_inv_cell)), ivec3(0), u_grid_res - 1);
+    uint ci = cell_index(c);
+    packed_idx[cell_start[ci] + surfel_slot[s]] = s;
+}

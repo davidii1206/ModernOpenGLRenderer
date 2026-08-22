@@ -1,0 +1,111 @@
+#version 460 core
+// Re-emission bounce: one thread per leaf surfel. Gathers incoming radiance
+// from all other leaves via its own micro-buffer (same flat splat + atomicMin
+// depth sort as micro_render.comp), then re-seeds its outgoing radiance:
+//   rad_next[leaf] = emissive * gain + albedo * E
+// The host copies the leaf region back into Radiance and re-runs the pull-up.
+layout(local_size_x = 256) in;
+
+// fp32 leaf attributes (refit-current).
+layout(std430, binding = 0) readonly buffer PGeom { vec4 pgeom[]; };  // pos + radius
+layout(std430, binding = 1) readonly buffer PNrm  { vec4 pnrm[]; };
+layout(std430, binding = 2) readonly buffer PAlb  { vec4 palb[]; };
+layout(std430, binding = 3) readonly buffer PEmit { vec4 pemit[]; };
+// Packed leaf records for the splat loop.
+layout(std430, binding = 4) readonly buffer Leaves { uvec4 leaf_packed[]; };
+// Current leaf radiance (read) and re-emitted radiance (write).
+layout(std430, binding = 8)  readonly buffer Rad     { vec4 rad[]; };
+layout(std430, binding = 13) writeonly buffer RadNext { vec4 rad_next[]; };
+
+// Bounce micro-buffer atlas: one micro_size^2 tile per leaf gather point.
+layout(binding = 2, r32ui) coherent uniform uimage2D u_bounce;
+
+uniform uint u_num_leaves;
+uniform uint u_rad_offset;
+uniform uint u_micro_size;
+uniform uint u_m_valid;
+uniform uint u_tiles_x;         // atlas tiles per row (ceil(sqrt(N)))
+uniform float u_gain;           // emissive gain (matches radiance_seed)
+uniform vec3 u_scene_min;
+uniform vec3 u_scene_size;
+uniform float u_radius_scale;
+
+vec3 dec_leaf_pos(uvec4 L) {
+    uint px = L.x >> 16u;
+    uint py = L.y >> 16u;
+    uint pz = L.y & 0xFFFFu;
+    return u_scene_min + u_scene_size * (vec3(float(px), float(py), float(pz)) / 65535.0);
+}
+float dec_leaf_radius(uvec4 L) {
+    return float(L.x & 0xFFFFu) / 65535.0 * u_radius_scale;
+}
+vec3 dec_leaf_nrm(uvec4 L) {
+    int hi = int(L.w >> 16u);  hi = hi > 32767 ? hi - 65536 : hi;
+    int lo = int(L.w & 0xFFFFu); lo = lo > 32767 ? lo - 65536 : lo;
+    vec2 p = vec2(float(hi), float(lo)) / 32767.0;
+    vec3 n = vec3(p, 1.0 - abs(p.x) - abs(p.y));
+    if (n.z < 0.0) n.xy = (1.0 - abs(vec2(n.y, n.x))) * sign(n.xy);
+    return normalize(n);
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= u_num_leaves) return;
+
+    vec3 pos = pgeom[i].xyz;
+    vec3 nrm = normalize(pnrm[i].xyz);
+    vec3 alb = palb[i].rgb;
+
+    vec3 up = abs(nrm.y) < 0.999 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    vec3 T = normalize(cross(up, nrm));
+    vec3 B = cross(nrm, T);
+    float half_ms = float(u_micro_size) * 0.5;
+    int m = int(u_micro_size) - 1;
+
+    ivec2 tile = ivec2(int(i % u_tiles_x), int(i / u_tiles_x)) * int(u_micro_size);
+
+    for (uint j = 0u; j < u_num_leaves; ++j) {
+        if (j == i) continue;
+        uvec4 L = leaf_packed[j];
+        vec3 d = dec_leaf_pos(L) - pos;
+        float lr = dec_leaf_radius(L);
+        if (dot(d, nrm) <= lr) continue;   // plane bias (own surface)
+
+        float d2 = dot(d, d);
+        if (d2 < 1e-10) continue;
+        float dist = sqrt(d2);
+        vec3 dir = d / dist;
+        if (dot(dir, dec_leaf_nrm(L)) >= 0.0) continue;   // backface
+
+        float ux = dot(dir, T);
+        float vy = dot(dir, B);
+        if (ux * ux + vy * vy > 1.0) continue;
+
+        int pr = clamp(int(0.5 + lr / dist * half_ms), 0, m);
+        int px = clamp(int((ux + 1.0) * half_ms), 0, m);
+        int py = clamp(int((vy + 1.0) * half_ms), 0, m);
+
+        uint qd = min(uint(dist * 1024.0 + 0.5), 8191u);
+        uint key = (qd << 19) | ((u_rad_offset + j) & 0x7FFFFu);
+
+        for (int sy = max(0, py - pr); sy <= min(m, py + pr); ++sy)
+            for (int sx = max(0, px - pr); sx <= min(m, px + pr); ++sx)
+                imageAtomicMin(u_bounce, tile + ivec2(sx, sy), key);
+    }
+
+    // Convolve: E = incoming radiance over the disk (cosine mapping cancels).
+    vec3 E = vec3(0.0);
+    for (uint y = 0u; y < u_micro_size; ++y)
+        for (uint x = 0u; x < u_micro_size; ++x) {
+            float uu = (float(x) + 0.5) / half_ms - 1.0;
+            float vv = (float(y) + 0.5) / half_ms - 1.0;
+            if (uu * uu + vv * vv > 1.0) continue;
+            uint key = imageLoad(u_bounce, tile + ivec2(x, y)).x;
+            if (key == 0xFFFFFFFFu) continue;
+            E += rad[key & 0x7FFFFu].rgb;
+        }
+    E /= float(u_m_valid);
+
+    vec3 emi = pemit[i].rgb * u_gain;
+    rad_next[u_rad_offset + i] = vec4(emi + alb * E, 1.0);
+}

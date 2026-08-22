@@ -1,0 +1,34 @@
+#version 460 core
+layout(local_size_x = 256) in;
+
+struct GpuTri { vec4 pos[3]; vec4 nrm[3]; };
+struct LeafSrc { uint tri_idx; float u; float v; float pad; };
+
+layout(std430, binding = 0) buffer PGeom    { vec4 pgeom[]; };
+layout(std430, binding = 1) buffer PNrm     { vec4 pnrm[]; };
+layout(std430, binding = 5) buffer Spheres  { vec4 sphere_buf[]; };
+layout(std430, binding = 9) buffer Cones    { vec4 cone_buf[]; };
+layout(std430, binding = 6) readonly buffer Tris     { GpuTri tri_buf[]; };
+layout(std430, binding = 7) readonly buffer LeafSrcs { LeafSrc leaf_src[]; };
+
+uniform uint u_num_leaves;
+uniform uint u_tree_offset;   // interior node count; leaves live at [offset, offset+N)
+uniform float u_leaf_radius;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= u_num_leaves) return;
+
+    LeafSrc ls = leaf_src[i];
+    GpuTri t = tri_buf[ls.tri_idx];
+    float w = 1.0 - ls.u - ls.v;
+
+    vec3 pos = ls.u * t.pos[0].xyz + ls.v * t.pos[1].xyz + w * t.pos[2].xyz;
+    vec3 nrm = normalize(ls.u * t.nrm[0].xyz + ls.v * t.nrm[1].xyz + w * t.nrm[2].xyz);
+
+    uint node = u_tree_offset + i;
+    pgeom[i]      = vec4(pos, u_leaf_radius);
+    pnrm[i]       = vec4(nrm, 0.0);
+    sphere_buf[node] = vec4(pos, u_leaf_radius);
+    cone_buf[node]   = vec4(nrm, 1.0);
+}
