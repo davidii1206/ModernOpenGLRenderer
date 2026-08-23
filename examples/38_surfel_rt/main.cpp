@@ -81,6 +81,7 @@ struct FeatEdge {
     float half_len = 0.0f;
     glm::vec3 na, nb;    // incident face normals (nb unused when boundary)
     glm::vec3 ctr_a, ctr_b;  // incident face centroids (ctr_b unused when boundary)
+    glm::vec3 tri_a[3];  // incident triangle of face a (boundary ownership test)
     bool boundary = false;
 };
 
@@ -215,7 +216,6 @@ struct ExtractedMesh {
 
 ExtractedMesh extract_triangles(const gfx::Model& model, const glm::mat4& model_mat) {
     ExtractedMesh out;
-    glm::mat3 normal_mat = glm::transpose(glm::inverse(glm::mat3(model_mat)));
 
     for (size_t mi = 0; mi < model.mesh_count(); ++mi) {
         const gfx::Mesh& mesh = model.mesh(int(mi));
@@ -224,6 +224,11 @@ ExtractedMesh extract_triangles(const gfx::Model& model, const glm::mat4& model_
         glm::vec3 alb(mat.base_color_factor[0], mat.base_color_factor[1], mat.base_color_factor[2]);
         bool is_mirror = (mat.name.find("tallBox") != std::string::npos) ||
                          (mat.roughness_factor < 0.05f);
+        
+        // Combine the mesh's node transform with the global model transform
+        glm::mat4 combined_xform = model_mat * model.mesh_transform(int(mi));
+        glm::mat3 normal_mat = glm::transpose(glm::inverse(glm::mat3(combined_xform)));
+        
         const auto& vs = mesh.vertices();
         const auto& is = mesh.indices();
 
@@ -232,9 +237,9 @@ ExtractedMesh extract_triangles(const gfx::Model& model, const glm::mat4& model_
             glm::vec3 pa(a.position[0], a.position[1], a.position[2]);
             glm::vec3 pb(b.position[0], b.position[1], b.position[2]);
             glm::vec3 pc(c.position[0], c.position[1], c.position[2]);
-            t.p[0] = glm::vec3(model_mat * glm::vec4(pa, 1.0f));
-            t.p[1] = glm::vec3(model_mat * glm::vec4(pb, 1.0f));
-            t.p[2] = glm::vec3(model_mat * glm::vec4(pc, 1.0f));
+            t.p[0] = glm::vec3(combined_xform * glm::vec4(pa, 1.0f));
+            t.p[1] = glm::vec3(combined_xform * glm::vec4(pb, 1.0f));
+            t.p[2] = glm::vec3(combined_xform * glm::vec4(pc, 1.0f));
             glm::vec3 na = normal_mat * glm::vec3(a.normal[0], a.normal[1], a.normal[2]);
             glm::vec3 nb = normal_mat * glm::vec3(b.normal[0], b.normal[1], b.normal[2]);
             glm::vec3 nc = normal_mat * glm::vec3(c.normal[0], c.normal[1], c.normal[2]);
@@ -266,6 +271,7 @@ ExtractedMesh extract_triangles(const gfx::Model& model, const glm::mat4& model_
         glm::vec3 n[2];
         glm::vec3 ctr[2];   // centroids of the incident triangles
         glm::vec3 p[2][3];
+        glm::vec3 opp[2];   // third vertex of each incident triangle
     };
     std::map<std::pair<int64_t,int64_t>, EdgeAccum> edge_map;
     auto qkey = [&](const glm::vec3& p) -> int64_t {
@@ -288,6 +294,7 @@ ExtractedMesh extract_triangles(const gfx::Model& model, const glm::mat4& model_
                 e.ctr[e.count] = ctr;
                 e.p[e.count][0] = p0;
                 e.p[e.count][1] = p1;
+                e.opp[e.count] = t.p[0] + t.p[1] + t.p[2] - p0 - p1;
             }
             ++e.count;
         }
@@ -302,6 +309,9 @@ ExtractedMesh extract_triangles(const gfx::Model& model, const glm::mat4& model_
             fe.boundary = true;
             fe.na = e.n[0];
             fe.ctr_a = e.ctr[0];
+            fe.tri_a[0] = e.p[0][0];
+            fe.tri_a[1] = e.p[0][1];
+            fe.tri_a[2] = e.opp[0];
             out.edges.push_back(fe);
         } else if (e.count == 2 && std::abs(glm::dot(e.n[0], e.n[1])) < kSHARP_DOT) {
             fe.boundary = false;
@@ -378,17 +388,18 @@ static std::vector<SamplePoint> sample_points_lattice(
 // Cuts are derived from topology (extracted sharp/boundary edges), not from
 // neighbor samples: planes land exactly on triangle borders regardless of local
 // sampling. Which side of an edge a surfel's disk lives on is decided from the
-// INCIDENT FACE GEOMETRY (centroids), never from the surfel center: the
-// barycentric lattice places whole rows of samples exactly ON the triangle
-// borders, so position tests against the surfel center are exactly zero there
-// and strict-inequality orientation tests used to flip cuts the wrong way
-// round (disks keeping the outside half-plane => overextension; whole disks
-// rejected at concave seams => hairline gaps). For a shared sharp edge the cut
-// is the OTHER incident face's plane through the closest point on the edge;
-// at CONCAVE junctions it is extended by a small overlap so adjacent faces'
-// disks fuse across the seam (the poke hides inside the crevice). At convex
-// and boundary edges the cut stays exact, keeping silhouettes straight and
-// flush with the triangles.
+// INCIDENT FACE GEOMETRY (centroids), never from the surfel center or the sign
+// of a computed offset: the barycentric lattice places whole rows of samples
+// exactly ON the triangle borders, so those quantities are exactly zero there
+// and sign-based decisions flip cuts the wrong way round for roughly half of
+// the border samples (disks keeping the outside half-plane => overextension;
+// whole disks rejected at concave seams => hairline gaps). Cuts are EXACT at
+// every edge: both faces' border rows end at the seam line, so the clipped
+// disk sets meet watertight — no overlap poke is needed, and attributes do not
+// blend across the crease. Shared edges only cut surfels of their two incident
+// faces, boundary edges only surfels lying on the incident triangle (other
+// surfaces merely pass close by — a box standing on the floor must not be
+// clipped by the floor, or vice versa).
 // Shader clip condition: dot(q - surfel_pos, cut.xyz) <= cut.w.
 // ---------------------------------------------------------------------------
 
@@ -398,8 +409,7 @@ constexpr float kCutInf = 1e30f;
 std::vector<glm::vec4> compute_surfel_cuts(const std::vector<SamplePoint>& pts,
                                            const std::vector<FeatEdge>& edges,
                                            float search_radius, float ref_radius) {
-    // Concave seams overlap by this much so clipped half-surfaces fuse.
-    const float cut_overlap = 0.35f * ref_radius;
+    (void)ref_radius;
     const float reach = 2.0f * search_radius;   // covers radius_scale up to ~2.0
     const int N = int(pts.size());
     std::vector<glm::vec4> cuts(size_t(N) * kSurfelCuts, glm::vec4(0.0f, 0.0f, 0.0f, kCutInf));
@@ -424,39 +434,55 @@ std::vector<glm::vec4> compute_surfel_cuts(const std::vector<SamplePoint>& pts,
             glm::vec3 cp = e.mid + e.dir * t;
             if (glm::length(ca - cp) > reach) continue;
             if (!e.boundary) {
-                // Shared sharp edge: clip each surfel at the plane of the
-                // OTHER incident face (never its own plane). Own face is
-                // identified by normal agreement; with flat face normals this
-                // is exact (1 vs ~0).
+                // Shared sharp edge: only the two incident faces are clipped.
+                // Own face is identified by normal agreement; with flat face
+                // normals this is exact (1 vs ~0).
                 const float da = glm::dot(pts[i].nrm, e.na);
                 const float db = glm::dot(pts[i].nrm, e.nb);
+                if (glm::max(da, db) < 0.5f) continue;   // surfel of another surface
                 const bool own_is_a = da >= db;
                 const glm::vec3& other = own_is_a ? e.nb : e.na;
                 const glm::vec3& own_ctr = own_is_a ? e.ctr_a : e.ctr_b;
                 // Concavity from the OWN face's centroid: strictly inside the
                 // face, so the test never degenerates (the surfel center can
                 // sit exactly on the edge). Concave => own face extends into
-                // the other face's half-space (crevice) => fuse with overlap;
-                // convex silhouette edges stay exact.
-                bool concave = glm::dot(other, own_ctr - cp) > 0.0f;
+                // the other face's half-space (crevice).
+                const bool concave = glm::dot(other, own_ctr - cp) > 0.0f;
                 // Plane through cp (on the edge) with the other face's normal:
                 // keep dot(p - cp, other) <= 0, i.e. reject the half-space on
                 // the other face's side. NEVER branch on the sign of off: the
-                // lattice border rows sit exactly ON the edge, off is pure
-                // float noise there, and a sign-based flip inverts the cut for
-                // roughly half of them (disks leaking past the edge).
+                // border rows sit exactly ON the edge, off is pure float noise
+                // there, and a sign-based flip inverts the cut for roughly
+                // half of them (disks leaking past the edge).
                 glm::vec3 n = other;
                 float off = glm::dot(cp - ca, n);
                 if (concave) {
-                    // Flip unconditionally (own face lives on the positive
-                    // side) and extend across the seam so clipped
-                    // half-surfaces fuse; the poke hides in the crevice.
+                    // Own face lives on the positive side: flip so the cut
+                    // keeps it, ending exactly at the seam line.
                     n = -n;
-                    off = glm::max(-off, 0.0f) + cut_overlap;
+                    off = glm::max(-off, 0.0f);
                 }
                 add_cut(n, off);
             } else {
-                // Boundary edge: reject points beyond the edge line only.
+                // Boundary edge: clip only surfels lying ON the incident
+                // triangle — other surfaces passing within reach (a box
+                // standing on the floor) keep their disks. Ownership test:
+                // the sample must sit on the triangle's plane AND inside it
+                // (with tolerance; lattice samples lie exactly on it).
+                const float dp = glm::dot(ca - e.tri_a[0], e.na);
+                if (std::abs(dp) > 1e-3f) continue;
+                const glm::vec3 v0 = e.tri_a[1] - e.tri_a[0];
+                const glm::vec3 v1 = e.tri_a[2] - e.tri_a[0];
+                const glm::vec3 vq = ca - e.na * dp - e.tri_a[0];
+                const float d00 = glm::dot(v0, v0), d01 = glm::dot(v0, v1);
+                const float d11 = glm::dot(v1, v1);
+                const float d20 = glm::dot(vq, v0), d21 = glm::dot(vq, v1);
+                const float den = d00 * d11 - d01 * d01;
+                if (std::abs(den) < 1e-12f) continue;
+                const float bu = (d11 * d20 - d01 * d21) / den;
+                const float bv = (d00 * d21 - d01 * d20) / den;
+                const float bw = 1.0f - bu - bv;
+                if (bu < -1e-3f || bv < -1e-3f || bw < -1e-3f) continue;
                 // u points from the edge into the face interior, decided
                 // against the incident face's centroid (strictly inside, so
                 // never degenerate for border-row samples). The shader keeps
@@ -697,16 +723,36 @@ int main() {
     if (getenv("SRT_TGT_Z")) cam_tgt.z = std::atof(getenv("SRT_TGT_Z"));
     cam.look_at(cam_pos, cam_tgt);
 
+    // Model list.
+    const char* model_paths[] = {
+        "CornellBoxMirrorBox.glb",
+        "CornellBoxBunnyMirror.glb",
+        "CornellBoxMirrorBunny.glb",
+    };
+    const char* model_names[] = {
+        "Cornell Box (Mirror)",
+        "Cornell Box (Mirror) + Bunny",
+        "Cornell Box + Bunny (Mirror)",
+    };
+    constexpr int num_models = 3;
+    int current_model_index = 0;
+
     // Model.
-    const char* model_path = "CornellBoxMirrorBox.glb";
+    const char* model_path = model_paths[current_model_index];
     gfx::Model model;
     if (!model.load(model_path)) {
-        gllib::log(gllib::LogLevel::error, "Failed to load CornellBoxMirrorBox.glb");
+        gllib::logf(gllib::LogLevel::error, "Failed to load %s", model_path);
         return EXIT_FAILURE;
     }
-    // The model node rotates 90 deg about X; gfx::Model keeps meshes in local
-    // space, so bake it here (makes the box axis-aligned: +Y up, open face -Z).
-    glm::mat4 model_mat = glm::rotate(glm::mat4(1.0f), glm::radians(90.0f), glm::vec3(1, 0, 0));
+    
+    // The glTF models already have correct orientations encoded in their node transforms.
+    // No additional global transform is needed.
+    auto get_model_transform = [](int model_idx) -> glm::mat4 {
+        (void)model_idx;  // All models use identity transform
+        return glm::mat4(1.0f);
+    };
+    
+    glm::mat4 model_mat = get_model_transform(current_model_index);
 
     gllib::logf(gllib::LogLevel::info, "Loaded: %zu meshes, %zu materials",
                 model.mesh_count(), model.material_count());
@@ -724,11 +770,51 @@ int main() {
     float search_radius = 0.0f;   // max per-surfel radius, for grid/traversal bounds
     float total_area = 0.0f;
 
-    // Feature edges are needed on every launch (cut planes are computed from
-    // them even when the surfel cloud itself comes from the cache).
-    ExtractedMesh em = extract_triangles(model, model_mat);
+    // Load the initial model
+    ExtractedMesh em;
+    if (!model.load(model_path)) {
+        gllib::logf(gllib::LogLevel::error, "Failed to load %s", model_path);
+        return EXIT_FAILURE;
+    }
+    em = extract_triangles(model, model_mat);
     total_area = 0.0f;
     for (const auto& t : em.tris) total_area += t.area;
+
+    gllib::logf(gllib::LogLevel::info, "Loaded: %zu meshes, %zu materials",
+                model.mesh_count(), model.material_count());
+    for (size_t i = 0; i < model.material_count(); ++i) {
+        const auto& m = model.material_info(i);
+        gllib::logf(gllib::LogLevel::info, "mat %zu '%s': albedo(%.3f %.3f %.3f) rough=%.3f",
+                    i, m.name.c_str(), m.base_color_factor[0], m.base_color_factor[1],
+                    m.base_color_factor[2], m.roughness_factor);
+    }
+
+    // Function to load a model and extract its triangles
+    auto load_model_and_extract = [&](const char* new_model_path) -> bool {
+        gfx::Model new_model;
+        if (!new_model.load(new_model_path)) {
+            gllib::logf(gllib::LogLevel::error, "Failed to load %s", new_model_path);
+            return false;
+        }
+        model = std::move(new_model);
+        model_path = new_model_path;
+        
+        gllib::logf(gllib::LogLevel::info, "Loaded: %zu meshes, %zu materials",
+                    model.mesh_count(), model.material_count());
+        for (size_t i = 0; i < model.material_count(); ++i) {
+            const auto& m = model.material_info(i);
+            gllib::logf(gllib::LogLevel::info, "mat %zu '%s': albedo(%.3f %.3f %.3f) rough=%.3f",
+                        i, m.name.c_str(), m.base_color_factor[0], m.base_color_factor[1],
+                        m.base_color_factor[2], m.roughness_factor);
+        }
+        
+        // Extract triangles with the model transform
+        em = extract_triangles(model, model_mat);
+        total_area = 0.0f;
+        for (const auto& t : em.tris) total_area += t.area;
+        
+        return true;
+    };
 
     std::vector<SamplePoint> surfels;
 
@@ -761,6 +847,9 @@ int main() {
     };
     build_surfels();
 
+    // Feature edges are needed on every launch (cut planes are computed from
+    // them even when the surfel cloud itself comes from the cache).
+    
     // Max per-surfel radius bounds the grid cell size and ray-traversal search
     // radius (must cover the largest disk so neighborhood windows reach it).
     search_radius = 0.0f;
@@ -1089,15 +1178,18 @@ int main() {
             auto loc = [&](const char* n) { return gbuf->uniform_location(n); };
             GLint l;
             l = loc("u_view_proj");      if (l >= 0) gbuf->uniform_matrix4fv(l, glm::value_ptr(vp));
-            l = loc("u_model");           if (l >= 0) gbuf->uniform_matrix4fv(l, glm::value_ptr(model_mat));
-            glm::mat3 normal_mat = glm::transpose(glm::inverse(glm::mat3(model_mat)));
-            l = loc("u_normal_mat");      if (l >= 0) gbuf->uniform_matrix3fv(l, glm::value_ptr(normal_mat));
             l = loc("u_light_pos");       if (l >= 0) gbuf->uniform3f(l, light_pos.x, light_pos.y, light_pos.z);
             l = loc("u_light_color");     if (l >= 0) gbuf->uniform3f(l, light_color.x, light_color.y, light_color.z);
             l = loc("u_light_intensity"); if (l >= 0) gbuf->uniform1f(l, light_intensity);
             l = loc("u_ambient");         if (l >= 0) gbuf->uniform1f(l, ambient);
 
             for (size_t i = 0; i < model.mesh_count(); ++i) {
+                // Apply per-mesh transform combined with global model transform
+                glm::mat4 combined_xform = model_mat * model.mesh_transform(int(i));
+                glm::mat3 normal_mat = glm::transpose(glm::inverse(glm::mat3(combined_xform)));
+                l = loc("u_model");           if (l >= 0) gbuf->uniform_matrix4fv(l, glm::value_ptr(combined_xform));
+                l = loc("u_normal_mat");      if (l >= 0) gbuf->uniform_matrix3fv(l, glm::value_ptr(normal_mat));
+                
                 int mi = model.mesh_material(int(i));
                 const auto& mat = model.material_info(size_t(mi >= 0 ? mi : 0));
                 l = loc("u_albedo");    if (l >= 0) gbuf->uniform3f(l, mat.base_color_factor[0], mat.base_color_factor[1], mat.base_color_factor[2]);
@@ -1267,6 +1359,64 @@ int main() {
             ImGui::Begin("38 Surfel Ray Tracing");
             ImGui::Text("FPS: %.1f   Frame: %.2f ms", 1.0f / std::max(dt, 1e-6f), dt * 1000.0f);
             ImGui::Text("Resolution: %d x %d", fw, fh);
+            ImGui::Separator();
+
+            // Model selection
+            static int last_model_index = current_model_index;
+            if (ImGui::Combo("Model", &current_model_index, model_names, num_models)) {
+                if (current_model_index != last_model_index) {
+                    last_model_index = current_model_index;
+                    model_path = model_paths[current_model_index];
+                    model_mat = get_model_transform(current_model_index);  // Update model transform for the new model
+                    
+                    // Load new model and extract triangles
+                    if (load_model_and_extract(model_path)) {
+                        // Rebuild surfels with the new model
+                        build_surfels();
+                        
+                        // Recompute grid parameters
+                        search_radius = 0.0f;
+                        for (const auto& s : surfels) search_radius = std::max(search_radius, s.radius);
+                        
+                        // Update AABB
+                        mn = glm::vec3(1e30f);
+                        mx = glm::vec3(-1e30f);
+                        for (const auto& s : surfels) {
+                            mn = glm::min(mn, s.pos);
+                            mx = glm::max(mx, s.pos);
+                        }
+                        scene_size = mx - mn;
+                        gllib::logf(gllib::LogLevel::info,
+                                    "surfel AABB (%.3f %.3f %.3f)-(%.3f %.3f %.3f), radius=%.5f",
+                                    mn.x, mn.y, mn.z, mx.x, mx.y, mx.z, leaf_radius);
+                        
+                        // Update surfels buffers
+                        compute_grid_params(2.0f * search_radius);
+                        cell_count_buf.data(nullptr, size_t(grid_volume) * sizeof(uint32_t));
+                        cell_start_buf.data(nullptr, size_t(grid_volume) * sizeof(uint32_t));
+                        block_sum_buf.data(nullptr, kScanBlocksMax * sizeof(uint32_t));
+                        
+                        std::vector<glm::vec4> vp_new(N), vn_new(N), va_new(N);
+                        for (int i = 0; i < N; ++i) {
+                            vp_new[i] = glm::vec4(surfels[i].pos, surfels[i].radius);
+                            vn_new[i] = glm::vec4(surfels[i].nrm, 0.0f);
+                            va_new[i] = glm::vec4(surfels[i].alb, surfels[i].is_mirror ? 1.0f : 0.0f);
+                        }
+                        surfel_pos_buf.data(vp_new.data(), vp_new.size() * sizeof(glm::vec4));
+                        surfel_nrm_buf.data(vn_new.data(), vn_new.size() * sizeof(glm::vec4));
+                        surfel_alb_buf.data(va_new.data(), va_new.size() * sizeof(glm::vec4));
+                        
+                        std::vector<glm::vec4> cuts_new = compute_surfel_cuts(surfels, em.edges, search_radius, leaf_radius);
+                        surfel_cut_buf.data(cuts_new.data(), cuts_new.size() * sizeof(glm::vec4));
+                        surfel_slot_buf.data(nullptr, size_t(N) * sizeof(uint32_t));
+                        packed_idx_buf.data(nullptr, size_t(N) * sizeof(uint32_t));
+                        
+                        build_grid();
+                        refresh_occupied_cells();
+                        traced = false;
+                    }
+                }
+            }
             ImGui::Separator();
 
             if (ImGui::Button("Ray Trace")) run_raytrace();

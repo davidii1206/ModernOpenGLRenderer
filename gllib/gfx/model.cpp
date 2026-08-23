@@ -282,6 +282,7 @@ void Model::clear() {
     mesh_material_map_.clear();
     mesh_names_.clear();
     mesh_bounding_spheres_.clear();
+    mesh_transforms_.clear();
     materials_.clear();
     textures_.clear();
     lod_groups_.clear();
@@ -431,9 +432,56 @@ bool Model::load_gltf(const std::string& path) {
         materials_.push_back(info);
     }
 
+    // --- Extract node transforms and build mesh-to-transform mapping ---
+    // glTF stores transforms (TRS) at nodes, not meshes. We need to iterate through
+    // nodes and collect the transform for each mesh.
+    std::unordered_map<int, glm::mat4> mesh_to_transform;
+    
+    auto node_transform_to_matrix = [](const tinygltf::Node& node) -> glm::mat4 {
+        glm::mat4 m(1.0f);
+        
+        // Apply translation
+        if (node.translation.size() == 3) {
+            glm::vec3 t(float(node.translation[0]), float(node.translation[1]), float(node.translation[2]));
+            m = glm::translate(m, t);
+        }
+        
+        // Apply rotation (quaternion)
+        if (node.rotation.size() == 4) {
+            glm::quat q(float(node.rotation[3]), float(node.rotation[0]), float(node.rotation[1]), float(node.rotation[2]));
+            m = m * glm::mat4_cast(q);
+        }
+        
+        // Apply scale
+        if (node.scale.size() == 3) {
+            glm::vec3 s(float(node.scale[0]), float(node.scale[1]), float(node.scale[2]));
+            m = glm::scale(m, s);
+        }
+        
+        // If matrix is provided directly, use it
+        if (node.matrix.size() == 16) {
+            glm::mat4 direct(1.0f);
+            for (int i = 0; i < 16; ++i) {
+                direct[i / 4][i % 4] = float(node.matrix[i]);
+            }
+            m = direct;
+        }
+        
+        return m;
+    };
+    
+    // Process all nodes to build the mesh-to-transform map
+    for (const auto& node : mdl.nodes) {
+        if (node.mesh >= 0) {
+            glm::mat4 node_xform = node_transform_to_matrix(node);
+            mesh_to_transform[node.mesh] = node_xform;
+        }
+    }
+
     // --- Load meshes ---
     gllib::logf(gllib::LogLevel::info, "loading %zu meshes ...", mdl.meshes.size());
-    for (const auto& gltf_mesh : mdl.meshes) {
+    for (size_t mi = 0; mi < mdl.meshes.size(); ++mi) {
+        const auto& gltf_mesh = mdl.meshes[mi];
         for (size_t pi = 0; pi < gltf_mesh.primitives.size(); ++pi) {
             const auto& prim = gltf_mesh.primitives[pi];
 
@@ -553,6 +601,11 @@ bool Model::load_gltf(const std::string& path) {
             mesh_material_map_.push_back(prim.material);
             mesh_names_.push_back(gltf_mesh.name);
             mesh_bounding_spheres_.push_back(glm::vec4(center, radius));
+            
+            // Look up the node transform for this mesh (if any)
+            auto it = mesh_to_transform.find(static_cast<int>(mi));
+            glm::mat4 transform = (it != mesh_to_transform.end()) ? it->second : glm::mat4(1.0f);
+            mesh_transforms_.push_back(transform);
 
             size_t tri_count = indices.empty() ? vertex_count / 3 : indices.size() / 3;
             gllib::logf(gllib::LogLevel::debug, "  → mesh %zu: '%s' primitive %zu: %zu verts, %zu indices (%zu tris), material %d",

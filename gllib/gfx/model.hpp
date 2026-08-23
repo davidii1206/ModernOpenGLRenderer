@@ -1,6 +1,7 @@
 #pragma once
 
 #include <glm/vec4.hpp>
+#include <glm/mat4x4.hpp>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -59,6 +60,7 @@ public:
     int mesh_material(size_t i) const { return mesh_material_map_[i]; }
     const std::string& mesh_name(size_t i) const { return mesh_names_[i]; }
     const glm::vec4& mesh_bounding_sphere(size_t i) const { return mesh_bounding_spheres_[i]; }
+    const glm::mat4& mesh_transform(size_t i) const { return mesh_transforms_[i]; }
 
     size_t material_count() const { return materials_.size(); }
     const ModelMaterialInfo& material_info(size_t i) const { return materials_[i]; }
@@ -87,6 +89,7 @@ private:
     std::vector<int> mesh_material_map_;
     std::vector<std::string> mesh_names_;
     std::vector<glm::vec4> mesh_bounding_spheres_;
+    std::vector<glm::mat4> mesh_transforms_;
     std::vector<ModelMaterialInfo> materials_;
     std::vector<std::shared_ptr<Texture>> textures_;
     std::vector<LodGroup> lod_groups_;

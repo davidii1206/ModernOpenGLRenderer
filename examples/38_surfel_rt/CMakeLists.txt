@@ -11,3 +11,15 @@ add_custom_command(TARGET 38_surfel_rt POST_BUILD
           ${CMAKE_SOURCE_DIR}/data/CornellBoxMirrorBox.glb
           $<TARGET_FILE_DIR:38_surfel_rt>
 )
+
+add_custom_command(TARGET 38_surfel_rt POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy
+          ${CMAKE_SOURCE_DIR}/data/CornellBoxBunnyMirror.glb
+          $<TARGET_FILE_DIR:38_surfel_rt>
+)
+
+add_custom_command(TARGET 38_surfel_rt POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy
+          ${CMAKE_SOURCE_DIR}/data/CornellBoxMirrorBunny.glb
+          $<TARGET_FILE_DIR:38_surfel_rt>
+)
