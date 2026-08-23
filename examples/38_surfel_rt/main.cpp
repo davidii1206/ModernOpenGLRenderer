@@ -36,6 +36,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <map>
 #include <numeric>
 #include <random>
 #include <string>
@@ -43,8 +44,8 @@
 #include <vector>
 
 constexpr float kPi      = 3.14159265358979f;
-constexpr int   kBEST_K  = 24;
-constexpr float kCOVERAGE = 1.4f;
+constexpr float kLATTICE_R = 0.8f;    // stored disk radius = this * grid step h
+constexpr float kSHARP_DOT = 0.6f;    // |n_i . n_j| below this => sharp edge
 constexpr uint32_t kSEED = 42;
 constexpr int   kBudgetOptions[] = {4096, 16384, 65536};
 constexpr int   kBudgetCount = 3;
@@ -67,8 +68,20 @@ struct SamplePoint {
     glm::vec3 pos{0.0f};
     glm::vec3 nrm{0.0f};
     glm::vec3 alb{0.0f};
-    float radius = 0.0f;   // adaptive per-surfel disk radius (paper future-work: local density)
+    float radius = 0.0f;   // uniform disk radius (lattice step derived)
     bool is_mirror = false;
+};
+
+// Sharp/boundary mesh feature edge (world space). Cut planes for the surfel
+// disks are anchored to these, so clipped disks end exactly at triangle
+// borders (paper §3: border gaps need special handling).
+struct FeatEdge {
+    glm::vec3 mid;       // midpoint of the edge
+    glm::vec3 dir;       // unit edge direction
+    float half_len = 0.0f;
+    glm::vec3 na, nb;    // incident face normals (nb unused when boundary)
+    glm::vec3 ctr_a, ctr_b;  // incident face centroids (ctr_b unused when boundary)
+    bool boundary = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -197,6 +210,7 @@ void camera_control(gfx::Window& w, gfx::Camera& cam, float dt, bool allow, bool
 struct ExtractedMesh {
     std::vector<Tri> tris;
     std::vector<bool> tri_mirror;   // parallel to tris
+    std::vector<FeatEdge> edges;    // sharp + boundary feature edges
 };
 
 ExtractedMesh extract_triangles(const gfx::Model& model, const glm::mat4& model_mat) {
@@ -242,231 +256,218 @@ ExtractedMesh extract_triangles(const gfx::Model& model, const glm::mat4& model_
                 add_tri(vs[is[k]], vs[is[k + 1]], vs[is[k + 2]]);
         }
     }
+
+    // Feature edges: hash triangle edges by quantized endpoint positions and
+    // collect incident face normals (geometric, from baked winding). Edges with
+    // one incident triangle are boundaries (open space beyond); edges whose two
+    // faces differ sharply are creases. Coplanar diagonals drop out on their own.
+    struct EdgeAccum {
+        int count = 0;
+        glm::vec3 n[2];
+        glm::vec3 ctr[2];   // centroids of the incident triangles
+        glm::vec3 p[2][3];
+    };
+    std::map<std::pair<int64_t,int64_t>, EdgeAccum> edge_map;
+    auto qkey = [&](const glm::vec3& p) -> int64_t {
+        return int64_t(std::llround(p.x * 10000.0f)) * 73856093 ^
+               int64_t(std::llround(p.y * 10000.0f)) * 19349663 ^
+               int64_t(std::llround(p.z * 10000.0f)) * 83492791;
+    };
+    for (size_t ti = 0; ti < out.tris.size(); ++ti) {
+        const Tri& t = out.tris[ti];
+        glm::vec3 fn = glm::normalize(glm::cross(t.p[1] - t.p[0], t.p[2] - t.p[0]));
+        glm::vec3 ctr = (t.p[0] + t.p[1] + t.p[2]) / 3.0f;
+        for (int k = 0; k < 3; ++k) {
+            const glm::vec3& p0 = t.p[k];
+            const glm::vec3& p1 = t.p[(k + 1) % 3];
+            auto ka = qkey(p0), kb = qkey(p1);
+            if (ka > kb) std::swap(ka, kb);
+            EdgeAccum& e = edge_map[{ka, kb}];
+            if (e.count < 2) {
+                e.n[e.count] = fn;
+                e.ctr[e.count] = ctr;
+                e.p[e.count][0] = p0;
+                e.p[e.count][1] = p1;
+            }
+            ++e.count;
+        }
+    }
+    out.edges.reserve(edge_map.size());
+    for (auto& [key, e] : edge_map) {
+        FeatEdge fe;
+        fe.mid = 0.5f * (e.p[0][0] + e.p[0][1]);
+        fe.dir = glm::normalize(e.p[0][1] - e.p[0][0]);
+        fe.half_len = 0.5f * glm::length(e.p[0][1] - e.p[0][0]);
+        if (e.count == 1) {
+            fe.boundary = true;
+            fe.na = e.n[0];
+            fe.ctr_a = e.ctr[0];
+            out.edges.push_back(fe);
+        } else if (e.count == 2 && std::abs(glm::dot(e.n[0], e.n[1])) < kSHARP_DOT) {
+            fe.boundary = false;
+            fe.na = e.n[0];
+            fe.nb = e.n[1];
+            fe.ctr_a = e.ctr[0];
+            fe.ctr_b = e.ctr[1];
+            out.edges.push_back(fe);
+        }
+    }
     return out;
 }
 
 // ---------------------------------------------------------------------------
-// Mitchell best-candidate sampling, area-weighted
+// Barycentric lattice sampling.
+//
+// Instead of random best-candidate placement, each triangle carries a regular
+// lattice aligned to its edges: p0 + (u/n1) e1 + (v/n2) e2 for u,v >= 0 inside
+// u/n1 + v/n2 <= 1. All three triangle borders receive rows lying exactly on
+// them, spacing is uniform, and the biggest hole is known analytically (paper
+// Â§3/Â§4.1 require r > biggest hole): lattice covering radius is at most
+// sqrt(h1^2+h2^2)/2 <= h*sqrt(2)/2, so a uniform disk radius kLATTICE_R * h
+// with kLATTICE_R > 0.71 makes the point-sampled surface provably watertight.
+// A second pass rescales h so the count matches the requested budget.
 // ---------------------------------------------------------------------------
 
-SamplePoint sample_on_tri(const Tri& tri, std::mt19937& rng, bool is_mirror) {
-    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-    float su = dist(rng), sv = dist(rng);
-    if (su + sv > 1.0f) { su = 1.0f - su; sv = 1.0f - sv; }
-    float sw = 1.0f - su - sv;
-    SamplePoint s;
-    s.pos = su * tri.p[0] + sv * tri.p[1] + sw * tri.p[2];
-    s.nrm = glm::normalize(su * tri.n[0] + sv * tri.n[1] + sw * tri.n[2]);
-    s.alb = tri.alb;
-    s.is_mirror = is_mirror;
-    return s;
-}
-
-// Returns (surfels, total_area).
-std::pair<std::vector<SamplePoint>, float> sample_points_mitchell(
+static std::vector<SamplePoint> sample_points_lattice(
     const std::vector<Tri>& tris, const std::vector<bool>& tri_mirror,
-    float total_area, int N, int K)
+    float total_area, int N, float& step_out)
 {
-    std::vector<float> cdf(tris.size());
-    float acc = 0.0f;
-    for (size_t i = 0; i < tris.size(); ++i) { acc += tris[i].area; cdf[i] = acc; }
-
-    // Scene AABB for the acceleration grid.
-    glm::vec3 mn(1e30f), mx(-1e30f);
-    for (const auto& t : tris)
-        for (int k = 0; k < 3; ++k)
-            for (int c = 0; c < 3; ++c) {
-                mn[c] = std::min(mn[c], t.p[k][c]);
-                mx[c] = std::max(mx[c], t.p[k][c]);
-            }
-    float s = std::max(std::sqrt(total_area / float(N)), 1e-6f);
-
-    auto cell_of = [&](const glm::vec3& p) -> glm::ivec3 {
-        return glm::ivec3(glm::floor((p - mn) / s));
-    };
-    auto cell_key = [](const glm::ivec3& c) -> uint64_t {
-        return (uint64_t(uint32_t(c.x) & 0x1FFFFF) << 42) |
-               (uint64_t(uint32_t(c.y) & 0x1FFFFF) << 21) |
-                uint64_t(uint32_t(c.z) & 0x1FFFFF);
-    };
-    std::unordered_map<uint64_t, std::vector<int>> grid;
-
-    std::mt19937 rng(kSEED);
-    std::uniform_real_distribution<float> unit(0.0f, 1.0f);
-    std::uniform_int_distribution<int> tri_pick(0, int(tris.size()) - 1);
-
-    std::vector<SamplePoint> accepted;
-    accepted.reserve(N);
-
-    auto add_point = [&](int idx) {
-        grid[cell_key(cell_of(accepted[idx].pos))].push_back(idx);
-    };
-
-    constexpr int kMaxRing = 6;
-    auto min_dist_to = [&](const glm::vec3& p, float stop_at, float& d2) -> bool {
-        glm::ivec3 c0 = cell_of(p);
-        d2 = 1e30f;
-        for (int R = 0; R <= kMaxRing; ++R) {
-            bool any = false;
-            for (int dx = -R; dx <= R; ++dx)
-                for (int dy = -R; dy <= R; ++dy)
-                    for (int dz = -R; dz <= R; ++dz) {
-                        if (std::max({std::abs(dx), std::abs(dy), std::abs(dz)}) != R) continue;
-                        auto it = grid.find(cell_key(c0 + glm::ivec3(dx, dy, dz)));
-                        if (it == grid.end()) continue;
-                        any = true;
-                        for (int idx : it->second) {
-                            float t = glm::dot(p - accepted[idx].pos, p - accepted[idx].pos);
-                            if (t < d2) { d2 = t; if (t == 0.0f) return true; }
-                        }
-                    }
-            float bound = std::max(stop_at, float(R * R) * s * s);
-            if (any && d2 <= bound) break;
-        }
-        return d2 < 1e29f;
-    };
-
-    {
-        int ti = tri_pick(rng);
-        accepted.push_back(sample_on_tri(tris[ti], rng, tri_mirror[ti]));
-        add_point(0);
-    }
-
-    for (int i = 1; i < N; ++i) {
-        float best_dist = -1.0f;
-        SamplePoint best_sp{};
-        for (int k = 0; k < K; ++k) {
-            float r = unit(rng) * total_area;
-            int ti = int(std::lower_bound(cdf.begin(), cdf.end(), r) - cdf.begin());
-            ti = std::clamp(ti, 0, int(tris.size()) - 1);
-            SamplePoint cand = sample_on_tri(tris[ti], rng, tri_mirror[ti]);
-            float min_d;
-            if (!min_dist_to(cand.pos, best_dist, min_d)) min_d = 1e30f;
-            if (min_d > best_dist) { best_dist = min_d; best_sp = cand; }
-        }
-        accepted.push_back(best_sp);
-        add_point(i);
-    }
-
-    // Per-surfel adaptive radius (paper §7 future work): shrink the disk radius
-    // where the local sampling is denser, i.e. near edges/corners where surfaces
-    // converge, so disks don't protrude past geometric edges (crisper silhouette).
-    // Local tile area ~ nn^2 => radius = kCOVERAGE * nn / sqrt(pi), which matches the
-    // global leaf_radius on flat, evenly sampled faces and shrinks at edges.
-    const float global_r = kCOVERAGE * std::sqrt(total_area / (float(N) * kPi));
-    const float nn_scale = kCOVERAGE / std::sqrt(kPi);
-    // Mild shrink only: keep disks mostly overlapping so the surface stays
-    // continuous (no gaps). Edge sharpness is handled by the per-surfel cut
-    // planes, so we no longer need an aggressive radius reduction here.
-    constexpr float kMinFrac = 0.85f;
-    for (int i = 0; i < N; ++i) {
-        glm::ivec3 c0 = cell_of(accepted[i].pos);
-        float nn2 = 1e30f;
-        for (int R = 0; R <= kMaxRing; ++R) {
-            bool any = false;
-            for (int dx = -R; dx <= R; ++dx)
-            for (int dy = -R; dy <= R; ++dy)
-            for (int dz = -R; dz <= R; ++dz) {
-                if (std::max({std::abs(dx), std::abs(dy), std::abs(dz)}) != R) continue;
-                auto it = grid.find(cell_key(c0 + glm::ivec3(dx, dy, dz)));
-                if (it == grid.end()) continue;
-                any = true;
-                for (int j : it->second) {
-                    if (j == i) continue;
-                    float t = glm::dot(accepted[i].pos - accepted[j].pos,
-                                       accepted[i].pos - accepted[j].pos);
-                    if (t < nn2) nn2 = t;
+    auto generate = [&](float h) {
+        std::vector<SamplePoint> pts;
+        for (size_t i = 0; i < tris.size(); ++i) {
+            const Tri& t = tris[i];
+            glm::vec3 e1 = t.p[1] - t.p[0];
+            glm::vec3 e2 = t.p[2] - t.p[0];
+            int n1 = std::max(1, int(std::round(glm::length(e1) / h)));
+            int n2 = std::max(1, int(std::round(glm::length(e2) / h)));
+            for (int u = 0; u <= n1; ++u)
+                for (int v = 0; v <= n2; ++v) {
+                    if (float(u) / float(n1) + float(v) / float(n2) > 1.0f + 1e-6f)
+                        continue;   // keep barycentric w >= 0 half-parallelogram
+                    SamplePoint s;
+                    s.pos = t.p[0] + e1 * (float(u) / float(n1))
+                          + e2 * (float(v) / float(n2));
+                    s.nrm = glm::normalize(t.n[0] + t.n[1] + t.n[2]);
+                    s.alb = t.alb;
+                    s.is_mirror = tri_mirror[i];
+                    s.radius = 0.0f;   // set uniformly below
+                    pts.push_back(s);
                 }
-            }
-            if (any && nn2 < 1e29f) {
-                float bound = float(R * R) * s * s;
-                if (nn2 <= bound) break;
-            }
         }
-        float r = (nn2 < 1e29f) ? nn_scale * std::sqrt(nn2) : global_r;
-        r = std::clamp(r, kMinFrac * global_r, global_r);
-        accepted[i].radius = r;
+        return pts;
+    };
+
+    float h = std::max(std::sqrt(total_area / float(N)), 1e-5f);
+    std::vector<SamplePoint> pts = generate(h);
+    if (!pts.empty()) {
+        // Rescale once so the count matches the budget.
+        h *= std::sqrt(float(pts.size()) / float(N));
+        pts = generate(h);
     }
-    return {accepted, total_area};
+    const float r = kLATTICE_R * h;
+    for (auto& s : pts) s.radius = r;
+    step_out = h;
+    return pts;
 }
 
 // ---------------------------------------------------------------------------
 // Surfel edge cutting: for each surfel, store up to K cut planes so the shader
-// can clip its disk to the sharp-edge boundaries (no surfel-pair adjacency).
+// can clip its disk exactly at mesh feature edges (paper Sec. 3: border gaps
+// need special treatment).
 //
-// A surfel on face A near a sharp edge against face B stores B's plane as a cut:
-//   cut.xyz = n_B,  cut.w = dot(pos_B - pos_A, n_B) >= 0
-// with the clip condition  dot(q - pos_A, n_B) <= cut.w  (keeps A's side of B's
-// plane). Surfels with fewer than K cuts pad with cut.w = +inf (never clipped).
-// A box-corner surfel touches up to 2-3 sharp edges, so K covers it.
+// Cuts are derived from topology (extracted sharp/boundary edges), not from
+// neighbor samples: planes land exactly on triangle borders regardless of local
+// sampling. Which side of an edge a surfel's disk lives on is decided from the
+// INCIDENT FACE GEOMETRY (centroids), never from the surfel center: the
+// barycentric lattice places whole rows of samples exactly ON the triangle
+// borders, so position tests against the surfel center are exactly zero there
+// and strict-inequality orientation tests used to flip cuts the wrong way
+// round (disks keeping the outside half-plane => overextension; whole disks
+// rejected at concave seams => hairline gaps). For a shared sharp edge the cut
+// is the OTHER incident face's plane through the closest point on the edge;
+// at CONCAVE junctions it is extended by a small overlap so adjacent faces'
+// disks fuse across the seam (the poke hides inside the crevice). At convex
+// and boundary edges the cut stays exact, keeping silhouettes straight and
+// flush with the triangles.
+// Shader clip condition: dot(q - surfel_pos, cut.xyz) <= cut.w.
 // ---------------------------------------------------------------------------
 
-constexpr int kSurfelCuts = 4;
+constexpr int kSurfelCuts = 6;
 constexpr float kCutInf = 1e30f;
 
 std::vector<glm::vec4> compute_surfel_cuts(const std::vector<SamplePoint>& pts,
-                                           float search_radius) {
+                                           const std::vector<FeatEdge>& edges,
+                                           float search_radius, float ref_radius) {
+    // Concave seams overlap by this much so clipped half-surfaces fuse.
+    const float cut_overlap = 0.35f * ref_radius;
+    const float reach = 2.0f * search_radius;   // covers radius_scale up to ~2.0
     const int N = int(pts.size());
     std::vector<glm::vec4> cuts(size_t(N) * kSurfelCuts, glm::vec4(0.0f, 0.0f, 0.0f, kCutInf));
 
-    // Binning grid over the scene AABB at cell ~ search radius.
-    glm::vec3 mn(1e30f), mx(-1e30f);
-    for (const auto& s : pts) { mn = glm::min(mn, s.pos); mx = glm::max(mx, s.pos); }
-    glm::vec3 sz = mx - mn;
-    float cell = std::max(search_radius, 1e-4f);
-    glm::ivec3 res(std::max(1, int(std::ceil(sz.x / cell))),
-                   std::max(1, int(std::ceil(sz.y / cell))),
-                   std::max(1, int(std::ceil(sz.z / cell))));
-
-    auto cell_of = [&](const glm::vec3& p) -> glm::ivec3 {
-        return glm::ivec3(glm::floor((p - mn) / cell));
-    };
-    auto cell_key = [](const glm::ivec3& c) -> uint64_t {
-        return (uint64_t(uint32_t(c.x) & 0x1FFFFF) << 42) |
-               (uint64_t(uint32_t(c.y) & 0x1FFFFF) << 21) |
-                uint64_t(uint32_t(c.z) & 0x1FFFFF);
-    };
-    std::unordered_map<uint64_t, std::vector<int>> grid;
-    for (int i = 0; i < N; ++i)
-        grid[cell_key(cell_of(pts[i].pos))].push_back(i);
-
-    constexpr float kSharpDot = 0.6f;   // |n_i . n_j| < this => sharp edge
     for (int i = 0; i < N; ++i) {
-        glm::ivec3 c0 = cell_of(pts[i].pos);
+        const glm::vec3& ca = pts[i].pos;
         int ncuts = 0;
-        // Sweep a small neighborhood; a disk of radius ~ search_radius on A can
-        // cross edges within a few cells. Ring 0..2 of a cell-sized grid is enough.
-        for (int dz = -2; dz <= 2 && ncuts < kSurfelCuts; ++dz)
-        for (int dy = -2; dy <= 2 && ncuts < kSurfelCuts; ++dy)
-        for (int dx = -2; dx <= 2 && ncuts < kSurfelCuts; ++dx) {
-            auto it = grid.find(cell_key(c0 + glm::ivec3(dx, dy, dz)));
-            if (it == grid.end()) continue;
-            for (int j : it->second) {
-                if (j == i) continue;
-                const SamplePoint& a = pts[i];
-                const SamplePoint& b = pts[j];
-                // Only across a sharp edge (different face orientation) and close.
-                float nd = glm::dot(a.nrm, b.nrm);
-                if (std::abs(nd) > kSharpDot) continue;
-                if (glm::length(a.pos - b.pos) > 2.0f * search_radius) continue;
-
-                // Clip against b's plane, keeping a's side.
-                glm::vec3 nb = b.nrm;
-                float off = glm::dot(b.pos - a.pos, nb);
-                if (off < 0.0f) { nb = -nb; off = -off; }   // force keep-side to -inf side
-
-                // Deduplicate against existing cuts for this surfel.
-                bool dup = false;
-                for (int k = 0; k < ncuts; ++k) {
-                    glm::vec4& ex = cuts[size_t(i) * kSurfelCuts + k];
-                    if (std::abs(glm::dot(glm::vec3(ex), nb)) > 0.98f && std::abs(ex.w - off) < 1e-3f) {
-                        dup = true; break;
-                    }
+        auto add_cut = [&](const glm::vec3& n, float off) {
+            for (int k = 0; k < ncuts; ++k) {
+                glm::vec4 ex = cuts[size_t(i) * kSurfelCuts + k];
+                if (glm::dot(glm::vec3(ex), n) > 0.98f && std::abs(ex.w - off) < 1e-3f)
+                    return;
+            }
+            if (ncuts >= kSurfelCuts) return;
+            cuts[size_t(i) * kSurfelCuts + ncuts] = glm::vec4(n, off);
+            ++ncuts;
+        };
+        for (const FeatEdge& e : edges) {
+            if (ncuts >= kSurfelCuts) break;
+            // Point-segment distance from the surfel center to the edge.
+            float t = glm::clamp(glm::dot(ca - e.mid, e.dir), -e.half_len, e.half_len);
+            glm::vec3 cp = e.mid + e.dir * t;
+            if (glm::length(ca - cp) > reach) continue;
+            if (!e.boundary) {
+                // Shared sharp edge: clip each surfel at the plane of the
+                // OTHER incident face (never its own plane). Own face is
+                // identified by normal agreement; with flat face normals this
+                // is exact (1 vs ~0).
+                const float da = glm::dot(pts[i].nrm, e.na);
+                const float db = glm::dot(pts[i].nrm, e.nb);
+                const bool own_is_a = da >= db;
+                const glm::vec3& other = own_is_a ? e.nb : e.na;
+                const glm::vec3& own_ctr = own_is_a ? e.ctr_a : e.ctr_b;
+                // Concavity from the OWN face's centroid: strictly inside the
+                // face, so the test never degenerates (the surfel center can
+                // sit exactly on the edge). Concave => own face extends into
+                // the other face's half-space (crevice) => fuse with overlap;
+                // convex silhouette edges stay exact.
+                bool concave = glm::dot(other, own_ctr - cp) > 0.0f;
+                // Plane through cp (on the edge) with the other face's normal:
+                // keep dot(p - cp, other) <= 0, i.e. reject the half-space on
+                // the other face's side. NEVER branch on the sign of off: the
+                // lattice border rows sit exactly ON the edge, off is pure
+                // float noise there, and a sign-based flip inverts the cut for
+                // roughly half of them (disks leaking past the edge).
+                glm::vec3 n = other;
+                float off = glm::dot(cp - ca, n);
+                if (concave) {
+                    // Flip unconditionally (own face lives on the positive
+                    // side) and extend across the seam so clipped
+                    // half-surfaces fuse; the poke hides in the crevice.
+                    n = -n;
+                    off = glm::max(-off, 0.0f) + cut_overlap;
                 }
-                if (dup) continue;
-                cuts[size_t(i) * kSurfelCuts + ncuts] = glm::vec4(nb, off);
-                ++ncuts;
-                if (ncuts >= kSurfelCuts) break;
+                add_cut(n, off);
+            } else {
+                // Boundary edge: reject points beyond the edge line only.
+                // u points from the edge into the face interior, decided
+                // against the incident face's centroid (strictly inside, so
+                // never degenerate for border-row samples). The shader keeps
+                // dot(p-ca, n) <= off, so store n = -u (outward) and off =
+                // surfel depth: rejects exactly dot(p-cp,u) < 0.
+                glm::vec3 u = glm::cross(e.dir, e.na);
+                float ul = glm::length(u);
+                if (ul < 1e-8f) continue;
+                u /= ul;
+                if (glm::dot(u, e.ctr_a - cp) < 0.0f) u = -u;   // edge -> interior
+                add_cut(-u, glm::dot(ca - cp, u));
             }
         }
     }
@@ -479,7 +480,7 @@ std::vector<glm::vec4> compute_surfel_cuts(const std::vector<SamplePoint>& pts,
 // ---------------------------------------------------------------------------
 
 constexpr uint32_t kCacheMagic   = 0x38535254;  // "8SRT"
-constexpr uint32_t kCacheVersion = 3;
+constexpr uint32_t kCacheVersion = 5;
 
 uint64_t file_stamp(const std::string& path, uint64_t* size_out) {
     std::error_code ec;
@@ -514,8 +515,6 @@ struct CacheKey {
     uint64_t mat_hash = 0;
     uint64_t transform_hash = 0;
     uint32_t N = 0;
-    uint32_t best_k = kBEST_K;
-    float coverage = kCOVERAGE;
     uint32_t seed = kSEED;
 };
 
@@ -540,8 +539,6 @@ bool save_cache(const std::string& path, const CacheKey& key, const std::vector<
     w64(key.mat_hash);
     w64(key.transform_hash);
     w32(key.N);
-    w32(key.best_k);
-    wf(key.coverage);
     w32(key.seed);
     wf(leaf_radius);
     wf(total_area);
@@ -564,8 +561,6 @@ bool load_cache(const std::string& path, const CacheKey& key, std::vector<Sample
     if (r64() != key.mat_hash) return false;
     if (r64() != key.transform_hash) return false;
     if (r32() != key.N) return false;
-    if (r32() != key.best_k) return false;
-    if (rf() != key.coverage) return false;
     if (r32() != key.seed) return false;
 
     leaf_radius = rf();
@@ -725,9 +720,16 @@ int main() {
     // ---- Surfel cloud (CPU, cached) ----
     int point_budget_index = 1;   // default N=16384
     int N = 0;
-    float leaf_radius = 0.0f;     // nominal (flat-face) radius
+    float leaf_radius = 0.0f;     // uniform lattice-derived disk radius
     float search_radius = 0.0f;   // max per-surfel radius, for grid/traversal bounds
     float total_area = 0.0f;
+
+    // Feature edges are needed on every launch (cut planes are computed from
+    // them even when the surfel cloud itself comes from the cache).
+    ExtractedMesh em = extract_triangles(model, model_mat);
+    total_area = 0.0f;
+    for (const auto& t : em.tris) total_area += t.area;
+
     std::vector<SamplePoint> surfels;
 
     auto build_surfels = [&]() {
@@ -741,21 +743,19 @@ int main() {
         std::string cpath = cache_path_for(model_path, N);
         if (load_cache(cpath, key, surfels, leaf_radius, total_area)) {
             gllib::logf(gllib::LogLevel::info, "cache hit %s (N=%d)", cpath.c_str(), N);
+            leaf_radius = surfels.empty() ? 0.0f : surfels.front().radius;
         } else {
             auto t0 = std::chrono::steady_clock::now();
-            ExtractedMesh em = extract_triangles(model, model_mat);
-            total_area = 0.0f;
-            for (const auto& t : em.tris) total_area += t.area;
-
-            auto [pts, ta] = sample_points_mitchell(em.tris, em.tri_mirror, total_area, N, kBEST_K);
-            surfels = std::move(pts);
-            leaf_radius = kCOVERAGE * std::sqrt(total_area / (float(N) * kPi));
+            float step = 0.0f;
+            surfels = sample_points_lattice(em.tris, em.tri_mirror, total_area, N, step);
+            leaf_radius = kLATTICE_R * step;
             if (save_cache(cpath, key, surfels, leaf_radius, total_area))
                 gllib::logf(gllib::LogLevel::info, "cached to %s", cpath.c_str());
             auto t1 = std::chrono::steady_clock::now();
             gllib::logf(gllib::LogLevel::info,
-                        "sampled %d surfels in %.0f ms (%.1f tris)",
-                        N, std::chrono::duration<double, std::milli>(t1 - t0).count(),
+                        "sampled %zu surfels (step %.5f) in %.0f ms (%.1f tris)",
+                        surfels.size(), step,
+                        std::chrono::duration<double, std::milli>(t1 - t0).count(),
                         double(em.tris.size()));
         }
     };
@@ -797,7 +797,7 @@ int main() {
     surfel_pos_buf.data(vp.data(), vp.size() * sizeof(glm::vec4));
     surfel_nrm_buf.data(vn.data(), vn.size() * sizeof(glm::vec4));
     surfel_alb_buf.data(va.data(), va.size() * sizeof(glm::vec4));
-    std::vector<glm::vec4> cuts = compute_surfel_cuts(surfels, search_radius);
+    std::vector<glm::vec4> cuts = compute_surfel_cuts(surfels, em.edges, search_radius, leaf_radius);
     surfel_cut_buf.data(cuts.data(), cuts.size() * sizeof(glm::vec4));
     surfel_slot_buf.data(nullptr, size_t(N) * sizeof(uint32_t));
     packed_idx_buf.data(nullptr, size_t(N) * sizeof(uint32_t));
@@ -999,7 +999,7 @@ int main() {
     const float far_plane = 100.0f;
     int max_bounces = 1;
     if (getenv("SRT_BOUNCES")) max_bounces = std::atoi(getenv("SRT_BOUNCES"));
-    float radius_scale = 1.25f;
+    float radius_scale = 1.5f;
     if (getenv("SRT_RADIUS")) radius_scale = std::atof(getenv("SRT_RADIUS"));
     float light_intensity = 6.0f;
     float ambient = 0.08f;
@@ -1020,6 +1020,57 @@ int main() {
     const char* shot_path = getenv("SRT_SHOT");
     int shot_frame = getenv("SRT_FRAME") ? std::atoi(getenv("SRT_FRAME")) : 5;
     uint64_t frame_counter = 0;
+
+    // Debug export: SRT_EXPORT=path dumps surfels, cuts, grid and triangles for
+    // exact CPU-side replication of the trace (temporary debugging aid).
+    if (const char* exp = getenv("SRT_EXPORT")) {
+        glMemoryBarrier(GL_ALL_BARRIER_BITS);
+        glFinish();
+        FILE* f = fopen(exp, "wb");
+        if (f) {
+            auto w4 = [&](const void* p, size_t bytes) { fwrite(p, 1, bytes, f); };
+            const uint32_t magic = 0x31505845;  // "EXP1"
+            w4(&magic, 4);
+            const uint32_t n32 = uint32_t(N);
+            w4(&n32, 4);
+            w4(&radius_scale, 4); w4(&search_radius, 4); w4(&leaf_radius, 4);
+            w4(&cell_size, 4); w4(&far_plane, 4);
+            w4(&mn, 12); w4(&grid_res, 12);
+            w4(&light_pos, 12); w4(&light_color, 12);
+            w4(&light_intensity, 4); w4(&ambient, 4);
+            w4(vp.data(), size_t(N) * 16);
+            w4(vn.data(), size_t(N) * 16);
+            w4(va.data(), size_t(N) * 16);
+            // Only the first N surfels' cuts are used by the shader; the lattice
+            // may produce more samples than the budget (cuts tail is dead data).
+            w4(cuts.data(), size_t(N) * kSurfelCuts * 16);
+            std::vector<uint32_t> cs(grid_volume), cc(grid_volume), pi(N);
+            auto cpy = [&](gl::Buffer& b, std::vector<uint32_t>& dst, size_t elems) {
+                void* ptr = b.map_range(0, elems * sizeof(uint32_t), GL_MAP_READ_BIT);
+                if (ptr) { std::memcpy(dst.data(), ptr, elems * sizeof(uint32_t)); b.unmap(); }
+            };
+            cpy(cell_start_buf, cs, size_t(grid_volume));
+            cpy(cell_count_buf, cc, size_t(grid_volume));
+            cpy(packed_idx_buf, pi, size_t(N));
+            w4(cs.data(), cs.size() * 4);
+            w4(cc.data(), cc.size() * 4);
+            w4(pi.data(), pi.size() * 4);
+            const uint32_t nt = uint32_t(em.tris.size());
+            w4(&nt, 4);
+            for (const auto& t : em.tris) {
+                glm::vec3 fn = glm::normalize(glm::cross(t.p[1] - t.p[0], t.p[2] - t.p[0]));
+                w4(&t.p[0], 12); w4(&t.p[1], 12); w4(&t.p[2], 12);
+                w4(&fn, 12); w4(&t.n[0], 12); w4(&t.n[1], 12); w4(&t.n[2], 12);
+                w4(&t.alb, 12);
+            }
+            std::vector<uint32_t> mir(em.tris.size());
+            for (size_t i = 0; i < em.tris.size(); ++i) mir[i] = em.tri_mirror[i] ? 1u : 0u;
+            w4(mir.data(), mir.size() * 4);
+            fclose(f);
+            gllib::logf(gllib::LogLevel::info, "exported scene to %s", exp);
+        }
+    }
+
 
     // Rasterize the G-buffer: world pos/normal/albedo(+mirror) + direct shaded color.
     auto run_gbuffer = [&]() {
@@ -1252,7 +1303,7 @@ int main() {
                 surfel_pos_buf.data(vp2.data(), vp2.size() * sizeof(glm::vec4));
                 surfel_nrm_buf.data(vn2.data(), vn2.size() * sizeof(glm::vec4));
                 surfel_alb_buf.data(va2.data(), va2.size() * sizeof(glm::vec4));
-                std::vector<glm::vec4> cuts2 = compute_surfel_cuts(surfels, search_radius);
+                std::vector<glm::vec4> cuts2 = compute_surfel_cuts(surfels, em.edges, search_radius, leaf_radius);
                 surfel_cut_buf.data(cuts2.data(), cuts2.size() * sizeof(glm::vec4));
                 surfel_slot_buf.data(nullptr, size_t(N) * sizeof(uint32_t));
                 packed_idx_buf.data(nullptr, size_t(N) * sizeof(uint32_t));

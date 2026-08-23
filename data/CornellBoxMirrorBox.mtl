@@ -1,0 +1,9 @@
+# CornellBoxMirrorBox.mtl
+newmtl ReflectiveMaterial
+Ka 0.000 0.000 0.000
+Kd 0.100 0.100 0.100
+Ks 0.900 0.900 0.900
+Ns 1000.0
+Ni 1.0
+d 1.0
+illum 3

@@ -73,7 +73,7 @@ float surfel_r(int s) { return surfel_pos[s].w * u_radius_scale; }
 // every disk is reachable from its cell's neighborhood. Matches surfel_r (scaled).
 float search_r() { return u_search_radius * u_radius_scale; }
 
-const int kSurfelCuts = 4;
+const int kSurfelCuts = 6;
 
 // Edge-cut clip test for surfel s at point p (on s's tangent plane). Rejects p if
 // it lies outside any stored cut plane (i.e. across a sharp edge into the
@@ -329,18 +329,23 @@ void main() {
         // Reflected surface: cast a reflection ray through the point-sampled
         // geometry (Schaufler & Jensen), shade what it hits, recurse on mirrors.
         // Paper §5: only accept intersections at least 2r from the ray origin to
-        // avoid false hits on the mirror's own surfels.
+        // avoid false hits on the mirror's own surfels. Instead of rejecting all
+        // hits within 2r (which also deletes genuinely close geometry, e.g.
+        // surfaces meeting at contact edges -> gaps), pad the ray ORIGIN by 2r
+        // along the normal (paper's shadow-offset trick): self-surfels then lie
+        // behind the origin while real neighbors stay visible.
         color = vec3(0.0);
-        vec3 ro = gpos + gnrm * 1e-3;
+        float self_off = 2.0 * search_r();
+        vec3 ro = gpos + gnrm * self_off;
         vec3 rd = reflect(view_dir, gnrm);
-        float t_near = 2.0 * search_r();
+        float t_near = 1e-3;
         for (int b = 0; b < u_max_bounces; ++b) {
             Hit hit;
             if (!trace_ray(ro, rd, t_near, u_far, hit)) break;
             color += shade(hit.alb, hit.nrm, hit.pos);
             if (hit.is_mirror) {
                 rd = reflect(rd, hit.nrm);
-                ro = hit.pos + hit.nrm * 1e-3;
+                ro = hit.pos + hit.nrm * self_off;
             } else {
                 break;
             }
