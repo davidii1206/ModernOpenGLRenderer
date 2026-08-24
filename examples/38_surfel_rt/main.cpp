@@ -344,12 +344,44 @@ static std::vector<SamplePoint> sample_points_lattice(
 {
     auto generate = [&](float h) {
         std::vector<SamplePoint> pts;
+        float carry = 0.0f;
         for (size_t i = 0; i < tris.size(); ++i) {
             const Tri& t = tris[i];
             glm::vec3 e1 = t.p[1] - t.p[0];
             glm::vec3 e2 = t.p[2] - t.p[0];
             int n1 = std::max(1, int(std::round(glm::length(e1) / h)));
             int n2 = std::max(1, int(std::round(glm::length(e2) / h)));
+            if (n1 == 1 && n2 == 1) {
+                // Sub-step triangle (edges shorter than the lattice step — e.g.
+                // dense imported meshes like the Stanford bunny). Corner
+                // sampling would emit 3 samples per triangle no matter how h
+                // is rescaled (count explosion: ~200k for the bunny) and pile
+                // duplicates onto shared vertices. Instead place samples
+                // PROPORTIONAL TO AREA via error diffusion, so the sub-step
+                // population converges to ~area/h² and the budget stays
+                // meaningful. One sample lands at the centroid; extra samples
+                // spread deterministically (golden-ratio barycentrics).
+                const float target = t.area / (h * h);
+                const int n = int(target + carry);
+                carry += target - float(n);
+                for (int j = 0; j < n; ++j) {
+                    SamplePoint s;
+                    if (j == 0) {
+                        s.pos = (t.p[0] + t.p[1] + t.p[2]) / 3.0f;
+                    } else {
+                        float a = std::fmod(float(j) * 0.618034f + 0.5f, 1.0f);
+                        float b = std::fmod(float(j) * 0.754878f + 0.25f, 1.0f);
+                        if (a + b > 1.0f) { a = 1.0f - a; b = 1.0f - b; }
+                        s.pos = t.p[0] + e1 * a + e2 * b;
+                    }
+                    s.nrm = glm::normalize(t.n[0] + t.n[1] + t.n[2]);
+                    s.alb = t.alb;
+                    s.is_mirror = tri_mirror[i];
+                    s.radius = 0.0f;
+                    pts.push_back(s);
+                }
+                continue;
+            }
             for (int u = 0; u <= n1; ++u)
                 for (int v = 0; v <= n2; ++v) {
                     if (float(u) / float(n1) + float(v) / float(n2) > 1.0f + 1e-6f)
@@ -369,9 +401,14 @@ static std::vector<SamplePoint> sample_points_lattice(
 
     float h = std::max(std::sqrt(total_area / float(N)), 1e-5f);
     std::vector<SamplePoint> pts = generate(h);
-    if (!pts.empty()) {
-        // Rescale once so the count matches the budget.
-        h *= std::sqrt(float(pts.size()) / float(N));
+    // Rescale until the count settles at the budget. One pass is not enough
+    // for mixed-resolution scenes: the sub-step population only responds to h
+    // through area/h², while the lattice population scales with 1/h² too but
+    // rounds per edge — iterate to a fixed point.
+    for (int it = 0; it < 6 && !pts.empty(); ++it) {
+        const float next = h * std::sqrt(float(pts.size()) / float(N));
+        if (std::abs(next - h) < 0.01f * h) break;
+        h = next;
         pts = generate(h);
     }
     const float r = kLATTICE_R * h;
@@ -506,7 +543,7 @@ std::vector<glm::vec4> compute_surfel_cuts(const std::vector<SamplePoint>& pts,
 // ---------------------------------------------------------------------------
 
 constexpr uint32_t kCacheMagic   = 0x38535254;  // "8SRT"
-constexpr uint32_t kCacheVersion = 5;
+constexpr uint32_t kCacheVersion = 6;   // 6: stores actual sample count
 
 uint64_t file_stamp(const std::string& path, uint64_t* size_out) {
     std::error_code ec;
@@ -568,6 +605,7 @@ bool save_cache(const std::string& path, const CacheKey& key, const std::vector<
     w32(key.seed);
     wf(leaf_radius);
     wf(total_area);
+    w32(uint32_t(pts.size()));   // actual sample count (may differ from key.N)
     f.write(reinterpret_cast<const char*>(pts.data()), pts.size() * sizeof(SamplePoint));
     return f.good();
 }
@@ -591,8 +629,10 @@ bool load_cache(const std::string& path, const CacheKey& key, std::vector<Sample
 
     leaf_radius = rf();
     total_area = rf();
-    pts.resize(key.N);
-    f.read(reinterpret_cast<char*>(pts.data()), key.N * sizeof(SamplePoint));
+    const uint32_t count = r32();
+    if (count == 0 || count > 10u * 1000u * 1000u) return false;
+    pts.resize(count);
+    f.read(reinterpret_cast<char*>(pts.data()), count * sizeof(SamplePoint));
     return f.good();
 }
 
@@ -736,6 +776,7 @@ int main() {
     };
     constexpr int num_models = 3;
     int current_model_index = 0;
+    if (const char* m = getenv("SRT_MODEL")) current_model_index = std::clamp(std::atoi(m), 0, num_models - 1);
 
     // Model.
     const char* model_path = model_paths[current_model_index];
@@ -819,21 +860,21 @@ int main() {
     std::vector<SamplePoint> surfels;
 
     auto build_surfels = [&]() {
-        N = kBudgetOptions[point_budget_index];
+        const int budget = kBudgetOptions[point_budget_index];
         CacheKey key;
         key.model_stamp = file_stamp(model_path, nullptr);
-        key.N = uint32_t(N);
+        key.N = uint32_t(budget);
         key.mat_hash = material_hash(model);
         key.transform_hash = matrix_hash(model_mat);
 
-        std::string cpath = cache_path_for(model_path, N);
+        std::string cpath = cache_path_for(model_path, budget);
         if (load_cache(cpath, key, surfels, leaf_radius, total_area)) {
-            gllib::logf(gllib::LogLevel::info, "cache hit %s (N=%d)", cpath.c_str(), N);
+            gllib::logf(gllib::LogLevel::info, "cache hit %s (N=%d)", cpath.c_str(), budget);
             leaf_radius = surfels.empty() ? 0.0f : surfels.front().radius;
         } else {
             auto t0 = std::chrono::steady_clock::now();
             float step = 0.0f;
-            surfels = sample_points_lattice(em.tris, em.tri_mirror, total_area, N, step);
+            surfels = sample_points_lattice(em.tris, em.tri_mirror, total_area, budget, step);
             leaf_radius = kLATTICE_R * step;
             if (save_cache(cpath, key, surfels, leaf_radius, total_area))
                 gllib::logf(gllib::LogLevel::info, "cached to %s", cpath.c_str());
@@ -844,6 +885,10 @@ int main() {
                         std::chrono::duration<double, std::milli>(t1 - t0).count(),
                         double(em.tris.size()));
         }
+        // The sampler may legitimately produce more samples than the budget
+        // (per-triangle lattice floors); N is the ACTUAL count so buffers,
+        // dispatches and the grid cover the whole cloud — never truncate.
+        N = int(surfels.size());
     };
     build_surfels();
 
