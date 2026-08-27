@@ -7,7 +7,9 @@ layout(std430, binding = 0) readonly buffer CellCount { uint cell_count[]; };
 layout(std430, binding = 1) buffer CellStart { uint cell_start[]; };
 layout(std430, binding = 2) buffer BlockSum { uint bsum[]; };
 
-uniform uint u_n;   // grid volume
+uniform uint u_n;          // this level's grid volume
+uniform uint u_cnt_off;    // cell_count segment offset
+uniform uint u_start_off;  // cell_start segment offset
 
 shared uint s[256];
 
@@ -16,7 +18,7 @@ void main() {
     uint lid = gl_LocalInvocationID.x;
     uint bid = gl_WorkGroupID.x;
 
-    s[lid] = (gid < u_n) ? cell_count[gid] : 0u;
+    s[lid] = (gid < u_n) ? cell_count[u_cnt_off + gid] : 0u;
     barrier();
 
     for (uint stride = 1u; stride < 256u; stride <<= 1u) {
@@ -28,6 +30,6 @@ void main() {
     }
 
     uint excl = (lid == 0u) ? 0u : s[lid - 1u];
-    if (gid < u_n) cell_start[gid] = excl;
+    if (gid < u_n) cell_start[u_start_off + gid] = excl;
     if (lid == 255u) bsum[bid] = s[lid];
 }

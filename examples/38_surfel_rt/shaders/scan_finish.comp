@@ -6,10 +6,11 @@ layout(local_size_x = 256) in;
 layout(std430, binding = 0) buffer CellStart { uint cell_start[]; };
 layout(std430, binding = 1) readonly buffer BlockSum { uint bsum[]; };
 
-uniform uint u_n;   // grid volume
+uniform uint u_n;          // this level's grid volume
+uniform uint u_start_off;  // cell_start segment offset
 
 void main() {
     uint gid = gl_GlobalInvocationID.x;
     uint bid = gl_WorkGroupID.x;
-    if (gid < u_n) cell_start[gid] += bsum[bid];
+    if (gid < u_n) cell_start[u_start_off + gid] += bsum[bid];
 }
