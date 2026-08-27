@@ -1,4 +1,5 @@
 #version 460 core
+#extension GL_ARB_shader_clock : enable
 layout(local_size_x = 8, local_size_y = 8) in;
 
 // Rasterized G-buffer (texture units).
@@ -24,6 +25,27 @@ layout(std430, binding = 5) readonly buffer PackedIdx { uint packed_idx[]; };
 // slots have n = 0 (dot == 0, never rejects). Planes pass exactly through the
 // mesh feature edges; layout is ready for per-frame skinned cuts.
 layout(std430, binding = 6) readonly buffer SurfCut { vec4 surfel_cut[]; };
+
+// Optional per-dispatch diagnostics (frame-timing / shader-clock counters,
+// see the "Ray kernel counters" section of the ImGui window). Every counter is
+// gated by the u_perf uniform so the common path is unchanged when off; the
+// buffer itself is always bound (binding 7 is unused by any other pass).
+layout(std430, binding = 7) buffer PerfBuf { uint perf[]; };
+// perf[]:
+//   0 = rays (trace_ray invocations)
+//   1 = level-0 DDA iterations
+//   2 = finer-level descend iterations
+//   3 = neighborhood cells scanned (3x3x3 windows)
+//   4 = surfel disk tests (surfel_hit)
+//   5 = gather surfels tested (surface reconstruction)
+//   6 = cycles: setup (per traced pixel)
+//   7 = cycles: traversal (DDA + descend + disk tests)
+//   8 = cycles: reconstruction (gather + blend)
+//   9 = cycles: shade (+ bounce loop)
+uniform int u_perf;   // 0 = counters off
+
+#define PERF_ADD(i, v) if (u_perf != 0) atomicAdd(perf[i], uint(v))
+#define PERF_CYC(i, t0) if (u_perf != 0) atomicAdd(perf[i], clock2x32ARB().x - t0)
 
 // Outputs (image units).
 layout(binding = 3, rgba16f) writeonly uniform image2D u_color;   // composite result
@@ -136,6 +158,7 @@ void scan_neighborhood(int l, ivec3 ic, vec3 o, vec3 d, float t_far, float relax
     for (int nx = -1; nx <= 1; ++nx) {
         ivec3 nc = ic + ivec3(nx, ny, nz);
         if (!l_in_bounds(l, nc)) continue;
+        PERF_ADD(3, 1);
         uint nci = l_cell_index(l, nc);
         uint start = cell_start[u_l_start_off[l] + nci];
         uint count = cell_count[u_l_cnt_off[l] + nci];
@@ -143,6 +166,7 @@ void scan_neighborhood(int l, ivec3 ic, vec3 o, vec3 d, float t_far, float relax
         for (uint k = 0; k < count; ++k) {
             int s = int(packed_idx[u_l_packed_off[l] + start + k]);
             float ht;
+            PERF_ADD(4, 1);
             if (surfel_hit(s, o, d, relax_near, t_far, r_mul, near_ratio, ht) && ht < best_t) {
                 best_t = ht;
                 found = true;
@@ -197,6 +221,7 @@ void descend(int l, vec3 o, vec3 d, float t_in, float t_out, float t_far, float 
     float t_cur = tmin;
     for (int iter = 0; iter < 256; ++iter) {
         if (!l_in_bounds(l, ic)) break;
+        PERF_ADD(2, 1);
         if (t_cur > tmax) break;
         if (found && t_cur > best_t + pad) break;
         float relax_near = max(tmin, t_cur - pad);
@@ -219,6 +244,8 @@ bool trace_ray(vec3 o, vec3 d, float t_near, float t_far, float r_mul, out Hit h
                out float near_ratio) {
     tested = false;
     near_ratio = 1e30;
+    uint trav0 = 0;
+    if (u_perf != 0) trav0 = clock2x32ARB().x;
     float cs0 = 1.0 / u_l_inv_cell[0];
     float pad = search_r(r_mul);
     vec3 bmin = u_l_min[0];
@@ -231,17 +258,17 @@ bool trace_ray(vec3 o, vec3 d, float t_near, float t_far, float r_mul, out Hit h
         float da = d[a];
         float oa = o[a];
         if (abs(da) < 1e-20) {
-            if (oa < bmin[a] || oa > bmax[a]) return false;
+            if (oa < bmin[a] || oa > bmax[a]) { PERF_CYC(7, trav0); return false; }
         } else {
             float t0 = (bmin[a] - oa) / da;
             float t1 = (bmax[a] - oa) / da;
             if (t0 > t1) { float tmp = t0; t0 = t1; t1 = tmp; }
             tmin = max(tmin, t0);
             tmax = min(tmax, t1);
-            if (tmin > tmax) return false;
+            if (tmin > tmax) { PERF_CYC(7, trav0); return false; }
         }
     }
-    if (tmax < t_near || tmin > t_far) return false;
+    if (tmax < t_near || tmin > t_far) { PERF_CYC(7, trav0); return false; }
 
     // --- Level-0 DDA with descents into finer levels ---
     vec3 p0 = o + d * tmin;
@@ -263,6 +290,7 @@ bool trace_ray(vec3 o, vec3 d, float t_near, float t_far, float r_mul, out Hit h
 
     for (int iter = 0; iter < 512; ++iter) {
         if (!l_in_bounds(0, ic)) break;
+        PERF_ADD(1, 1);
         if (found && t_cur > best_t + pad) break;
         if (t_cur > tmax) break;
 
@@ -285,7 +313,7 @@ bool trace_ray(vec3 o, vec3 d, float t_near, float t_far, float r_mul, out Hit h
         else { ic.z += stepv.z; tmaxv.z += tdelta.z; }
     }
 
-    if (!found) return false;
+    if (!found) { PERF_CYC(7, trav0); return false; }
 
     // --- Surface reconstruction (paper §4.2, Eq. 1). Collect surfels whose
     // tangent-plane disk distance d_i is < r (distance measured IN the plane of
@@ -295,6 +323,8 @@ bool trace_ray(vec3 o, vec3 d, float t_near, float t_far, float r_mul, out Hit h
     // Surfels live in exactly one level, so gathering 5x5x5 neighborhoods from
     // every level never double-counts; per level the window covers +/-2 cells
     // = +/-4 * that level's band radius.
+    uint recon0 = 0;
+    if (u_perf != 0) { PERF_CYC(7, trav0); recon0 = clock2x32ARB().x; }
     vec3 hit_pos = o + d * best_t;
     vec3 acc_nrm = vec3(0.0), acc_alb = vec3(0.0);
     float acc_t = 0.0;
@@ -322,6 +352,7 @@ bool trace_ray(vec3 o, vec3 d, float t_near, float t_far, float r_mul, out Hit h
             uint count = cell_count[u_l_cnt_off[l] + ci];
             for (uint k = 0; k < count; ++k) {
                 int s = int(packed_idx[u_l_packed_off[l] + start + k]);
+                PERF_ADD(5, 1);
                 vec3 c = surfel_pos[s].xyz;
                 vec3 n = surfel_nrm[s].xyz;
 
@@ -378,6 +409,7 @@ bool trace_ray(vec3 o, vec3 d, float t_near, float t_far, float r_mul, out Hit h
 
     // Flip normal toward the ray origin (paper §5).
     if (dot(hit.nrm, d) > 0.0) hit.nrm = -hit.nrm;
+    PERF_CYC(8, recon0);
     return true;
 }
 
@@ -394,6 +426,9 @@ vec3 shade(vec3 alb, vec3 n, vec3 pos) {
 void main() {
     ivec2 px = ivec2(gl_GlobalInvocationID.xy);
     if (px.x >= u_img_size.x || px.y >= u_img_size.y) return;
+
+    uint t_setup0 = 0;
+    if (u_perf != 0) t_setup0 = clock2x32ARB().x;
 
     vec4 gpos4 = texelFetch(gbuf_pos, px, 0);
     vec3 gpos = gpos4.xyz;
@@ -437,6 +472,7 @@ void main() {
         vec3 ro = gpos + gnrm * self_off;
         vec3 rd = reflect(view_dir, gnrm);
         float t_near = 1e-3;
+        PERF_CYC(6, t_setup0);         // setup cycles, once per traced pixel
         for (int b = 0; b < u_max_bounces; ++b) {
             Hit hit;
             // Single-pass trace at the uniform radius. (An inflated retry on
@@ -444,8 +480,12 @@ void main() {
             // hit unrelated surfaces and turned the mirror into noise.)
             bool tested = false;
             float near_ratio = 1e30;
+            PERF_ADD(0, 1);            // rays (trace_ray invocations)
             if (!trace_ray(ro, rd, t_near, u_far, 1.0, hit, tested, near_ratio)) break;
+            uint t_shade0 = 0;
+            if (u_perf != 0) t_shade0 = clock2x32ARB().x;
             color += shade(hit.alb, hit.nrm, hit.pos);
+            PERF_CYC(9, t_shade0);
             if (hit.is_mirror) {
                 rd = reflect(rd, hit.nrm);
                 ro = hit.pos + hit.nrm * self_off;
@@ -455,6 +495,7 @@ void main() {
         }
     } else {
         // Direct surface: use the rasterized shading (no ray tracing needed).
+        PERF_CYC(6, t_setup0);
         color = gdirect;
     }
 

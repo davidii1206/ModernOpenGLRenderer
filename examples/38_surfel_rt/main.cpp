@@ -111,23 +111,166 @@ struct FeatEdge {
 };
 
 // ---------------------------------------------------------------------------
-// GPU timer (ping-pong query pair)
+// Per-pass GPU/CPU frame timing (mirrors the diagnostics in example 32)
 // ---------------------------------------------------------------------------
 
-struct GpuTimer {
-    const char* name;
-    gl::Query q{gl::QueryType::time_elapsed};
-    gl::Query q_prev{gl::QueryType::time_elapsed};
-    bool ran = false;
-    double ms = 0.0;
-    explicit GpuTimer(const char* n) : name(n) {}
-    void begin() { q.begin(); }
-    void end() { q.end(); std::swap(q, q_prev); ran = true; }
-    double readback() {
-        if (ran) { ms = double(q_prev.result()) * 1e-6; ran = false; }
-        return ms;
+// Per-pass GPU/CPU timing with double-buffered GL_TIME_ELAPSED queries.
+// Only one time-elapsed query may be active at once, so passes are timed
+// sequentially (never nested); the frame timer is CPU-only.
+class PassTimer {
+public:
+    explicit PassTimer(const char* name, bool gpu = true)
+        : name_(name), gpu_(gpu), q_(gl::QueryType::time_elapsed),
+          q_prev_(gl::QueryType::time_elapsed) {}
+
+    void begin() {
+        t0_ = std::chrono::steady_clock::now();
+        if (gpu_) q_.begin();
     }
+    void end() {
+        if (gpu_) q_.end();
+        cpu_ms_ = std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - t0_).count();
+        ran_ = true;
+        if (gpu_) std::swap(q_, q_prev_);
+    }
+    void skip() { ran_ = false; cpu_ms_ = 0.0; }
+
+    // Reads the just-finished frame's query result (never re-begun until the
+    // next frame, so the read cannot block a live query) and returns that GPU
+    // ms value. Samples accumulate into the current window for the 0.5 s
+    // averaged display.
+    double readback() {
+        gpu_ms_ = 0.0;
+        if (ran_) {
+            if (gpu_) gpu_ms_ = double(q_prev_.result()) * 1.0e-6;   // ns -> ms
+            cpu_acc_ += cpu_ms_;
+            gpu_acc_ += gpu_ms_;
+            n_++;
+        }
+        win_cpu_acc_ += cpu_ms_;
+        win_gpu_acc_ += gpu_ms_;
+        win_n_++;
+        return gpu_ms_;
+    }
+
+    // Called every ~0.5 s: averages the accumulated samples into disp_* (what
+    // the ImGui window shows) and appends that average to the history plots.
+    void flush_window() {
+        disp_cpu_ = win_n_ ? win_cpu_acc_ / double(win_n_) : 0.0;
+        disp_gpu_ = win_n_ ? win_gpu_acc_ / double(win_n_) : 0.0;
+        win_cpu_acc_ = win_gpu_acc_ = 0.0;
+        win_n_ = 0;
+        cpu_hist_.push_back(float(disp_cpu_));
+        if (cpu_hist_.size() > kHist) cpu_hist_.erase(cpu_hist_.begin());
+        if (gpu_) {
+            gpu_hist_.push_back(float(disp_gpu_));
+            if (gpu_hist_.size() > kHist) gpu_hist_.erase(gpu_hist_.begin());
+        }
+    }
+
+    const char* name() const { return name_; }
+    bool gpu() const { return gpu_; }
+    double cpu_ms() const { return cpu_ms_; }
+    double gpu_ms() const { return gpu_ms_; }
+    double disp_cpu() const { return disp_cpu_; }
+    double disp_gpu() const { return disp_gpu_; }
+    double avg_cpu() const { return n_ ? cpu_acc_ / double(n_) : 0.0; }
+    double avg_gpu() const { return n_ ? gpu_acc_ / double(n_) : 0.0; }
+    const std::vector<float>& cpu_hist() const { return cpu_hist_; }
+    const std::vector<float>& gpu_hist() const { return gpu_hist_; }
+
+private:
+    static constexpr size_t kHist = 120;
+    const char* name_;
+    bool gpu_;
+    gl::Query q_, q_prev_;
+    std::chrono::steady_clock::time_point t0_;
+    double cpu_ms_ = 0.0, gpu_ms_ = 0.0;
+    double cpu_acc_ = 0.0, gpu_acc_ = 0.0;
+    double win_cpu_acc_ = 0.0, win_gpu_acc_ = 0.0;
+    double disp_cpu_ = 0.0, disp_gpu_ = 0.0;
+    int n_ = 0, win_n_ = 0;
+    bool ran_ = false;
+    std::vector<float> cpu_hist_, gpu_hist_;
 };
+
+// Per-phase shader-clock breakdown of the ray kernel, mirrored on PassTimer's
+// 0.5 s display window: readback() per dispatch, flush_window() publishes the
+// averaged cycles/ray values the ImGui window shows so the readout is stable.
+class PhaseAccum {
+public:
+    void readback(const uint32_t pv[10]) {
+        for (int k = 0; k < 4; ++k) {
+            cyc_acc_[k] += pv[6 + k];
+            win_cyc_acc_[k] += pv[6 + k];
+        }
+        rays_acc_ += pv[0];
+        win_rays_acc_ += pv[0];
+    }
+
+    void flush_window() {
+        if (win_rays_acc_ > 0.0)
+            for (int k = 0; k < 4; ++k) disp_cyc_[k] = win_cyc_acc_[k] / win_rays_acc_;
+        for (int k = 0; k < 4; ++k) win_cyc_acc_[k] = 0.0;
+        win_rays_acc_ = 0.0;
+    }
+
+    double disp_cyc(int k) const { return disp_cyc_[k]; }
+    double avg_cyc(int k) const {
+        return rays_acc_ > 0.0 ? cyc_acc_[k] / rays_acc_ : 0.0;
+    }
+
+private:
+    double cyc_acc_[4] = {0.0, 0.0, 0.0, 0.0};
+    double win_cyc_acc_[4] = {0.0, 0.0, 0.0, 0.0};
+    double disp_cyc_[4] = {0.0, 0.0, 0.0, 0.0};
+    double rays_acc_ = 0.0, win_rays_acc_ = 0.0;
+};
+
+// Horizontal stacked bar (segment widths ∝ time) drawn with the ImGui draw list.
+static void imgui_stacked_bar(const ImVec2& pos, const ImVec2& size,
+                              const float* vals, const ImU32* cols, int n) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    float total = 0.0f;
+    for (int i = 0; i < n; ++i) total += vals[i];
+    if (total <= 0.0f) {
+        dl->AddRectFilled(pos, ImVec2(pos.x + size.x, pos.y + size.y),
+                          IM_COL32(40, 40, 40, 255));
+        return;
+    }
+    float x = pos.x;
+    for (int i = 0; i < n; ++i) {
+        float w = size.x * vals[i] / total;
+        if (w > 0.0f)
+            dl->AddRectFilled(ImVec2(x, pos.y), ImVec2(x + w, pos.y + size.y), cols[i]);
+        x += w;
+    }
+    dl->AddRect(pos, ImVec2(pos.x + size.x, pos.y + size.y),
+                IM_COL32(255, 255, 255, 90));
+}
+
+// Two-column legend next to a stacked bar: color swatch + name | ms + share.
+static void imgui_stacked_legend(const char* id, const char* const* names,
+                                 const float* ms, const ImU32* cols, int n, float total) {
+    if (ImGui::BeginTable(id, 2)) {
+        for (int i = 0; i < n; ++i) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImVec4 c = ImGui::ColorConvertU32ToFloat4(cols[i]);
+            ImGui::ColorButton("##sw", c,
+                               ImGuiColorEditFlags_NoTooltip |
+                               ImGuiColorEditFlags_NoInputs |
+                               ImGuiColorEditFlags_NoPicker, ImVec2(10, 10));
+            ImGui::SameLine();
+            ImGui::Text("%s", names[i]);
+            ImGui::TableNextColumn();
+            ImGui::Text("%.3f ms  (%.1f%%)", ms[i],
+                        total > 0.0f ? 100.0f * ms[i] / total : 0.0f);
+        }
+        ImGui::EndTable();
+    }
+}
 
 // ---------------------------------------------------------------------------
 // G-buffer targets: direct-shaded color + position / normal / albedo(+mirror)
@@ -1406,11 +1549,44 @@ int main() {
     glm::vec3 light_pos = mn + glm::vec3(scene_size.x * 0.5f, scene_size.y * 0.95f, scene_size.z * 0.5f);
     glm::vec3 light_color(1.0f, 0.98f, 0.92f);
 
-    GpuTimer t_ray("raytrace");
-    GpuTimer t_display("display");
+    // --- Per-pass GPU/CPU timers + optional per-dispatch ray-kernel counters ---
+    // t_frame spans the whole loop iteration (poll → present) and is CPU-only;
+    // the GPU frame time is the sum of the individual GPU passes.
+    PassTimer t_frame("frame", false);
+    PassTimer t_poll("poll_events", false);
+    PassTimer t_input("camera_input", false);  // camera + resize + hot-reload
+    PassTimer t_gbuf("gbuffer");
+    PassTimer t_ray("raytrace");
+    PassTimer t_display("display");
+    PassTimer t_points("point_cloud");         // only when the overlay is shown
+    PassTimer t_cells("cell_overlay");         // only when the overlay is shown
+    PassTimer t_imgui("imgui", false);         // building the debug window
+    PassTimer t_present("present", false);     // gui.render + swap_buffers
+
+    // Per-dispatch work counters read back from the ray kernel (raytrace.comp
+    // perf[] layout: 0=rays 1=L0 steps 2=descend steps 3=cells 4=disk tests
+    // 5=gather tests 6..9=setup/traversal/reconstruction/shade shader cycles).
+    // Everything is gated at runtime by the u_perf uniform, so the common path
+    // is unchanged when diagnostics are off (default; SRT_PERF=1 enables).
+    constexpr int kPerfCount = 10;
+    gl::Buffer perf_ssbo(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);
+    perf_ssbo.data(nullptr, size_t(kPerfCount) * sizeof(uint32_t));
+    perf_ssbo.bind_base(7);
+    uint64_t perf_acc[kPerfCount] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    PhaseAccum phase_acc;
+    int perf_frames = 0;
+    bool perf_on = getenv("SRT_PERF") != nullptr;
 
     bool captured = false;
     double last = window.time();
+
+    // 0.5 s display window: frame-period samples accumulate into period_* and
+    // are averaged into disp_frame_period when the window elapses.
+    std::vector<float> frame_times;
+    double win_start = window.time();
+    double period_acc = 0.0;
+    int period_n = 0;
+    double disp_frame_period = 0.0;
 
     // Headless test hook: SRT_AUTOTRACE=1 runs the trace every frame, saves a
     // screenshot to SRT_SHOT (default rt38.png) on frame SRT_FRAME (default 5),
@@ -1420,6 +1596,59 @@ int main() {
     const char* shot_path = getenv("SRT_SHOT");
     int shot_frame = getenv("SRT_FRAME") ? std::atoi(getenv("SRT_FRAME")) : 5;
     uint64_t frame_counter = 0;
+
+    // Console diagnostics: the same per-pass breakdown + ray-kernel counters
+    // the ImGui window shows, printed as lifetime averages. Called every 120
+    // frames (every 5 when ray-kernel counters are on) and once on exit.
+    auto print_perf = [&]() {
+        double sum_gpu = t_gbuf.avg_gpu() + t_ray.avg_gpu() + t_display.avg_gpu() +
+                         t_points.avg_gpu() + t_cells.avg_gpu();
+        printf("PERF avg over %llu frames:\n", (unsigned long long)frame_counter);
+        auto row = [](const char* n, double g, double c) {
+            printf("  %-12s gpu %7.2f ms  cpu %7.2f ms\n", n, g, c);
+        };
+        row("frame", sum_gpu, t_frame.avg_cpu());
+        row("poll_events", 0.0, t_poll.avg_cpu());
+        row("camera_input", 0.0, t_input.avg_cpu());
+        row("gbuffer", t_gbuf.avg_gpu(), t_gbuf.avg_cpu());
+        row("raytrace", t_ray.avg_gpu(), t_ray.avg_cpu());
+        row("display", t_display.avg_gpu(), t_display.avg_cpu());
+        row("point_cloud", t_points.avg_gpu(), t_points.avg_cpu());
+        row("cell_overlay", t_cells.avg_gpu(), t_cells.avg_cpu());
+        row("imgui", 0.0, t_imgui.avg_cpu());
+        row("present", 0.0, t_present.avg_cpu());
+        if (perf_frames > 0) {
+            double rays = double(perf_acc[0]);
+            printf("  ray work (accumulated over %d dispatches):\n", perf_frames);
+            printf("    rays / frame         = %.0f\n", rays / double(perf_frames));
+            if (rays > 0.0) {
+                printf("    L0 DDA steps / ray   = %.2f\n", double(perf_acc[1]) / rays);
+                printf("    descend steps / ray  = %.2f\n", double(perf_acc[2]) / rays);
+                printf("    cells scanned / ray  = %.2f\n", double(perf_acc[3]) / rays);
+                printf("    disk tests / ray     = %.2f\n", double(perf_acc[4]) / rays);
+                printf("    gather surfels / ray = %.2f\n", double(perf_acc[5]) / rays);
+
+                // Per-phase shader-clock cycles (low 32 bits of the GPU cycle
+                // counter, lifetime average), normalised to the dispatch GPU ms.
+                const char* ph_name[4] = {"setup", "traversal", "reconstruct", "shade"};
+                double ph_cyc[4];
+                for (int k = 0; k < 4; ++k) ph_cyc[k] = phase_acc.avg_cyc(k);
+                double tot_cyc = 0.0;
+                for (int k = 0; k < 4; ++k) tot_cyc += ph_cyc[k];
+                double gpu_ms = t_ray.avg_gpu();
+                if (tot_cyc > 0.0) {
+                    printf("    phase cycles/ray (low32 shader clock):\n");
+                    for (int k = 0; k < 4; ++k)
+                        printf("      %-11s %10.1f  %5.1f%%   ~%.4f ms\n",
+                               ph_name[k], ph_cyc[k],
+                               100.0 * ph_cyc[k] / tot_cyc,
+                               gpu_ms * ph_cyc[k] / tot_cyc);
+                    printf("      (sum %.1f cyc/ray; dispatch %.2f ms; shader clock counts issue cycles, not latency)\n",
+                           tot_cyc, gpu_ms);
+                }
+            }
+        }
+    };
 
     // Debug export: SRT_EXPORT=path dumps surfels, cuts, grids and triangles for
     // exact CPU-side replication of the trace (temporary debugging aid).
@@ -1585,9 +1814,24 @@ int main() {
         l = loc("u_ambient");      if (l >= 0) raytrace->uniform1f(l, ambient);
         int aux_sel = (view_mode >= 1) ? (view_mode - 1) : 0;  // albedo/normal/pos/depth
         l = loc("u_aux_mode");     if (l >= 0) raytrace->uniform1i(l, aux_sel);
+        l = loc("u_perf");         if (l >= 0) raytrace->uniform1i(l, perf_on ? 1 : 0);
+        if (perf_on) perf_ssbo.clear(GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, &zero);
 
         gl::dispatch_compute((fw + 7) / 8, (fh + 7) / 8, 1);
         glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+        if (perf_on) {
+            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+            GLuint pv[kPerfCount];
+            void* ptr = perf_ssbo.map_range(0, size_t(kPerfCount) * sizeof(GLuint),
+                                            GL_MAP_READ_BIT);
+            if (ptr) {
+                std::memcpy(pv, ptr, size_t(kPerfCount) * sizeof(GLuint));
+                perf_ssbo.unmap();
+                for (int k = 0; k < kPerfCount; ++k) perf_acc[k] += pv[k];
+                phase_acc.readback(pv);
+                ++perf_frames;
+            }
+        }
         t_ray.end();
         traced = true;
     };
@@ -1598,7 +1842,20 @@ int main() {
         last = now;
         ++frame_counter;
 
+        if (frame_times.size() >= 120) frame_times.erase(frame_times.begin());
+        frame_times.push_back(dt * 1000.0f);
+        period_acc += dt * 1000.0f;
+        period_n++;
+
+        // Whole-frame CPU timer: spans poll_events → present. The GPU frame
+        // time is the sum of the individual GPU passes below.
+        t_frame.begin();
+
+        t_poll.begin();
         window.poll_events();
+        t_poll.end();
+
+        t_input.begin();
         camera_control(window, cam, dt, !gui.wants_mouse(), captured);
         cam.set_aspect(float(window.framebuffer_width()) / float(window.framebuffer_height()));
 
@@ -1622,12 +1879,16 @@ int main() {
         if (scan_blocks_prog.poll()) scan_blocks_cs = scan_blocks_prog.take_program();
         if (scan_finish_prog.poll()) scan_finish_cs = scan_finish_prog.take_program();
         if (compact_prog.poll()) compact_cs = compact_prog.take_program();
+        t_input.end();
 
         // Rasterize the direct view every frame (cheap).
+        t_gbuf.begin();
         run_gbuffer();
+        t_gbuf.end();
 
         // Composite (mirror reflections): on demand or realtime.
         if (realtime) run_raytrace();
+        else t_ray.skip();
 
         // Display pass.
         t_display.begin();
@@ -1666,6 +1927,7 @@ int main() {
         }
 
         // Point cloud overlay.
+        t_points.begin();
         if (show_points && pc->valid()) {
             pc->use();
             auto pl = [&](const char* n) { return pc->uniform_location(n); };
@@ -1683,8 +1945,10 @@ int main() {
             gl::draw_arrays(GL_POINTS, 0, N);
             gl::disable(GL_PROGRAM_POINT_SIZE);
         }
+        t_points.end();
 
         // Occupied-cell wireframe overlay.
+        t_cells.begin();
         if (show_cells && boxp->valid() && !occ_aabbs.empty()) {
             boxp->use();
             auto bl = [&](const char* n) { return boxp->uniform_location(n); };
@@ -1703,13 +1967,183 @@ int main() {
             glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
             gl::disable(GL_BLEND);
         }
+        t_cells.end();
 
         // ImGui.
+        t_imgui.begin();
         gui.begin_frame();
         {
             ImGui::Begin("38 Surfel Ray Tracing");
             ImGui::Text("FPS: %.1f   Frame: %.2f ms", 1.0f / std::max(dt, 1e-6f), dt * 1000.0f);
             ImGui::Text("Resolution: %d x %d", fw, fh);
+            ImGui::Separator();
+
+            // ---- Frame timing diagnostics (per-pass GPU/CPU, 0.5 s averages) ----
+            if (ImGui::CollapsingHeader("Frame timing diagnostics",
+                                        ImGuiTreeNodeFlags_DefaultOpen)) {
+                ImGui::Text("Frametime (avg 0.5s): %.3f ms", disp_frame_period);
+                ImGui::Text("FPS: %.1f", 1.0f / std::max(float(disp_frame_period * 1e-3), 1e-6f));
+                ImGui::PlotLines("frame period ms (raw)", frame_times.data(),
+                                 int(frame_times.size()), 0, nullptr, 0.0f, 40.0f,
+                                 ImVec2(0, 50));
+                ImGui::Separator();
+
+                // ---- Frame timing breakdown ----
+                // Order matches the order the segments run in each frame.
+                struct PassRow { const char* name; const PassTimer* t; };
+                const PassRow passes[] = {
+                    {"poll events", &t_poll},
+                    {"camera input", &t_input},
+                    {"gbuffer", &t_gbuf},
+                    {"raytrace", &t_ray},
+                    {"display", &t_display},
+                    {"point cloud", &t_points},
+                    {"cell overlay", &t_cells},
+                    {"imgui build", &t_imgui},
+                    {"present", &t_present},
+                };
+                const int kPasses = int(sizeof(passes) / sizeof(passes[0]));
+                const ImU32 pass_cols[kPasses] = {
+                    IM_COL32(236, 100, 75, 255),
+                    IM_COL32(243, 156, 18, 255),
+                    IM_COL32(52, 152, 219, 255),
+                    IM_COL32(46, 204, 113, 255),
+                    IM_COL32(155, 89, 182, 255),
+                    IM_COL32(52, 73, 94, 255),
+                    IM_COL32(241, 196, 15, 255),
+                    IM_COL32(26, 188, 156, 255),
+                    IM_COL32(230, 126, 34, 255),
+                };
+
+                double gpu_sum = 0.0;
+                for (int i = 0; i < kPasses; ++i)
+                    if (passes[i].t->gpu()) gpu_sum += passes[i].t->disp_gpu();
+
+                if (ImGui::BeginTable("ftable", 3,
+                                      ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+                    ImGui::TableSetupColumn("Pass", ImGuiTableColumnFlags_WidthFixed);
+                    ImGui::TableSetupColumn("GPU avg (ms)", ImGuiTableColumnFlags_WidthFixed);
+                    ImGui::TableSetupColumn("CPU avg (ms)", ImGuiTableColumnFlags_WidthFixed);
+                    ImGui::TableHeadersRow();
+                    for (int i = 0; i < kPasses; ++i) {
+                        const PassTimer& t = *passes[i].t;
+                        ImGui::TableNextRow();
+                        ImGui::TableNextColumn();
+                        ImGui::Text("%s", passes[i].name);
+                        if (t.gpu()) {
+                            ImGui::TableNextColumn(); ImGui::Text("%.3f", t.disp_gpu());
+                        } else {
+                            ImGui::TableNextColumn(); ImGui::Text("cpu-only");
+                        }
+                        ImGui::TableNextColumn(); ImGui::Text("%.3f", t.disp_cpu());
+                    }
+                    const ImVec4 total_col(1.0f, 0.82f, 0.3f, 1.0f);
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn(); ImGui::TextColored(total_col, "frame total");
+                    ImGui::TableNextColumn(); ImGui::TextColored(total_col, "%.3f", gpu_sum);
+                    ImGui::TableNextColumn(); ImGui::TextColored(total_col, "%.3f", t_frame.disp_cpu());
+                    ImGui::EndTable();
+                }
+
+                // CPU time stacked bar across every segment of the frame.
+                const char* cpu_names[kPasses];
+                float cpu_vals[kPasses];
+                for (int i = 0; i < kPasses; ++i) {
+                    cpu_names[i] = passes[i].name;
+                    cpu_vals[i] = float(passes[i].t->disp_cpu());
+                }
+                ImGui::Text("CPU time by segment (frame: %.3f ms):", t_frame.disp_cpu());
+                float bar_w = ImGui::GetContentRegionAvail().x;
+                if (bar_w < 64) bar_w = 256;
+                imgui_stacked_bar(ImGui::GetCursorScreenPos(), ImVec2(bar_w, 16),
+                                  cpu_vals, pass_cols, kPasses);
+                ImGui::Dummy(ImVec2(0, 16));
+                imgui_stacked_legend("cpu_legend", cpu_names, cpu_vals, pass_cols, kPasses,
+                                     float(t_frame.disp_cpu()));
+                ImGui::Separator();
+
+                // GPU time stacked bar across the GPU passes only.
+                const char* gpu_names[kPasses];
+                float gpu_vals[kPasses];
+                ImU32 gpu_cols[kPasses];
+                int gn = 0;
+                for (int i = 0; i < kPasses; ++i)
+                    if (passes[i].t->gpu()) {
+                        gpu_names[gn] = passes[i].name;
+                        gpu_vals[gn] = float(passes[i].t->disp_gpu());
+                        gpu_cols[gn] = pass_cols[i];
+                        ++gn;
+                    }
+                ImGui::Text("GPU time by pass (sum: %.3f ms):", gpu_sum);
+                float gw = ImGui::GetContentRegionAvail().x;
+                if (gw < 64) gw = 256;
+                imgui_stacked_bar(ImGui::GetCursorScreenPos(), ImVec2(gw, 16),
+                                  gpu_vals, gpu_cols, gn);
+                ImGui::Dummy(ImVec2(0, 16));
+                imgui_stacked_legend("gpu_legend", gpu_names, gpu_vals, gpu_cols, gn,
+                                     float(gpu_sum));
+                ImGui::Separator();
+
+                if (ImGui::CollapsingHeader("Pass history (120 windowed samples)")) {
+                    for (int i = 0; i < kPasses; ++i) {
+                        const PassTimer& t = *passes[i].t;
+                        if (!t.cpu_hist().empty()) {
+                            ImGui::PlotLines(passes[i].name, t.cpu_hist().data(),
+                                             int(t.cpu_hist().size()), 0, nullptr,
+                                             0.0f, 40.0f, ImVec2(0, 26));
+                        }
+                    }
+                }
+                ImGui::Separator();
+
+                // ---- Ray-kernel diagnostics (gated by u_perf in raytrace.comp) ----
+                if (ImGui::CollapsingHeader("Ray kernel counters (shader clock)")) {
+                    ImGui::Checkbox("Enable perf counters", &perf_on);
+                    ImGui::SameLine();
+                    ImGui::TextWrapped("(GL_ARB_shader_clock; SRT_PERF=1 also enables at launch)");
+                    if (perf_frames > 0) {
+                        double rays = double(perf_acc[0]);
+                        ImGui::Text("Rays traced: %.0f over %d dispatches", rays, perf_frames);
+                        if (rays > 0.0) {
+                            ImGui::Text("L0 DDA steps / ray: %.1f", double(perf_acc[1]) / rays);
+                            ImGui::Text("descend steps / ray: %.1f", double(perf_acc[2]) / rays);
+                            ImGui::Text("neighborhood cells / ray: %.1f", double(perf_acc[3]) / rays);
+                            ImGui::Text("surfel disk tests / ray: %.1f", double(perf_acc[4]) / rays);
+                            ImGui::Text("gather surfels / ray: %.1f", double(perf_acc[5]) / rays);
+
+                            // Per-phase shader-clock cycles (0.5 s windowed
+                            // average, normalized to the whole-dispatch GPU ms).
+                            static const char* ph_names[4] = {"setup", "traversal",
+                                                              "reconstruct", "shade"};
+                            const ImU32 ph_cols[4] = {
+                                IM_COL32(52, 152, 219, 255),
+                                IM_COL32(243, 156, 18, 255),
+                                IM_COL32(46, 204, 113, 255),
+                                IM_COL32(236, 100, 75, 255),
+                            };
+                            float ph_ms[4] = {0, 0, 0, 0};
+                            double tot_cyc = 0.0;
+                            for (int k = 0; k < 4; ++k) tot_cyc += phase_acc.disp_cyc(k);
+                            if (tot_cyc > 0.0) {
+                                double gpu_ms = t_ray.disp_gpu();
+                                for (int k = 0; k < 4; ++k)
+                                    ph_ms[k] = float(gpu_ms * phase_acc.disp_cyc(k) / tot_cyc);
+                                ImGui::Text("Ray shader cycles by phase (dispatch: %.3f ms):",
+                                            gpu_ms);
+                                float bw = ImGui::GetContentRegionAvail().x;
+                                if (bw < 64) bw = 256;
+                                imgui_stacked_bar(ImGui::GetCursorScreenPos(), ImVec2(bw, 16),
+                                                  ph_ms, ph_cols, 4);
+                                ImGui::Dummy(ImVec2(0, 16));
+                                imgui_stacked_legend("ray_phase_legend", ph_names, ph_ms,
+                                                     ph_cols, 4, float(gpu_ms));
+                            }
+                        }
+                    } else {
+                        ImGui::Text("No traced frames yet (enable counters and run a trace).");
+                    }
+                }
+            }
             ImGui::Separator();
 
             // Model selection
@@ -1734,7 +2168,7 @@ int main() {
             if (ImGui::Button("Ray Trace")) run_raytrace();
             ImGui::SameLine();
             ImGui::Checkbox("Realtime", &realtime);
-            ImGui::Text("Last ray trace: %.3f ms", t_ray.readback());
+            ImGui::Text("Last ray trace: %.3f ms", t_ray.gpu_ms());
             ImGui::Text("Direct view: rasterized | Mirror: %s", traced ? "ray traced" : "not traced yet");
             ImGui::TextWrapped("Orbit: RMB drag  |  Zoom: scroll  |  Move: WASD");
 
@@ -1788,17 +2222,61 @@ int main() {
 
             ImGui::Separator();
             ImGui::Text("GPU timings (ms)");
-            ImGui::Text("  raytrace  %6.2f", t_ray.readback());
-            ImGui::Text("  display   %6.2f", t_display.readback());
+            ImGui::Text("  raytrace  %6.2f", t_ray.disp_gpu());
+            ImGui::Text("  display   %6.2f", t_display.disp_gpu());
             ImGui::TextWrapped("Technique: Schaufler & Jensen 2000, ray tracing point-sampled geometry "
                                "through a GPU sparse uniform grid (DDA + interpolated surfel disks).");
             ImGui::End();
         }
-        gui.render();
+        t_imgui.end();
 
+        t_present.begin();
+        gui.render();
         window.swap_buffers();
+        t_present.end();
+        t_frame.end();
+
+        // Read the just-finished frame's GPU timers (non-blocking: each pass's
+        // query was ended in a previous frame, so the read cannot stall a live
+        // query). Samples accumulate into the current 0.5 s display window.
+        t_frame.readback();
+        t_poll.readback();
+        t_input.readback();
+        t_gbuf.readback();
+        t_ray.readback();
+        t_display.readback();
+        t_points.readback();
+        t_cells.readback();
+        t_imgui.readback();
+        t_present.readback();
+
+        // 0.5 s display window elapsed: publish the averaged pass timings and
+        // frame period, and append windowed averages to the history plots.
+        if (now - win_start >= 0.5) {
+            t_frame.flush_window();
+            t_poll.flush_window();
+            t_input.flush_window();
+            t_gbuf.flush_window();
+            t_ray.flush_window();
+            t_display.flush_window();
+            t_points.flush_window();
+            t_cells.flush_window();
+            t_imgui.flush_window();
+            t_present.flush_window();
+            phase_acc.flush_window();
+            disp_frame_period = period_n ? period_acc / double(period_n) : 0.0;
+            period_acc = 0.0;
+            period_n = 0;
+            win_start = now;
+        }
+
+        // Console diagnostics on a cadence (see print_perf above).
+        if (frame_counter % 120 == 0 || (perf_on && frame_counter % 5 == 0)) print_perf();
+
         window.poll_events();
     }
+
+    print_perf();   // final summary before exiting
 
     return EXIT_SUCCESS;
 }
