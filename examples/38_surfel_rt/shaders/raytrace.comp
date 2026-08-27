@@ -424,14 +424,16 @@ void main() {
     if (gmirror > 0.5) {
         // Reflected surface: cast a reflection ray through the point-sampled
         // geometry (Schaufler & Jensen), shade what it hits, recurse on mirrors.
-        // Paper §5: only accept intersections at least 2r from the ray origin to
-        // avoid false hits on the mirror's own surfels. Instead of rejecting all
-        // hits within 2r (which also deletes genuinely close geometry, e.g.
-        // surfaces meeting at contact edges -> gaps), pad the ray ORIGIN by 2r
-        // along the normal (paper's shadow-offset trick): self-surfels then lie
-        // behind the origin while real neighbors stay visible.
+        // Paper §5: to avoid false hits on the mirror's own surfels, pad the ray
+        // ORIGIN along the normal (the shadow-offset trick): the mirror's own
+        // disks all lie in its tangent plane, so they are behind the origin for
+        // ANY positive pad and never hit. The pad is a FIXED constant: scaling
+        // it with the surfel step or the cylinder-radius slider displaced the
+        // origin and shifted the whole reflected image (oblique rays displace
+        // laterally by ~pad*sin(angle)), and neither knob could compensate the
+        // other since radius_scale also rescales the disk/blend weights.
         color = vec3(0.0);
-        float self_off = 2.0 * search_r(1.0);
+        const float self_off = 0.02;   // fixed origin pad, independent of density/radius
         vec3 ro = gpos + gnrm * self_off;
         vec3 rd = reflect(view_dir, gnrm);
         float t_near = 1e-3;

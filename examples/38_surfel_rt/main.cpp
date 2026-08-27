@@ -52,12 +52,23 @@
 #include <vector>
 
 constexpr float kPi      = 3.14159265358979f;
-constexpr float kLATTICE_R = 0.8f;    // stored disk radius = this * local grid step h
+// Stored disk radius = this * local spacing h. For the old exact-lattice
+// sampling 0.8 (> covering radius 0.71h) was enough. Dart-throwing enforces a
+// MINIMUM spacing h, but the covering radius (largest hole) of a Poisson-disk
+// set is ~1.0-1.35h, so 1.35 makes the surface watertight at radius_scale 1.0.
+constexpr float kLATTICE_R = 1.35f;
 constexpr float kSHARP_DOT = 0.6f;    // |n_i . n_j| below this => sharp edge
 constexpr uint32_t kSEED = 42;
-constexpr float kCurvAdapt    = 4.5f;   // curvature adaptivity gamma (see sampler)
+constexpr float kCurvAdapt    = 8.0f;   // curvature adaptivity gamma (see sampler)
 constexpr float kCurvKappaMax = 200.0f; // curvature clamp [1/m]
-constexpr float kCurvFloor    = 0.08f;  // min adaptive step, as fraction of h_base
+constexpr float kCurvFloor    = 0.03f;  // min adaptive step, as fraction of h_base
+// Curvature below this counts as "flat". Cut planes clip disks at sharp
+// creases; on CURVED meshes (the bunny) the "crease" is a self-intersection
+// between curved faces and a cut plane through it slices unrelated surface —
+// exactly the gaps seen in the mirror. Only edges between flat faces (walls,
+// boxes) generate cuts. (A broad bunny back has kappa ~5-10 1/m, the room's
+// float-noise coplanar dihedrals ~1e-4, so 0.5 separates them cleanly.)
+constexpr float kFlatKappa    = 0.5f;   // [1/m]
 constexpr int   kBlockSize = 256;
 constexpr int   kScanBlocksMax = 1024;   // scan_blocks.comp single workgroup limit
 constexpr int   kMaxGridVolume = kBlockSize * kScanBlocksMax;  // 262144
@@ -373,8 +384,11 @@ ExtractedMesh extract_triangles(const gfx::Model& model, const glm::mat4& model_
             fe.tri_a[2] = e.opp[0];
             fe.obj_a = out.tris[size_t(e.ti[0])].object;
             fe.obj_b = fe.obj_a;
-            out.edges.push_back(fe);
-        } else if (e.count == 2 && std::abs(glm::dot(e.n[0], e.n[1])) < kSHARP_DOT) {
+            if (out.tris[size_t(e.ti[0])].curvature < kFlatKappa)
+                out.edges.push_back(fe);   // boundary cuts only on flat faces
+        } else if (e.count == 2 && std::abs(glm::dot(e.n[0], e.n[1])) < kSHARP_DOT &&
+                   out.tris[size_t(e.ti[0])].curvature < kFlatKappa &&
+                   out.tris[size_t(e.ti[1])].curvature < kFlatKappa) {
             fe.boundary = false;
             fe.na = e.n[0];
             fe.nb = e.n[1];
@@ -382,100 +396,178 @@ ExtractedMesh extract_triangles(const gfx::Model& model, const glm::mat4& model_
             fe.ctr_b = e.ctr[1];
             fe.obj_a = out.tris[size_t(e.ti[0])].object;
             fe.obj_b = out.tris[size_t(e.ti[1])].object;
-            out.edges.push_back(fe);
+            out.edges.push_back(fe);   // sharp crease only between FLAT faces
         }
     }
     return out;
 }
 
 // ---------------------------------------------------------------------------
-// Barycentric lattice sampling with curvature-adaptive density.
+// SurfEL placement — area-weighted Poisson-disk (dart-throwing) sampling with
+// variable local density.
 //
-// Instead of random best-candidate placement, each triangle carries a regular
-// lattice aligned to its edges: p0 + (u/n1) e1 + (v/n2) e2 for u,v >= 0 inside
-// u/n1 + v/n2 <= 1. All three triangle borders receive rows lying exactly on
-// them, spacing is uniform, and the biggest hole is known analytically (paper
-// §3/§4.1 require r > biggest hole): lattice covering radius is at most
-// sqrt(h^2+h^2)/2 <= h*sqrt(2)/2, so a disk radius kLATTICE_R * h with
-// kLATTICE_R > 0.71 makes the point-sampled surface provably watertight.
+// Target spacing is PER TRIANGLE: h_i = h_base / (1 + gamma*kappa_i*h_base),
+// curvature-adaptive (flat walls sample at h_base; curved detail refines to
+// millimeter spacing). The problem with per-triangle lattice/centroid
+// placement is that spacing is only even WITHIN a triangle — adjacent
+// triangles use independent patterns and phases, so the combined coverage has
+// clumps and gaps (error diffusion coordinates counts, not positions).
 //
-// The lattice step is PER TRIANGLE: h_i = h_base / (1 + gamma * kappa_i *
-// h_base), where kappa_i is the triangle's smooth-edge curvature. Flat surfaces
-// (walls) sample at h_base; curved detail (bunny: kappa ~ 15-50 1/m) refines
-// down to millimeter spacing. Each sample stores its own disk radius
-// kLATTICE_R * h_i — the whole pipeline (grid levels, traversal, blending)
-// already consumes per-surfel radii. Sub-step triangles (edges shorter than
-// h_i — dense imported meshes) place samples proportional to AREA via error
-// diffusion so their population converges to ~area/h_i²; one sample lands at
-// the centroid, extras spread deterministically (golden-ratio barycentrics).
-// The sample count is an OUTPUT of the density — there is no budget rescale.
+// Instead we dart-throw candidates on the whole surface:
+//   - pick a triangle weighted by area/h_i^2 (its target sample share),
+//   - place a uniform random barycentric point (sqrt trick),
+//   - accept only if no accepted same-surface sample of the same object is
+//     within max(h_i, h_existing) — a variable-radius Poisson-disk condition
+//     enforced via a flat 3D cell grid (cell = h_base, 27-cell lookup),
+//   - stop when the surface is packed (a long run of rejections).
+// This gives globally even spacing at the local scale with a bounded maximum
+// hole, independent of triangle tessellation. Normals are the geometric face
+// normal on flat faces (robust against junk vertex normals in the asset) and
+// barycentric-interpolated vertex normals on curved faces (matches the
+// rasterizer's shading). The sample count is an OUTPUT of the density —
+// there is no budget rescale.
 // ---------------------------------------------------------------------------
+
+namespace {
+
+// Flat 3D cell grid for Poisson-disk neighbor queries. cell = h_base >= any
+// local step, so the 27-cell neighborhood covers every min-distance query.
+// The scene bbox at cell = h_base is small (~40^3 cells), far faster than a
+// hash map, keeping the interactive step slider responsive.
+struct SampleHashGrid {
+    glm::vec3 mn{0.0f};
+    float cell = 1.0f;
+    glm::ivec3 res{1};
+    std::vector<std::vector<uint32_t>> cells;
+
+    void setup(const glm::vec3& bmin, const glm::vec3& bmax, float c) {
+        cell = c;
+        mn = bmin - glm::vec3(c);
+        const glm::vec3 mx = bmax + glm::vec3(c);
+        for (int a = 0; a < 3; ++a)
+            res[a] = std::max(1, int(std::ceil((mx[a] - mn[a]) / c)));
+        cells.assign(size_t(res.x) * size_t(res.y) * size_t(res.z), {});
+    }
+    glm::ivec3 icell(const glm::vec3& p) const {
+        glm::ivec3 c = glm::ivec3(glm::floor((p - mn) / cell));
+        return glm::clamp(c, glm::ivec3(0), res - 1);
+    }
+    void insert(const glm::vec3& p, uint32_t idx) {
+        const glm::ivec3 c = icell(p);
+        cells[size_t(c.x) + size_t(res.x) * (size_t(c.y) + size_t(res.y) * size_t(c.z))].push_back(idx);
+    }
+    // Candidate at p (normal n, object obj, local step h_cand) is too close to
+    // an accepted sample if the two are within max(h_cand, h_existing) AND lie
+    // on the same surface of the same object (crevice/touching-object pairs
+    // must not thin each other — that opens holes at seams).
+    bool too_close(const glm::vec3& p, const glm::vec3& n, int object, float h_cand,
+                   const std::vector<SamplePoint>& pts) const {
+        const glm::ivec3 c = icell(p);
+        for (int dz = -1; dz <= 1; ++dz)
+        for (int dy = -1; dy <= 1; ++dy)
+        for (int dx = -1; dx <= 1; ++dx) {
+            const glm::ivec3 cc = c + glm::ivec3(dx, dy, dz);
+            if (cc.x < 0 || cc.y < 0 || cc.z < 0 ||
+                cc.x >= res.x || cc.y >= res.y || cc.z >= res.z) continue;
+            const auto& cell_list =
+                cells[size_t(cc.x) + size_t(res.x) * (size_t(cc.y) + size_t(res.y) * size_t(cc.z))];
+            for (uint32_t i : cell_list) {
+                if (pts[i].object != object) continue;           // other object
+                if (glm::dot(n, pts[i].nrm) < 0.85f) continue;   // other surface
+                const float d = std::max(h_cand, pts[i].radius / kLATTICE_R);
+                if (glm::dot(glm::vec3(pts[i].pos) - p, glm::vec3(pts[i].pos) - p) < d * d)
+                    return true;
+            }
+        }
+        return false;
+    }
+};
+
+}  // namespace
 
 static std::vector<SamplePoint> sample_points_lattice(
     const std::vector<Tri>& tris, const std::vector<bool>& tri_mirror,
     float h_base, float& step_out)
 {
-    auto generate = [&](float h) {
-        std::vector<SamplePoint> pts;
-        float carry = 0.0f;
-        for (size_t i = 0; i < tris.size(); ++i) {
-            const Tri& t = tris[i];
-            glm::vec3 e1 = t.p[1] - t.p[0];
-            glm::vec3 e2 = t.p[2] - t.p[0];
-            // Curvature-adaptive local step (floored at a fraction of h_base
-            // so degenerate kappa estimates cannot explode the count).
-            const float hi = std::max(h / (1.0f + kCurvAdapt * std::min(t.curvature, kCurvKappaMax) * h),
-                                      h * kCurvFloor);
-            const float ri = kLATTICE_R * hi;
-            int n1 = std::max(1, int(std::round(glm::length(e1) / hi)));
-            int n2 = std::max(1, int(std::round(glm::length(e2) / hi)));
-            if (n1 == 1 && n2 == 1) {
-                // Sub-step triangle (edges shorter than the local lattice step).
-                // Corner sampling would emit 3 samples per triangle regardless
-                // of step (count explosion) and pile duplicates onto shared
-                // vertices. Place samples PROPORTIONAL TO AREA via error
-                // diffusion so the population converges to ~area/h_i².
-                const float target = t.area / (hi * hi);
-                const int n = int(target + carry);
-                carry += target - float(n);
-                for (int j = 0; j < n; ++j) {
-                    SamplePoint s;
-                    if (j == 0) {
-                        s.pos = (t.p[0] + t.p[1] + t.p[2]) / 3.0f;
-                    } else {
-                        float a = std::fmod(float(j) * 0.618034f + 0.5f, 1.0f);
-                        float b = std::fmod(float(j) * 0.754878f + 0.25f, 1.0f);
-                        if (a + b > 1.0f) { a = 1.0f - a; b = 1.0f - b; }
-                        s.pos = t.p[0] + e1 * a + e2 * b;
-                    }
-                    s.nrm = glm::normalize(t.n[0] + t.n[1] + t.n[2]);
-                    s.alb = t.alb;
-                    s.is_mirror = tri_mirror[i];
-                    s.object = t.object;
-                    s.radius = ri;
-                    pts.push_back(s);
-                }
-                continue;
-            }
-            for (int u = 0; u <= n1; ++u)
-                for (int v = 0; v <= n2; ++v) {
-                    if (float(u) / float(n1) + float(v) / float(n2) > 1.0f + 1e-6f)
-                        continue;   // keep barycentric w >= 0 half-parallelogram
-                    SamplePoint s;
-                    s.pos = t.p[0] + e1 * (float(u) / float(n1))
-                          + e2 * (float(v) / float(n2));
-                    s.nrm = glm::normalize(t.n[0] + t.n[1] + t.n[2]);
-                    s.alb = t.alb;
-                    s.is_mirror = tri_mirror[i];
-                    s.object = t.object;
-                    s.radius = ri;
-                    pts.push_back(s);
-                }
-        }
-        return pts;
-    };
+    const size_t ntri = tris.size();
 
-    std::vector<SamplePoint> pts = generate(h_base);
+    // Per-triangle target spacing (curvature-adaptive, floored) and a
+    // cumulative distribution over area/h_i^2 — each triangle's share of the
+    // target sample count — for area-weighted picking.
+    std::vector<float> pick_cdf;
+    pick_cdf.reserve(ntri);
+    std::vector<float> h_i(ntri), r_i(ntri);
+    double target = 0.0;
+    float total_weight = 0.0f;
+    glm::vec3 bmin(1e30f), bmax(-1e30f);
+    for (size_t i = 0; i < ntri; ++i) {
+        const Tri& t = tris[i];
+        for (int k = 0; k < 3; ++k) {
+            bmin = glm::min(bmin, t.p[k]);
+            bmax = glm::max(bmax, t.p[k]);
+        }
+        const float hi = std::max(h_base / (1.0f + kCurvAdapt * std::min(t.curvature, kCurvKappaMax) * h_base),
+                                  h_base * kCurvFloor);
+        h_i[i] = hi;
+        r_i[i] = kLATTICE_R * hi;
+        const float w = t.area / (hi * hi);   // target sample share
+        total_weight += w;
+        pick_cdf.push_back(total_weight);
+        target += double(w);
+    }
+    if (total_weight <= 0.0f) { step_out = h_base; return {}; }
+
+    // Variable-radius Poisson-disk dart-throwing.
+    std::mt19937 rng(kSEED);
+    std::uniform_real_distribution<float> unit(0.0f, 1.0f);
+
+    std::vector<SamplePoint> pts;
+    pts.reserve(size_t(std::min(target * 1.2, 1e6)));
+    SampleHashGrid grid;
+    grid.setup(bmin, bmax, h_base);
+
+    // Stop when the surface holds ~1.1x the target count (Poisson packing),
+    // a run of rejections indicates it is full, or the attempt cap is hit.
+    // The 60x cap of an earlier draft made dense scenes (high curvature,
+    // low floor) take minutes in debug builds — bound it tightly instead.
+    const size_t target_count = size_t(std::min(target * 1.1, 1e6));
+    const size_t max_attempts = std::max<size_t>(20000, size_t(std::min(target * 4.0, 4e6)));
+    size_t consecutive_fail = 0;
+    for (size_t attempt = 0; attempt < max_attempts; ++attempt) {
+        // Area/h_i^2 weighted triangle pick (binary search on the CDF).
+        const float u = unit(rng) * total_weight;
+        const size_t ti = size_t(std::upper_bound(pick_cdf.begin(), pick_cdf.end(), u) - pick_cdf.begin());
+        if (ti >= ntri) continue;
+        const Tri& t = tris[ti];
+        // Uniform random point in the triangle (sqrt trick).
+        float a = unit(rng), b = unit(rng);
+        if (a + b > 1.0f) { a = 1.0f - a; b = 1.0f - b; }
+        const float w = 1.0f - a - b;
+        SamplePoint s;
+        s.pos = t.p[0] + (t.p[1] - t.p[0]) * a + (t.p[2] - t.p[0]) * b;
+        // Normal: geometric face normal on flat faces (robust against junk
+        // vertex normals in the asset), barycentric-interpolated vertex
+        // normals on curved faces (matches the rasterizer's shading).
+        if (t.curvature < kFlatKappa) {
+            s.nrm = glm::normalize(glm::cross(t.p[1] - t.p[0], t.p[2] - t.p[0]));
+        } else {
+            s.nrm = glm::normalize(t.n[0] * w + t.n[1] * a + t.n[2] * b);
+        }
+        s.alb = t.alb;
+        s.is_mirror = tri_mirror[ti];
+        s.object = t.object;
+        s.radius = r_i[ti];
+
+        if (grid.too_close(s.pos, s.nrm, s.object, h_i[ti], pts)) {
+            if (++consecutive_fail >= 4000) break;   // surface is packed
+            continue;
+        }
+        consecutive_fail = 0;
+        grid.insert(s.pos, uint32_t(pts.size()));
+        pts.push_back(s);
+        if (pts.size() >= target_count) break;
+    }
+
     step_out = h_base;
     return pts;
 }
@@ -626,7 +718,7 @@ std::vector<glm::vec4> compute_surfel_cuts(const std::vector<SamplePoint>& pts,
 // ---------------------------------------------------------------------------
 
 constexpr uint32_t kCacheMagic   = 0x38535254;  // "8SRT"
-constexpr uint32_t kCacheVersion = 8;   // 8: per-object cuts (object id per sample)
+constexpr uint32_t kCacheVersion = 10;  // 10: area-weighted Poisson-disk (dart-throw) sampling
 
 uint64_t file_stamp(const std::string& path, uint64_t* size_out) {
     std::error_code ec;
