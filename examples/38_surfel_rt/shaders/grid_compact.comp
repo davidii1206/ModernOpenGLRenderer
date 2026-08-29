@@ -1,20 +1,30 @@
 #version 460 core
 layout(local_size_x = 256) in;
 
-// Pass 3: compact surfels into cell order: packed_idx[start[ci] + slot] = s.
-// Multi-LOD: processes ONE level's surfel list into the level's packed segment.
+// Pass 3: compact surfels into cell order: packed_idx[start[ci] + slot] = s,
+// and copy the surfel DATA to the same slot (cell-sorted SoA): the trace
+// kernel's cell scans then read strictly sequential streams instead of
+// gathering through packed_idx. pos+nrm are interleaved into one 32B record
+// (packed_pn[2i] = pos, packed_pn[2i+1] = nrm): a disk test fetches both with
+// a single contiguous 32B read instead of two separate streams.
+// Multi-LOD: processes ONE level's surfel list into the level's packed segment
+// (packed arrays share the packed_idx segment offsets; PN is 2x its length).
 layout(std430, binding = 0) readonly buffer SurfPos { vec4 surfel_pos[]; };
 layout(std430, binding = 1) readonly buffer SurfelSlot { uint surfel_slot[]; };
 layout(std430, binding = 2) readonly buffer CellStart { uint cell_start[]; };
 layout(std430, binding = 3) buffer PackedIdx { uint packed_idx[]; };
 layout(std430, binding = 4) readonly buffer LevelIdx { uint level_idx[]; };
+layout(std430, binding = 5) readonly buffer SurfNrm { vec4 surfel_nrm[]; };
+layout(std430, binding = 6) readonly buffer SurfAlb { vec4 surfel_alb[]; };
+layout(std430, binding = 7) buffer PackedPN { vec4 packed_pn[]; };
+layout(std430, binding = 8) buffer PackedAlb { vec4 packed_alb[]; };
 
 uniform vec3 u_grid_min;
 uniform float u_inv_cell;
 uniform ivec3 u_grid_res;
 uniform uint u_num;         // surfels in this level
 uniform uint u_start_off;   // cell_start segment offset of this level
-uniform uint u_packed_off;  // packed_idx segment offset of this level
+uniform uint u_packed_off;  // packed arrays segment offset of this level
 uniform uint u_idx_off;     // level_idx segment offset of this level
 
 uint cell_index(ivec3 c) {
@@ -28,5 +38,9 @@ void main() {
     vec3 p = surfel_pos[s].xyz;
     ivec3 c = clamp(ivec3(floor((p - u_grid_min) * u_inv_cell)), ivec3(0), u_grid_res - 1);
     uint ci = cell_index(c);
-    packed_idx[u_packed_off + cell_start[u_start_off + ci] + surfel_slot[s]] = s;
+    uint dst = u_packed_off + cell_start[u_start_off + ci] + surfel_slot[s];
+    packed_idx[dst] = s;
+    packed_pn[2u * dst] = surfel_pos[s];
+    packed_pn[2u * dst + 1u] = surfel_nrm[s];
+    packed_alb[dst] = surfel_alb[s];
 }

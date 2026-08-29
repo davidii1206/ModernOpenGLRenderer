@@ -1,0 +1,251 @@
+#version 460 core
+#extension GL_ARB_shader_clock : enable
+layout(local_size_x = 128) in;
+
+// Mirror-ray reconstruction kernel: runs after the traversal kernel for the
+// same bounce dispatch. Reads each ray's best-hit parameter, reconstructs the
+// surface (paper §4.2, Eq. 1) from the surrounding surfels, shades, and
+// accumulates the contribution into the RGBA32F image (one ray per pixel per
+// bounce: no races). Surviving mirror hits are appended to the next bounce's
+// stream here, so every dispatch has uniform full warps.
+// Splitting traversal and reconstruction into two kernels keeps both lean:
+// lower register pressure -> higher occupancy for the latency-bound parts.
+layout(binding = 3, rgba32f) uniform image2D u_accum;
+
+// Grid + surfel data (same bindings as the traversal kernel).
+layout(std430, binding = 3) readonly buffer CellSC { uvec2 cell_sc[]; };
+layout(std430, binding = 5) readonly buffer PackedIdx { uint packed_idx[]; };
+layout(std430, binding = 6) readonly buffer SurfCut { vec4 surfel_cut[]; };
+layout(std430, binding = 8) readonly buffer PackedPN { vec4 packed_pn[]; };   // 2i pos xyz+r, 2i+1 nrm
+layout(std430, binding = 9) readonly buffer PackedAlb { vec4 packed_alb[]; }; // rgb, w = mirror
+layout(std430, binding = 11) readonly buffer CellMask { uint cell_mask[]; };
+
+// Ray stream for this bounce + counts + the traversal kernel's hit buffer.
+layout(std430, binding = 12) readonly buffer StreamIn { vec4 stream_in[]; };
+layout(std430, binding = 13) buffer RayCounts { uint counts[]; };   // [bounce]
+layout(std430, binding = 15) readonly buffer HitBuf { float hit_buf[]; };
+layout(std430, binding = 14) writeonly buffer StreamOut { vec4 stream_out[]; };
+
+// Optional per-dispatch diagnostics, shared-memory flushed (see raytrace.comp).
+layout(std430, binding = 7) buffer PerfBuf { uint perf[]; };
+uniform int u_perf;   // 0 = counters off
+
+#define kLevels 4
+uniform vec3  u_l_min[kLevels];
+uniform float u_l_inv_cell[kLevels];
+uniform ivec3 u_l_res[kLevels];
+uniform uint  u_l_cnt_off[kLevels];
+uniform uint  u_l_packed_off[kLevels];
+uniform uint  u_l_mask_off[kLevels];
+uniform uint  u_l_num[kLevels];
+uniform float u_l_max_r[kLevels];
+uniform int   u_levels;
+
+uniform vec3 u_light_pos;
+uniform vec3 u_light_color;
+uniform float u_light_intensity;
+uniform int u_max_bounces;
+uniform int u_bounce;              // which bounce this dispatch processes
+uniform float u_radius_scale;      // multiplies each surfel's stored radius
+uniform float u_ambient;
+uniform float u_far;
+
+shared uint lperf[10];
+#define PERF_ADD(i, v) if (u_perf != 0) atomicAdd(lperf[i], uint(v))
+#define PERF_CYC(i, t0) if (u_perf != 0) atomicAdd(lperf[i], clock2x32ARB().x - t0)
+
+const int kSurfelCuts = 6;
+
+// Edge-cut clip test for surfel s at point p (on s's tangent plane): reject p
+// if it lies on the far side of any stored cut plane (across a sharp edge into
+// the neighboring face's half-space). Anchor form: plane through anchor with
+// normal n; empty slots have n == 0 and never reject.
+bool cut_rejects(int s, vec3 p) {
+    int base = s * kSurfelCuts * 2;
+    for (int k = 0; k < kSurfelCuts; ++k) {
+        vec3 n = surfel_cut[base + 2 * k].xyz;
+        vec3 a = surfel_cut[base + 2 * k + 1].xyz;
+        if (dot(p - a, n) > 0.0) return true;
+    }
+    return false;
+}
+
+bool l_in_bounds(int l, ivec3 c) {
+    return c.x >= 0 && c.y >= 0 && c.z >= 0 &&
+           c.x < u_l_res[l].x && c.y < u_l_res[l].y && c.z < u_l_res[l].z;
+}
+
+bool cell_occupied(int l, uint ci) {
+    return (cell_mask[u_l_mask_off[l] + (ci >> 5)] >> (ci & 31u)) != 0u;
+}
+
+struct Hit {
+    vec3 pos;
+    vec3 nrm;
+    vec3 alb;
+    float t;
+    bool is_mirror;
+};
+
+vec3 shade(vec3 alb, vec3 n, vec3 pos) {
+    vec3 to_light = u_light_pos - pos;
+    float dist2 = dot(to_light, to_light);
+    float dist = sqrt(dist2);
+    vec3 L = to_light / max(dist, 1e-5);
+    float ndl = max(dot(n, L), 0.0);
+    return alb * (u_light_color * u_light_intensity) * ndl / max(dist2, 1e-4)
+         + alb * u_ambient;
+}
+
+// Surface reconstruction for the hit at best_t (paper §4.2, Eq. 1). Collect
+// surfels whose tangent-plane disk distance d_i is < r (distance measured IN
+// the plane of the point and its normal, NOT orthogonal to the ray). Weight by
+// (r - d_i). The hit position is found by interpolating the ray parameter t of
+// each surfel's plane intersection, placed back on the ray: pos = o + d*t_int.
+// Surfels live in exactly one level, so gathering from every level never
+// double-counts. The per-level window is tight: a candidate blends only if
+// |t_i - best_t| < r_c*rs AND |q - c| < r_c*rs, so
+// |c - hit_pos| < 2*rs*r_c <= 2*rs*max_r_l; cells farther than that along any
+// axis cannot contribute, giving window = ceil(2*rs*max_r_l/cell_l)
+// (1 for levels whose band radii are small relative to their cells,
+// 2 in the worst case — identical output either way).
+bool reconstruct(vec3 o, vec3 d, float t_near, float t_far, float best_t, out Hit hit) {
+    uint recon0 = 0;
+    if (u_perf != 0) recon0 = clock2x32ARB().x;
+    vec3 hit_pos = o + d * best_t;
+    vec3 acc_nrm = vec3(0.0), acc_alb = vec3(0.0);
+    float acc_t = 0.0;
+    float wsum = 0.0;
+    bool mirror = false;
+    Hit nearest;
+    nearest.t = 1e30;
+    nearest.nrm = vec3(0.0, 1.0, 0.0);
+    nearest.alb = vec3(0.8);
+
+    for (int l = 0; l < u_levels; ++l) {
+        if (u_l_num[l] == 0u) continue;
+        // Skip levels whose grid does not contain the hit point.
+        vec3 g = (hit_pos - u_l_min[l]) * u_l_inv_cell[l];
+        if (any(lessThan(g, vec3(0.0))) || any(greaterThanEqual(g, vec3(u_l_res[l])))) continue;
+        int w = (2.0 * u_radius_scale * u_l_max_r[l] * u_l_inv_cell[l] >= 1.0) ? 2 : 1;
+        ivec3 hc = clamp(ivec3(floor(g)), ivec3(0), u_l_res[l] - 1);
+        for (int dz = -w; dz <= w; ++dz)
+        for (int dy = -w; dy <= w; ++dy)
+        for (int dx = -w; dx <= w; ++dx) {
+            ivec3 cc = hc + ivec3(dx, dy, dz);
+            if (!l_in_bounds(l, cc)) continue;
+            uint ci = uint(cc.x + u_l_res[l].x * (cc.y + u_l_res[l].y * cc.z));
+            if (!cell_occupied(l, ci)) continue;
+            uvec2 sc = cell_sc[u_l_cnt_off[l] + ci];
+            uint pbase = u_l_packed_off[l] + sc.x;
+            for (uint k = 0; k < sc.y; ++k) {
+                uint pi = pbase + k;
+                PERF_ADD(5, 1);
+                vec4 pc = packed_pn[2u * pi];
+                vec3 c = pc.xyz;
+                vec3 n = packed_pn[2u * pi + 1u].xyz;
+
+                // Ray intersection with this surfel's tangent plane.
+                float denom = dot(d, n);
+                // Cull backfaces: only blend surfels whose normal faces the ray
+                // origin (single-sided disks, consistent with the disk test).
+                if (denom >= 1e-6) continue;
+                float t_i = dot(c - o, n) / denom;
+                if (t_i < t_near || t_i > t_far) continue;
+                float sr = pc.w * u_radius_scale;   // adaptive per-surfel radius
+                // Parallax gate: only blend surfels whose own disk lies
+                // within the candidate's radius of the winning hit in ray
+                // parameter. With adaptive radii the candidate's own sr is the
+                // right window: coplanar neighbors always pass (same plane =>
+                // t_i == best_t), while surfels of a different surface behind
+                // or in front (edge-on walls, box sides) intersect the ray
+                // farther away and would blur the silhouette (edge bleed).
+                if (abs(t_i - best_t) > sr) continue;
+                vec3 q = o + d * t_i;
+                // Squared-distance gate first; only compute the real distance
+                // for surfels that actually contribute a weight (sr - d_i).
+                float d_i2 = dot(q - c, q - c);     // tangent-plane disk distance²
+                if (d_i2 >= sr * sr) continue;
+                float d_i = sqrt(d_i2);
+                // Edge-cut: don't blend this surfel's contribution across a
+                // sharp edge. packed_idx indirection only here, for the rare
+                // candidates that pass every gate.
+                if (cut_rejects(int(packed_idx[pi]), q)) continue;
+
+                float wgt = sr - d_i;
+                acc_t += t_i * wgt;
+                acc_nrm += n * wgt;
+                acc_alb += packed_alb[pi].rgb * wgt;
+                wsum += wgt;
+                mirror = mirror || packed_alb[pi].w > 0.5;
+
+                if (t_i < nearest.t) {
+                    nearest.t = t_i;
+                    nearest.nrm = n;
+                    nearest.alb = packed_alb[pi].rgb;
+                }
+            }
+        }
+    }
+
+    if (wsum > 1e-8) {
+        hit.pos = o + d * (acc_t / wsum);
+        hit.nrm = normalize(acc_nrm / wsum);
+        hit.alb = acc_alb / wsum;
+    } else {
+        hit.pos = hit_pos;
+        hit.nrm = nearest.nrm;
+        hit.alb = nearest.alb;
+    }
+    hit.t = best_t;
+    hit.is_mirror = mirror;
+
+    // Flip normal toward the ray origin (paper §5).
+    if (dot(hit.nrm, d) > 0.0) hit.nrm = -hit.nrm;
+    PERF_CYC(8, recon0);
+    return true;
+}
+
+void main() {
+    if (int(gl_LocalInvocationIndex) < 10) lperf[gl_LocalInvocationIndex] = 0u;
+    barrier();
+
+    uint rid = gl_GlobalInvocationID.x;
+    if (rid < counts[u_bounce]) {
+        float best_t = hit_buf[rid];
+        if (best_t > 0.0) {
+            vec4 e0 = stream_in[2u * rid];
+            vec4 e1 = stream_in[2u * rid + 1u];
+            uint p = floatBitsToUint(e0.x);
+            ivec2 px = ivec2(int(p & 0xffffu), int(p >> 16u));
+            vec3 ro = e0.yzw;
+            vec3 rd = e1.xyz;
+
+            Hit hit;
+            reconstruct(ro, rd, 1e-3, u_far, best_t, hit);
+
+            uint t_shade0 = 0;
+            if (u_perf != 0) t_shade0 = clock2x32ARB().x;
+            vec3 c = shade(hit.alb, hit.nrm, hit.pos);
+            PERF_CYC(9, t_shade0);
+            // Accumulate this bounce's contribution (each pixel belongs to
+            // exactly one ray per bounce: no races). fp32 adds in the same
+            // order as the old in-thread loop; display rounds to half float.
+            imageStore(u_accum, px, imageLoad(u_accum, px) + vec4(c, 0.0));
+
+            if (hit.is_mirror && u_bounce + 1 < u_max_bounces) {
+                // Paper §5 origin pad: fixed constant, see ray_mark.comp.
+                vec3 nro = hit.pos + hit.nrm * 0.02;
+                vec3 nrd = reflect(rd, hit.nrm);
+                uint ni = atomicAdd(counts[uint(u_bounce) + 1u], 1u);
+                stream_out[2u * ni] = vec4(uintBitsToFloat(
+                                               uint(px.x) | (uint(px.y) << 16)), nro);
+                stream_out[2u * ni + 1u] = vec4(nrd, 0.0);
+            }
+        }
+    }
+
+    barrier();
+    if (u_perf != 0 && int(gl_LocalInvocationIndex) < 10)
+        atomicAdd(perf[gl_LocalInvocationIndex], lperf[gl_LocalInvocationIndex]);
+}

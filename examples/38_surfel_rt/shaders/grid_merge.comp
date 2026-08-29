@@ -1,0 +1,17 @@
+#version 460 core
+layout(local_size_x = 256) in;
+
+// Grid build, final pass: interleave cell_start + cell_count into one uvec2
+// per cell. The trace kernel's per-cell probe then costs a single 8B load
+// instead of two dependent 4B loads (mask -> start -> count -> data chain
+// becomes mask -> sc -> data).
+layout(std430, binding = 0) readonly buffer CellStart { uint cell_start[]; };
+layout(std430, binding = 1) readonly buffer CellCount { uint cell_count[]; };
+layout(std430, binding = 2) buffer CellSC { uvec2 cell_sc[]; };
+
+uniform uint u_n;   // total cells across all levels (sum of level volumes)
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i < u_n) cell_sc[i] = uvec2(cell_start[i], cell_count[i]);
+}

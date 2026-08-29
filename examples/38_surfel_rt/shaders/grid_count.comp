@@ -4,10 +4,14 @@ layout(local_size_x = 256) in;
 // Pass 1: count surfels per cell (cell_count must be zeroed first) and record
 // each surfel's slot within its cell. Multi-LOD: this run processes ONE level's
 // surfel list; all cell arrays are combined buffers addressed via u_cnt_off.
+// Also sets the occupancy bitmask bit of every cell whose count went 0 -> 1:
+// the trace kernel skips empty cells with one mask load instead of two
+// start/count loads.
 layout(std430, binding = 0) readonly buffer SurfPos { vec4 surfel_pos[]; };
 layout(std430, binding = 1) buffer CellCount { uint cell_count[]; };
 layout(std430, binding = 2) buffer SurfelSlot { uint surfel_slot[]; };
 layout(std430, binding = 3) readonly buffer LevelIdx { uint level_idx[]; };
+layout(std430, binding = 4) buffer CellMask { uint cell_mask[]; };
 
 uniform vec3 u_grid_min;
 uniform float u_inv_cell;
@@ -15,6 +19,7 @@ uniform ivec3 u_grid_res;
 uniform uint u_num;        // surfels in this level
 uniform uint u_cnt_off;    // cell_count segment offset of this level
 uniform uint u_idx_off;    // level_idx segment offset of this level
+uniform uint u_mask_off;   // cell_mask segment offset of this level (cells/32)
 
 uint cell_index(ivec3 c) {
     return uint(c.x + u_grid_res.x * (c.y + u_grid_res.y * c.z));
@@ -27,5 +32,7 @@ void main() {
     vec3 p = surfel_pos[s].xyz;
     ivec3 c = clamp(ivec3(floor((p - u_grid_min) * u_inv_cell)), ivec3(0), u_grid_res - 1);
     uint ci = cell_index(c);
-    surfel_slot[s] = atomicAdd(cell_count[u_cnt_off + ci], 1u);
+    uint prev = atomicAdd(cell_count[u_cnt_off + ci], 1u);
+    if (prev == 0u) atomicOr(cell_mask[u_mask_off + (ci >> 5)], 1u << (ci & 31u));
+    surfel_slot[s] = prev;
 }

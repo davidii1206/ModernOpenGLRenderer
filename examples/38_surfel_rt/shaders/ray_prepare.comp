@@ -1,0 +1,19 @@
+#version 460 core
+layout(local_size_x = 1) in;
+
+// Turn a bounce's ray count into the indirect dispatch command for the trace
+// kernel so the CPU never has to read counts back (no pipeline bubble). One
+// extra workgroup is dispatched when the count is 0 or not a multiple of the
+// workgroup size: the trace kernel bounds-checks rid < counts[u_bounce].
+layout(std430, binding = 13) readonly buffer RayCounts { uint counts[]; };
+layout(std430, binding = 16) writeonly buffer DispCmd { uint cmd[3]; };
+
+uniform uint u_bounce;
+
+void main() {
+    uint groups = (counts[u_bounce] + 127u) / 128u;
+    if (groups == 0u) groups = 1u;
+    cmd[0] = groups;
+    cmd[1] = 1u;
+    cmd[2] = 1u;
+}

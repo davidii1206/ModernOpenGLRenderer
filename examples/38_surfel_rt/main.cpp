@@ -1038,6 +1038,14 @@ int main() {
     scan_finish_prog.add_stage("shaders/scan_finish.comp", gl::ShaderType::compute);
     gl::HotReloadProgram compact_prog;
     compact_prog.add_stage("shaders/grid_compact.comp", gl::ShaderType::compute);
+    gl::HotReloadProgram merge_prog;
+    merge_prog.add_stage("shaders/grid_merge.comp", gl::ShaderType::compute);
+    gl::HotReloadProgram mark_prog;
+    mark_prog.add_stage("shaders/ray_mark.comp", gl::ShaderType::compute);
+    gl::HotReloadProgram gather_prog;
+    gather_prog.add_stage("shaders/ray_gather.comp", gl::ShaderType::compute);
+    gl::HotReloadProgram prepare_prog;
+    prepare_prog.add_stage("shaders/ray_prepare.comp", gl::ShaderType::compute);
 
     display_prog.poll();
     gbuf_prog.poll();
@@ -1049,6 +1057,10 @@ int main() {
     scan_blocks_prog.poll();
     scan_finish_prog.poll();
     compact_prog.poll();
+    merge_prog.poll();
+    mark_prog.poll();
+    gather_prog.poll();
+    prepare_prog.poll();
 
     auto display = display_prog.take_program();
     auto gbuf = gbuf_prog.take_program();
@@ -1060,8 +1072,13 @@ int main() {
     auto scan_blocks_cs = scan_blocks_prog.take_program();
     auto scan_finish_cs = scan_finish_prog.take_program();
     auto compact_cs = compact_prog.take_program();
+    auto merge_cs = merge_prog.take_program();
+    auto mark_cs = mark_prog.take_program();
+    auto gather_cs = gather_prog.take_program();
+    auto prepare_cs = prepare_prog.take_program();
     if (!display || !gbuf || !raytrace || !pc || !boxp ||
-        !count_cs || !scan_block_cs || !scan_blocks_cs || !scan_finish_cs || !compact_cs)
+        !count_cs || !scan_block_cs || !scan_blocks_cs || !scan_finish_cs || !compact_cs ||
+        !merge_cs || !mark_cs || !gather_cs || !prepare_cs)
         return EXIT_FAILURE;
 
     // Fullscreen triangle for display.
@@ -1241,6 +1258,29 @@ int main() {
     gl::Buffer level_idx_all(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);
     gl::Buffer surfel_slot_buf(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);
     gl::Buffer block_sum_buf(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);
+    // Trace-time cell probe: uvec2 (start, count) per cell, merged from
+    // cell_start/cell_count after the scan (one 8B load in the hot loop).
+    gl::Buffer cell_sc_all(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);
+    // Cell-sorted surfel data (SoA) written by grid_compact — the trace kernel
+    // reads these streams instead of gathering through packed_idx. pos+nrm are
+    // interleaved: 2*dst = pos, 2*dst+1 = nrm.
+    gl::Buffer packed_pn_all(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);
+    gl::Buffer packed_alb_all(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);
+    // Occupancy bitmask: one bit per cell, uint per 32 cells per level.
+    gl::Buffer cell_mask_all(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);
+    // Per-bounce ray streams (2 vec4 per ray: px+origin, direction), ping-
+    // ponged: the mark kernel writes bounce 0 into A, each trace dispatch
+    // appends the next bounce into the other buffer (a bounce's stream is
+    // never larger than the previous one's, so w*h entries always suffice).
+    // (dispatch_buf is a shader-type buffer so bind_base works for the prepare
+    // kernel's SSBO write; the GL_DISPATCH_INDIRECT_BUFFER target is bound
+    // explicitly at dispatch time — Buffer::bind_base always uses the buffer's
+    // stored target, and GL_DISPATCH_INDIRECT_BUFFER is not one of them.)
+    gl::Buffer stream_a_buf(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);
+    gl::Buffer stream_b_buf(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);
+    gl::Buffer ray_count_buf(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);   // uint counts[kMaxBounces + 1]
+    gl::Buffer hit_buf(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);         // per-ray best-t, trace -> gather
+    gl::Buffer dispatch_buf(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);
 
     std::vector<glm::vec4> vp, vn, va, cuts;
     auto upload_surfel_buffers = [&]() {
@@ -1274,15 +1314,18 @@ int main() {
         uint32_t volume = 0;
         uint32_t count = 0;                                    // surfels assigned
         uint32_t cnt_off = 0, start_off = 0, packed_off = 0, idx_off = 0;
+        uint32_t mask_off = 0;                                 // cell_mask word offset (cells/32)
+        float max_r = 0.0f;                                    // max stored radius in this level
     };
     LevelSpec levels[kGridLevels];
-    uint32_t cnt_total = 0, start_total = 0, packed_total = 0, idx_total = 0;
+    uint32_t cnt_total = 0, start_total = 0, packed_total = 0, idx_total = 0, mask_total = 0;
     std::vector<uint32_t> level_of;
 
     auto compute_level_specs = [&]() {
         std::vector<glm::vec3> lmn(kGridLevels, glm::vec3(1e30f));
         std::vector<glm::vec3> lmx(kGridLevels, glm::vec3(-1e30f));
         std::vector<uint32_t> lcount(kGridLevels, 0u);
+        std::vector<float> lmaxr(kGridLevels, 0.0f);
         level_of.assign(size_t(N), 0u);
         const float c0 = 2.0f * search_radius;
         for (int i = 0; i < N; ++i) {
@@ -1294,6 +1337,7 @@ int main() {
             level_of[size_t(i)] = uint32_t(l);
             lmn[size_t(l)] = glm::min(lmn[size_t(l)], surfels[i].pos);
             lmx[size_t(l)] = glm::max(lmx[size_t(l)], surfels[i].pos);
+            lmaxr[size_t(l)] = std::max(lmaxr[size_t(l)], r);
             ++lcount[size_t(l)];
         }
         cnt_total = start_total = packed_total = idx_total = 0;
@@ -1301,6 +1345,7 @@ int main() {
             LevelSpec& L = levels[l];
             L.count = lcount[size_t(l)];
             L.cell = c0 / float(1 << l);
+            L.max_r = lmaxr[size_t(l)];
             if (L.count == 0) {
                 L.mn = mn;
                 L.res = glm::ivec3(1);
@@ -1323,6 +1368,7 @@ int main() {
             L.start_off = start_total;   start_total += L.volume;
             L.packed_off = packed_total; packed_total += L.count;
             L.idx_off = idx_total;       idx_total += L.count;
+            L.mask_off = mask_total;     mask_total += (L.volume + 31u) / 32u;
         }
     };
 
@@ -1338,6 +1384,10 @@ int main() {
         cell_count_all.data(nullptr, size_t(cnt_total) * sizeof(uint32_t));
         cell_start_all.data(nullptr, size_t(start_total) * sizeof(uint32_t));
         packed_all.data(nullptr, size_t(packed_total) * sizeof(uint32_t));
+        packed_pn_all.data(nullptr, size_t(packed_total) * 2 * sizeof(glm::vec4));
+        packed_alb_all.data(nullptr, size_t(packed_total) * sizeof(glm::vec4));
+        cell_sc_all.data(nullptr, size_t(cnt_total) * 2 * sizeof(uint32_t));
+        cell_mask_all.data(nullptr, size_t(mask_total) * sizeof(uint32_t));
         surfel_slot_buf.data(nullptr, size_t(N) * sizeof(uint32_t));
         block_sum_buf.data(nullptr, kScanBlocksMax * sizeof(uint32_t));
     };
@@ -1358,30 +1408,38 @@ int main() {
         u = loc("u_start_off");   if (u >= 0) prog.uniform1ui(u, levels[l].start_off);
         u = loc("u_packed_off");  if (u >= 0) prog.uniform1ui(u, levels[l].packed_off);
         u = loc("u_idx_off");     if (u >= 0) prog.uniform1ui(u, levels[l].idx_off);
+        u = loc("u_mask_off");    if (u >= 0) prog.uniform1ui(u, levels[l].mask_off);
     };
 
     auto bind_rt = [&] {
         surfel_pos_buf.bind_base(0);
         surfel_nrm_buf.bind_base(1);
         surfel_alb_buf.bind_base(2);
-        cell_start_all.bind_base(3);
-        cell_count_all.bind_base(4);
+        cell_sc_all.bind_base(3);
         packed_all.bind_base(5);
         surfel_cut_buf.bind_base(6);
+        packed_pn_all.bind_base(8);
+        packed_alb_all.bind_base(9);
+        cell_mask_all.bind_base(11);
+        stream_a_buf.bind_base(12);
+        ray_count_buf.bind_base(13);
+        hit_buf.bind_base(15);
     };
 
     auto build_grid = [&]() {
-        // Zero ALL level count segments at once.
+        // Zero ALL level count + mask segments at once.
         cell_count_all.clear(GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, &zero);
+        cell_mask_all.clear(GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, &zero);
         for (int l = 0; l < kGridLevels; ++l) {
             if (levels[l].count == 0) continue;
             const uint32_t n = levels[l].count;
 
-            // Pass 1: count + slot.
+            // Pass 1: count + slot + occupancy bit.
             surfel_pos_buf.bind_base(0);
             cell_count_all.bind_base(1);
             surfel_slot_buf.bind_base(2);
             level_idx_all.bind_base(3);
+            cell_mask_all.bind_base(4);
             count_cs->use();
             set_level_uniforms(*count_cs, l);
             gl::dispatch_compute((n + kBlockSize - 1) / kBlockSize, 1, 1);
@@ -1421,17 +1479,33 @@ int main() {
             gl::dispatch_compute(nblocks, 1, 1);
             glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
-            // Pass 3: compact.
+            // Pass 3: compact (indices + cell-sorted SoA data).
             surfel_pos_buf.bind_base(0);
             surfel_slot_buf.bind_base(1);
             cell_start_all.bind_base(2);
             packed_all.bind_base(3);
             level_idx_all.bind_base(4);
+            surfel_nrm_buf.bind_base(5);
+            surfel_alb_buf.bind_base(6);
+            packed_pn_all.bind_base(7);
+            packed_alb_all.bind_base(8);
             compact_cs->use();
             set_level_uniforms(*compact_cs, l);
             gl::dispatch_compute((n + kBlockSize - 1) / kBlockSize, 1, 1);
             glMemoryBarrier(GL_ALL_BARRIER_BITS);
         }
+
+        // Final pass: interleave cell_start + cell_count -> cell_sc.
+        cell_start_all.bind_base(0);
+        cell_count_all.bind_base(1);
+        cell_sc_all.bind_base(2);
+        merge_cs->use();
+        {
+            GLint u = merge_cs->uniform_location("u_n");
+            if (u >= 0) merge_cs->uniform1ui(u, cnt_total);
+        }
+        gl::dispatch_compute((cnt_total + kBlockSize - 1) / kBlockSize, 1, 1);
+        glMemoryBarrier(GL_ALL_BARRIER_BITS);
 
         bind_rt();   // restore raytrace bindings
     };
@@ -1494,22 +1568,25 @@ int main() {
     build_grid();
     refresh_occupied_cells();
 
-    // Ray trace output textures.
+    // Ray trace output texture (mirror pixels only; display composites).
+    // RGBA32F: the per-bounce trace dispatches accumulate fp32 shade
+    // contributions into it; display.frag reproduces the old RGBA16F rounding
+    // so the output stays byte-identical to the single-dispatch pipeline.
     gl::Texture color_tex{gl::TextureType::tex_2d};
-    gl::Texture aux_tex{gl::TextureType::tex_2d};
     auto create_rt_tex = [&](int w, int h) {
         color_tex = gl::Texture{gl::TextureType::tex_2d};
-        color_tex.image_2d(0, GL_RGBA16F, w, h, GL_RGBA, GL_FLOAT, nullptr, 1);
+        color_tex.image_2d(0, GL_RGBA32F, w, h, GL_RGBA, GL_FLOAT, nullptr, 1);
         color_tex.parameter(GL_TEXTURE_MIN_FILTER, GL_NEAREST);
         color_tex.parameter(GL_TEXTURE_MAG_FILTER, GL_NEAREST);
         color_tex.parameter(GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         color_tex.parameter(GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        aux_tex = gl::Texture{gl::TextureType::tex_2d};
-        aux_tex.image_2d(0, GL_RGBA16F, w, h, GL_RGBA, GL_FLOAT, nullptr, 1);
-        aux_tex.parameter(GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        aux_tex.parameter(GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        aux_tex.parameter(GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        aux_tex.parameter(GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        // Worst case: every pixel is a mirror ray (each bounce's stream is
+        // bounded by the previous bounce's, so one screenful per buffer).
+        stream_a_buf.data(nullptr, size_t(w) * size_t(h) * 2 * sizeof(glm::vec4));
+        stream_b_buf.data(nullptr, size_t(w) * size_t(h) * 2 * sizeof(glm::vec4));
+        ray_count_buf.data(nullptr, 4 * sizeof(uint32_t));
+        hit_buf.data(nullptr, size_t(w) * size_t(h) * sizeof(float));
+        dispatch_buf.data(nullptr, 3 * sizeof(uint32_t));
     };
     create_rt_tex(window.framebuffer_width(), window.framebuffer_height());
 
@@ -1569,9 +1646,15 @@ int main() {
     // Everything is gated at runtime by the u_perf uniform, so the common path
     // is unchanged when diagnostics are off (default; SRT_PERF=1 enables).
     constexpr int kPerfCount = 10;
-    gl::Buffer perf_ssbo(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);
-    perf_ssbo.data(nullptr, size_t(kPerfCount) * sizeof(uint32_t));
-    perf_ssbo.bind_base(7);
+    // Double-buffered: the trace dispatch writes one buffer while the counters
+    // of the PREVIOUS dispatch are read (its fence is already signaled, so the
+    // read never stalls the CPU on the live dispatch).
+    gl::Buffer perf_ssbo[2] = {gl::Buffer(gl::BufferType::shader, gl::BufferUsage::dynamic_draw),
+                               gl::Buffer(gl::BufferType::shader, gl::BufferUsage::dynamic_draw)};
+    for (auto& b : perf_ssbo) b.data(nullptr, size_t(kPerfCount) * sizeof(uint32_t));
+    gl::Sync perf_fence;          // fence placed after the newest perf dispatch
+    bool perf_pending = false;    // newest dispatch's counters not read yet
+    int perf_write = 0;           // buffer index the next dispatch writes
     uint64_t perf_acc[kPerfCount] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     PhaseAccum phase_acc;
     int perf_frames = 0;
@@ -1685,19 +1768,28 @@ int main() {
             }
             w4(&cnt_total, 4); w4(&start_total, 4); w4(&packed_total, 4); w4(&idx_total, 4);
             std::vector<uint32_t> cs(start_total), cc(cnt_total), pi(packed_total), ix(idx_total);
-            auto cpy = [&](gl::Buffer& b, std::vector<uint32_t>& dst, size_t elems) {
-                if (elems == 0) return;
-                void* ptr = b.map_range(0, elems * sizeof(uint32_t), GL_MAP_READ_BIT);
-                if (ptr) { std::memcpy(dst.data(), ptr, elems * sizeof(uint32_t)); b.unmap(); }
+            auto cpy = [&](gl::Buffer& b, void* dst, size_t bytes) {
+                if (bytes == 0) return;
+                void* ptr = b.map_range(0, bytes, GL_MAP_READ_BIT);
+                if (ptr) { std::memcpy(dst, ptr, bytes); b.unmap(); }
             };
-            cpy(cell_start_all, cs, size_t(start_total));
-            cpy(cell_count_all, cc, size_t(cnt_total));
-            cpy(packed_all, pi, size_t(packed_total));
-            cpy(level_idx_all, ix, size_t(idx_total));
-            w4(cs.data(), cs.size() * 4);
-            w4(cc.data(), cc.size() * 4);
-            w4(pi.data(), pi.size() * 4);
-            w4(ix.data(), ix.size() * 4);
+            cpy(cell_start_all, cs.data(), size_t(start_total) * 4);
+            cpy(cell_count_all, cc.data(), size_t(cnt_total) * 4);
+            cpy(packed_all, pi.data(), size_t(packed_total) * 4);
+            cpy(level_idx_all, ix.data(), size_t(idx_total) * 4);
+            // Cell-sorted SoA data (pos+nrm interleaved 2:1) + occupancy masks
+            // (appended after the original fields so old consumers still parse
+            // the prefix).
+            std::vector<glm::vec4> ppn(size_t(packed_total) * 2), pa(packed_total);
+            cpy(packed_pn_all, ppn.data(), ppn.size() * 16);
+            cpy(packed_alb_all, pa.data(), pa.size() * 16);
+            w4(ppn.data(), ppn.size() * 16);
+            w4(pa.data(), pa.size() * 16);
+            std::vector<uint32_t> cmask(mask_total);
+            cpy(cell_mask_all, cmask.data(), size_t(mask_total) * 4);
+            w4(&mask_total, 4);
+            for (int li = 0; li < kGridLevels; ++li) w4(&levels[li].mask_off, 4);
+            w4(cmask.data(), cmask.size() * 4);
             const uint32_t nt = uint32_t(em.tris.size());
             w4(&nt, 4);
             for (const auto& t : em.tris) {
@@ -1755,29 +1847,47 @@ int main() {
         gl::disable(GL_DEPTH_TEST);
     };
 
-    // Composite: rasterized direct shading everywhere; surfel ray-traced mirror
-    // reflections only on the mirror box (Schaufler & Jensen).
+    // Composite: the mark pass compacts mirror pixels into the bounce-0 ray
+    // stream (per-ray origin/direction computed there), the trace kernel runs
+    // ONE BOUNCE per dispatch — surviving mirror hits append to the next
+    // bounce's stream, every dispatch has uniform full warps, and the indirect
+    // command keeps the CPU out of the sizing loop. Shade contributions
+    // accumulate (fp32) into an RGBA32F image; display.frag composites them
+    // over the rasterized direct shading (Schaufler & Jensen).
     auto run_raytrace = [&]() {
         int fw = window.framebuffer_width(), fh = window.framebuffer_height();
         t_ray.begin();
-        gbuf_t.direct.bind(0);
+
+        // --- Mark: mirror pixels -> bounce-0 ray stream (+ accum clear) ---
         gbuf_t.position.bind(1);
         gbuf_t.normal.bind(2);
         gbuf_t.albedo.bind(3);
-        color_tex.bind_image(3, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
-        aux_tex.bind_image(4, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
+        color_tex.bind_image(3, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA32F);
+        stream_a_buf.bind_base(12);
+        ray_count_buf.bind_base(13);
+        mark_cs->use();
+        {
+            GLint l = mark_cs->uniform_location("u_img_size");
+            if (l >= 0) { GLint isz[2] = {fw, fh}; mark_cs->uniform2iv(l, isz); }
+            l = mark_cs->uniform_location("u_cam_pos");
+            if (l >= 0) mark_cs->uniform3f(l, cam.position().x, cam.position().y, cam.position().z);
+        }
+        ray_count_buf.clear(GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, &zero);
+        gl::dispatch_compute((fw + 7) / 8, (fh + 7) / 8, 1);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+
+        // --- Trace: one bounce per dispatch ---
+        color_tex.bind_image(3, 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA32F);
 
         raytrace->use();
         auto loc = [&](const char* n) { return raytrace->uniform_location(n); };
         GLint l;
-        GLint isz[2] = {fw, fh};
-        l = loc("u_img_size");     if (l >= 0) raytrace->uniform2iv(l, isz);
-        l = loc("u_cam_pos");      if (l >= 0) raytrace->uniform3f(l, cam.position().x, cam.position().y, cam.position().z);
         l = loc("u_far");          if (l >= 0) raytrace->uniform1f(l, far_plane);
+        GLfloat lmin[12], linv[4];
+        GLint lres[12];
+        GLuint loff[4], lnum[4], moff[4], soff[4], poff[4];
+        GLfloat lmaxr[4];
         {   // per-level grid uniforms
-            GLfloat lmin[12], linv[4];
-            GLint lres[12];
-            GLuint loff[4], lnum[4];
             for (int li = 0; li < kGridLevels; ++li) {
                 lmin[li * 3 + 0] = levels[li].mn.x;
                 lmin[li * 3 + 1] = levels[li].mn.y;
@@ -1790,12 +1900,13 @@ int main() {
                                                  // level index; packed/start have
                                                  // separate uniform arrays below
                 lnum[li] = levels[li].count;
+                moff[li] = levels[li].mask_off;
+                lmaxr[li] = levels[li].max_r;
             }
             l = loc("u_l_min");      if (l >= 0) glUniform3fv(l, kGridLevels, lmin);
             l = loc("u_l_inv_cell"); if (l >= 0) glUniform1fv(l, kGridLevels, linv);
             l = loc("u_l_res");      if (l >= 0) glUniform3iv(l, kGridLevels, lres);
             l = loc("u_l_num");      if (l >= 0) glUniform1uiv(l, kGridLevels, lnum);
-            GLuint soff[4], poff[4];
             for (int li = 0; li < kGridLevels; ++li) {
                 soff[li] = levels[li].start_off;
                 poff[li] = levels[li].packed_off;
@@ -1803,34 +1914,99 @@ int main() {
             l = loc("u_l_cnt_off");   if (l >= 0) glUniform1uiv(l, kGridLevels, loff);
             l = loc("u_l_start_off"); if (l >= 0) glUniform1uiv(l, kGridLevels, soff);
             l = loc("u_l_packed_off");if (l >= 0) glUniform1uiv(l, kGridLevels, poff);
+            l = loc("u_l_mask_off");  if (l >= 0) glUniform1uiv(l, kGridLevels, moff);
+            l = loc("u_l_max_r");     if (l >= 0) glUniform1fv(l, kGridLevels, lmaxr);
             l = loc("u_levels");      if (l >= 0) raytrace->uniform1i(l, kGridLevels);
         }
-        l = loc("u_light_pos");    if (l >= 0) raytrace->uniform3f(l, light_pos.x, light_pos.y, light_pos.z);
-        l = loc("u_light_color");  if (l >= 0) raytrace->uniform3f(l, light_color.x, light_color.y, light_color.z);
-        l = loc("u_light_intensity"); if (l >= 0) raytrace->uniform1f(l, light_intensity);
-        l = loc("u_max_bounces");  if (l >= 0) raytrace->uniform1i(l, max_bounces);
         l = loc("u_search_radius"); if (l >= 0) raytrace->uniform1f(l, search_radius);
         l = loc("u_radius_scale"); if (l >= 0) raytrace->uniform1f(l, radius_scale);
-        l = loc("u_ambient");      if (l >= 0) raytrace->uniform1f(l, ambient);
-        int aux_sel = (view_mode >= 1) ? (view_mode - 1) : 0;  // albedo/normal/pos/depth
-        l = loc("u_aux_mode");     if (l >= 0) raytrace->uniform1i(l, aux_sel);
         l = loc("u_perf");         if (l >= 0) raytrace->uniform1i(l, perf_on ? 1 : 0);
-        if (perf_on) perf_ssbo.clear(GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, &zero);
 
-        gl::dispatch_compute((fw + 7) / 8, (fh + 7) / 8, 1);
-        glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+        // Gather kernel uniforms (reconstruction + shading + next-bounce appends).
+        gather_cs->use();
+        auto gloc = [&](const char* n) { return gather_cs->uniform_location(n); };
+        l = gloc("u_far");          if (l >= 0) gather_cs->uniform1f(l, far_plane);
+        l = gloc("u_l_min");        if (l >= 0) glUniform3fv(l, kGridLevels, lmin);
+        l = gloc("u_l_inv_cell");   if (l >= 0) glUniform1fv(l, kGridLevels, linv);
+        l = gloc("u_l_res");        if (l >= 0) glUniform3iv(l, kGridLevels, lres);
+        l = gloc("u_l_num");        if (l >= 0) glUniform1uiv(l, kGridLevels, lnum);
+        l = gloc("u_l_cnt_off");    if (l >= 0) glUniform1uiv(l, kGridLevels, loff);
+        l = gloc("u_l_packed_off"); if (l >= 0) glUniform1uiv(l, kGridLevels, poff);
+        l = gloc("u_l_mask_off");   if (l >= 0) glUniform1uiv(l, kGridLevels, moff);
+        l = gloc("u_l_max_r");      if (l >= 0) glUniform1fv(l, kGridLevels, lmaxr);
+        l = gloc("u_levels");       if (l >= 0) gather_cs->uniform1i(l, kGridLevels);
+        l = gloc("u_light_pos");    if (l >= 0) gather_cs->uniform3f(l, light_pos.x, light_pos.y, light_pos.z);
+        l = gloc("u_light_color");  if (l >= 0) gather_cs->uniform3f(l, light_color.x, light_color.y, light_color.z);
+        l = gloc("u_light_intensity"); if (l >= 0) gather_cs->uniform1f(l, light_intensity);
+        l = gloc("u_max_bounces");  if (l >= 0) gather_cs->uniform1i(l, max_bounces);
+        l = gloc("u_radius_scale"); if (l >= 0) gather_cs->uniform1f(l, radius_scale);
+        l = gloc("u_ambient");      if (l >= 0) gather_cs->uniform1f(l, ambient);
+        l = gloc("u_perf");         if (l >= 0) gather_cs->uniform1i(l, perf_on ? 1 : 0);
+        raytrace->use();
+        if (perf_on) {
+            // Read the PREVIOUS dispatch's counters (one frame delayed). Its
+            // fence is already signaled, so neither the wait nor the map can
+            // stall behind the dispatch we are about to issue.
+            if (perf_pending) {
+                perf_fence.client_wait(1000000000ull);
+                GLuint pv[kPerfCount];
+                void* ptr = perf_ssbo[perf_write ^ 1].map_range(
+                    0, size_t(kPerfCount) * sizeof(GLuint), GL_MAP_READ_BIT);
+                if (ptr) {
+                    std::memcpy(pv, ptr, size_t(kPerfCount) * sizeof(GLuint));
+                    perf_ssbo[perf_write ^ 1].unmap();
+                    for (int k = 0; k < kPerfCount; ++k) perf_acc[k] += pv[k];
+                    phase_acc.readback(pv);
+                    ++perf_frames;
+                }
+            }
+            perf_ssbo[perf_write].clear(GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, &zero);
+            perf_ssbo[perf_write].bind_base(7);
+        }
+
+        // One dispatch per bounce: read streams[b&1], append survivors into
+        // streams[(b+1)&1] (a bounce's stream never exceeds the previous
+        // one's, so w*h entries per buffer always suffice). Empty streams
+        // cost one dummy workgroup in the trace kernel. All sizing happens
+        // on the GPU — the CPU never reads a ray count.
+        glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, dispatch_buf.handle());
+        gl::Buffer* streams[2] = {&stream_a_buf, &stream_b_buf};
+        for (int b = 0; b < max_bounces; ++b) {
+            dispatch_buf.bind_base(16);
+            prepare_cs->use();
+            {
+                GLint u = prepare_cs->uniform_location("u_bounce");
+                if (u >= 0) prepare_cs->uniform1ui(u, GLuint(b));
+            }
+            gl::dispatch_compute(1, 1, 1);
+            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_COMMAND_BARRIER_BIT);
+
+            // Traversal: best hit parameter per ray -> hit_buf.
+            raytrace->use();   // prepare_cs->use() above changed the current program
+            streams[b & 1]->bind_base(12);
+            streams[(b + 1) & 1]->bind_base(14);
+            l = loc("u_bounce");       if (l >= 0) raytrace->uniform1i(l, b);
+            gl::dispatch_compute_indirect(0);
+            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+            if (getenv("SRT_DEBUG")) {
+                printf("DBG b=%d glErr=0x%x counts=[", b, glGetError());
+                GLuint dbg[4] = {0,0,0,0};
+                glGetNamedBufferSubData(ray_count_buf.handle(), 0, 16, dbg);
+                printf("%u %u %u %u]\n", dbg[0], dbg[1], dbg[2], dbg[3]);
+            }
+
+            // Reconstruction + shading + next-bounce appends (same ray set:
+            // reuses the indirect command).
+            gather_cs->use();
+            l = gloc("u_bounce");      if (l >= 0) gather_cs->uniform1i(l, b);
+            gl::dispatch_compute_indirect(0);
+            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+        }
         if (perf_on) {
             glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-            GLuint pv[kPerfCount];
-            void* ptr = perf_ssbo.map_range(0, size_t(kPerfCount) * sizeof(GLuint),
-                                            GL_MAP_READ_BIT);
-            if (ptr) {
-                std::memcpy(pv, ptr, size_t(kPerfCount) * sizeof(GLuint));
-                perf_ssbo.unmap();
-                for (int k = 0; k < kPerfCount; ++k) perf_acc[k] += pv[k];
-                phase_acc.readback(pv);
-                ++perf_frames;
-            }
+            perf_fence = gl::Sync{};   // fence ordered after the last bounce
+            perf_pending = true;
+            perf_write ^= 1;
         }
         t_ray.end();
         traced = true;
@@ -1879,6 +2055,10 @@ int main() {
         if (scan_blocks_prog.poll()) scan_blocks_cs = scan_blocks_prog.take_program();
         if (scan_finish_prog.poll()) scan_finish_cs = scan_finish_prog.take_program();
         if (compact_prog.poll()) compact_cs = compact_prog.take_program();
+        if (merge_prog.poll()) merge_cs = merge_prog.take_program();
+        if (mark_prog.poll()) mark_cs = mark_prog.take_program();
+        if (gather_prog.poll()) gather_cs = gather_prog.take_program();
+        if (prepare_prog.poll()) prepare_cs = prepare_prog.take_program();
         t_input.end();
 
         // Rasterize the direct view every frame (cheap).
@@ -1901,16 +2081,29 @@ int main() {
             display->use();
             auto dl = [&](const char* n) { return display->uniform_location(n); };
             GLint l;
-            // view 0 = composite (reflections) when traced, else rasterized direct.
-            // debug views = composite aux when traced, else rasterized G-buffer.
-            gl::Texture* src = (view_mode == 0)
-                ? (traced ? &color_tex : &gbuf_t.direct)
-                : (traced ? &aux_tex
-                          : (view_mode == 1 ? &gbuf_t.albedo
-                                            : (view_mode == 2 ? &gbuf_t.normal
-                                                              : &gbuf_t.position)));
+            // view 0 = composite: traced mirror colors over direct (when not
+            // traced, plain direct). Debug views read the rasterized G-buffer
+            // textures directly (the old aux image copied them verbatim).
+            gl::Texture* src;
+            if (view_mode == 0) {
+                src = traced ? &color_tex : &gbuf_t.direct;
+                l = dl("u_composite"); if (l >= 0) display->uniform1i(l, traced ? 1 : 0);
+            } else {
+                src = view_mode == 1 ? &gbuf_t.albedo
+                    : view_mode == 2 ? &gbuf_t.normal
+                    : view_mode == 4 ? &gbuf_t.position   // depth reads position
+                                     : &gbuf_t.position;
+                l = dl("u_composite"); if (l >= 0) display->uniform1i(l, 0);
+            }
             src->bind(0);
+            gbuf_t.direct.bind(1);
+            gbuf_t.albedo.bind(2);
             l = dl("u_tex");      if (l >= 0) display->uniform1i(l, 0);
+            l = dl("u_direct");   if (l >= 0) display->uniform1i(l, 1);
+            l = dl("u_mirror");   if (l >= 0) display->uniform1i(l, 2);
+            l = dl("u_view");     if (l >= 0) display->uniform1i(l, view_mode);
+            l = dl("u_cam_pos");  if (l >= 0) display->uniform3f(l, cam.position().x, cam.position().y, cam.position().z);
+            l = dl("u_far");      if (l >= 0) display->uniform1f(l, far_plane);
             l = dl("u_exposure"); if (l >= 0) display->uniform1f(l, exposure);
             l = dl("u_gamma");    if (l >= 0) display->uniform1f(l, gamma);
             fsq_vao.bind();
@@ -1920,6 +2113,16 @@ int main() {
 
         // Headless test hook: screenshot + exit.
         if (autotrace && frame_counter == uint64_t(shot_frame)) {
+            if (const char* dump = getenv("SRT_DUMP")) {
+                glMemoryBarrier(GL_ALL_BARRIER_BITS);
+                glFinish();
+                std::vector<float> px(size_t(fw) * size_t(fh) * 4);
+                color_tex.bind(0);
+                glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_FLOAT, px.data());
+                FILE* df = fopen(dump, "wb");
+                if (df) { fwrite(px.data(), 4, px.size(), df); fclose(df); }
+                printf("DUMP %s\n", dump);
+            }
             gfx::screenshot(shot_path ? shot_path : "rt38.png");
             gllib::logf(gllib::LogLevel::info, "saved %s, ray=%.3f ms",
                         shot_path ? shot_path : "rt38.png", t_ray.readback());
@@ -2274,6 +2477,21 @@ int main() {
         if (frame_counter % 120 == 0 || (perf_on && frame_counter % 5 == 0)) print_perf();
 
         window.poll_events();
+    }
+
+    // Flush the last dispatch's counters before the final summary.
+    if (perf_on && perf_pending) {
+        perf_fence.client_wait(1000000000ull);
+        GLuint pv[kPerfCount];
+        void* ptr = perf_ssbo[perf_write ^ 1].map_range(
+            0, size_t(kPerfCount) * sizeof(GLuint), GL_MAP_READ_BIT);
+        if (ptr) {
+            std::memcpy(pv, ptr, size_t(kPerfCount) * sizeof(GLuint));
+            perf_ssbo[perf_write ^ 1].unmap();
+            for (int k = 0; k < kPerfCount; ++k) perf_acc[k] += pv[k];
+            phase_acc.readback(pv);
+            ++perf_frames;
+        }
     }
 
     print_perf();   // final summary before exiting

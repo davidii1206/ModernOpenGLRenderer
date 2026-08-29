@@ -1,0 +1,48 @@
+#version 460 core
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// Ray stream generation (bounce 0): compact the coords of mirror pixels (gbuf
+// albedo alpha) into a ray stream and compute each ray's origin/direction here
+// (cheap, high-occupancy pass), so the trace kernel is purely stream-driven:
+// one thread per ray, no G-buffer fetches, full warps during traversal.
+// Every such pixel spawns a reflection ray; ~94% of the screen does not, and
+// letting those threads idle inside the trace kernel costs ~94% of the warp
+// issue slots during traversal. The list order is arbitrary — rays write by
+// pixel id, so the image is unaffected.
+// Also zeroes the rgba32f accumulation image for ray pixels (per-bounce
+// dispatches add their shade contributions into it).
+layout(binding = 1) uniform sampler2D gbuf_pos;    // RGBA16F world position
+layout(binding = 2) uniform sampler2D gbuf_nrm;    // RGBA16F world normal
+layout(binding = 3) uniform sampler2D gbuf_alb;    // RGBA8 albedo + mirror flag
+layout(binding = 3, rgba32f) writeonly uniform image2D u_accum;
+
+// Ray stream: 2 vec4 per ray — [px_packed, ro.xyz], [rd.xyz, 0].
+layout(std430, binding = 12) writeonly buffer StreamOut { vec4 stream_out[]; };
+layout(std430, binding = 13) buffer RayCounts { uint counts[]; };  // [bounce]
+
+uniform ivec2 u_img_size;
+uniform vec3 u_cam_pos;
+
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= u_img_size.x || px.y >= u_img_size.y) return;
+    if (texelFetch(gbuf_alb, px, 0).a > 0.5) {
+        uint i = atomicAdd(counts[0u], 1u);
+        vec3 gpos = texelFetch(gbuf_pos, px, 0).xyz;
+        vec3 gnrm = normalize(texelFetch(gbuf_nrm, px, 0).xyz);
+        // Ensure the normal faces the camera (double-sided box faces).
+        vec3 view_dir = normalize(gpos - u_cam_pos);
+        if (dot(gnrm, view_dir) > 0.0) gnrm = -gnrm;
+        // Paper §5: pad the ray ORIGIN along the normal (shadow-offset trick):
+        // the mirror's own disks all lie in its tangent plane, so they are
+        // behind the origin for ANY positive pad and never hit. Fixed constant
+        // (see the trace kernel's comment for why it must not scale).
+        const float self_off = 0.02;
+        vec3 ro = gpos + gnrm * self_off;
+        vec3 rd = reflect(view_dir, gnrm);
+        stream_out[2u * i] = vec4(uintBitsToFloat(
+                                      uint(px.x) | (uint(px.y) << 16)), ro);
+        stream_out[2u * i + 1u] = vec4(rd, 0.0);
+        imageStore(u_accum, px, vec4(0.0));
+    }
+}
