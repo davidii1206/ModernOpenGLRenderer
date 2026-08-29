@@ -65,6 +65,7 @@ layout(std430, binding = 17) readonly buffer RdrAlb { vec4 rdr_alb[]; }; // (unu
 layout(std430, binding = 18) readonly buffer CombSC { uvec2 comb_sc[]; };
 layout(std430, binding = 21) readonly buffer RdrCut { uint rdr_cut[]; };
 uniform int u_mega;       // 0 = fine lists, 1 = combined render lists
+uniform int u_pair;       // 0 = one ray per thread, 1 = two interleaved rays per thread
 
 // Ray streams (2 vec4 per ray: [px_packed, ro.xyz], [rd.xyz, 0]). Bounce k
 // reads its stream (written by the mark kernel for k=0, by the previous trace
@@ -288,6 +289,284 @@ void descend(int l, vec3 o, vec3 d, float t_in, float t_out, float t_far, float 
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// Pair-traversal (u_pair): one thread advances TWO independent ray state
+// machines in lockstep. The grid caps warp residency at ~36% (rays / warp
+// slots) and resident warps stall on dependent grid loads (Nsight: CS warp
+// occupancy ~10%, SM issue ~12%, memory units <30%) — interleaving a second
+// ray's loads gives the scheduler independent work to hide the latency
+// without needing more warps. Per-ray traversal logic is IDENTICAL to
+// trace_best/descend above: same scan order, same gates, same early-outs —
+// only the scheduling changes.
+// ---------------------------------------------------------------------------
+
+struct DdaX {
+    vec3 o, d;
+    float t_cur, tmax;
+    ivec3 ic;
+    vec3 tmaxv;
+    ivec3 stepv;
+    vec3 tdelta;
+    float best_t;
+    bool found;
+    bool act;
+};
+
+// One fine DDA step for ray r. `alive` is the CALLER-LOCAL liveness flag of
+// this descend (deliberately separate from the DdaX.act L0-march flag).
+void dda_step(inout DdaX r, int l, float t_far, float relax_base, float r_mul,
+              inout bool alive) {
+    if (r.t_cur > r.tmax) { alive = false; return; }
+    if (r.found && r.t_cur > r.best_t + search_r(r_mul)) { alive = false; return; }
+    float tn = min(r.tmaxv.x, min(r.tmaxv.y, r.tmaxv.z));
+    if (tn >= r.tmax) { alive = false; return; }
+    r.t_cur = tn;
+    int axis;
+    if (tn == r.tmaxv.x) { r.ic.x += r.stepv.x; r.tmaxv.x += r.tdelta.x; axis = 0; }
+    else if (tn == r.tmaxv.y) { r.ic.y += r.stepv.y; r.tmaxv.y += r.tdelta.y; axis = 1; }
+    else { r.ic.z += r.stepv.z; r.tmaxv.z += r.tdelta.z; axis = 2; }
+    if (!l_in_bounds(l, r.ic)) { alive = false; return; }
+    // Newly entered cell is already beyond the best hit: skip its scan.
+    if (r.found && r.t_cur > r.best_t + search_r(r_mul)) { alive = false; return; }
+    PERF_ADD(2, 1);
+    float relax_near = max(relax_base, r.t_cur - search_r(r_mul));
+    float tf = r.found ? min(t_far, r.best_t) : t_far;
+    scan_slab(l, r.ic, axis, r.o, r.d, tf, relax_near, r_mul, r.best_t, r.found);
+}
+
+// Fused dual descend at level l: two fine DDAs, alternating single steps in
+// one loop so their scan_slab load chains overlap.
+void descend2(int l, float t_far, float r_mul,
+              inout DdaX a, float t_inA, float t_outA, float ta_inA, float ta_outA,
+              inout DdaX b, float t_inB, float t_outB, float ta_inB, float ta_outB) {
+    if (u_l_num[l] == 0u) return;
+    float cs = 1.0 / u_l_inv_cell[l];
+    float pad = search_r(r_mul);
+    vec3 bmin = u_l_min[l];
+
+    float tminA = max(max(t_inA - pad, ta_inA), 0.0);
+    float tmaxA = min(min(t_outA + pad, t_far), ta_outA);
+    float tminB = max(max(t_inB - pad, ta_inB), 0.0);
+    float tmaxB = min(min(t_outB + pad, t_far), ta_outB);
+    bool actA = tminA <= tmaxA && !(a.found && tminA > a.best_t + pad);
+    bool actB = tminB <= tmaxB && !(b.found && tminB > b.best_t + pad);
+    if (!actA && !actB) return;
+
+    // LOCAL fine-DDA state: the structs' t_cur/tmax/ic/tmaxv fields belong to
+    // the L0 march and must not be clobbered by the descend.
+    DdaX sa = a, sb = b;
+
+    if (actA) {
+        sa.t_cur = tminA; sa.tmax = tmaxA;
+        vec3 p0 = sa.o + sa.d * tminA;
+        sa.ic = clamp(ivec3(floor((p0 - bmin) * u_l_inv_cell[l])), ivec3(0), u_l_res[l] - 1);
+        vec3 cell_min = bmin + vec3(sa.ic) * cs;
+        sa.tmaxv.x = (sa.d.x > 1e-12) ? (cell_min.x + cs - p0.x) / sa.d.x : ((sa.d.x < -1e-12) ? (cell_min.x - p0.x) / sa.d.x : 1e30);
+        sa.tmaxv.y = (sa.d.y > 1e-12) ? (cell_min.y + cs - p0.y) / sa.d.y : ((sa.d.y < -1e-12) ? (cell_min.y - p0.y) / sa.d.y : 1e30);
+        sa.tmaxv.z = (sa.d.z > 1e-12) ? (cell_min.z + cs - p0.z) / sa.d.z : ((sa.d.z < -1e-12) ? (cell_min.z - p0.z) / sa.d.z : 1e30);
+        sa.tdelta = cs / (abs(sa.d) + 1e-20);
+        sa.stepv = ivec3(sign(sa.d));
+        PERF_ADD(2, 1);
+        scan_neighborhood(l, sa.ic, sa.o, sa.d, t_far, max(tminA, sa.t_cur - pad), r_mul, sa.best_t, sa.found);
+    }
+    if (actB) {
+        sb.t_cur = tminB; sb.tmax = tmaxB;
+        vec3 p0 = sb.o + sb.d * tminB;
+        sb.ic = clamp(ivec3(floor((p0 - bmin) * u_l_inv_cell[l])), ivec3(0), u_l_res[l] - 1);
+        vec3 cell_min = bmin + vec3(sb.ic) * cs;
+        sb.tmaxv.x = (sb.d.x > 1e-12) ? (cell_min.x + cs - p0.x) / sb.d.x : ((sb.d.x < -1e-12) ? (cell_min.x - p0.x) / sb.d.x : 1e30);
+        sb.tmaxv.y = (sb.d.y > 1e-12) ? (cell_min.y + cs - p0.y) / sb.d.y : ((sb.d.y < -1e-12) ? (cell_min.y - p0.y) / sb.d.y : 1e30);
+        sb.tmaxv.z = (sb.d.z > 1e-12) ? (cell_min.z + cs - p0.z) / sb.d.z : ((sb.d.z < -1e-12) ? (cell_min.z - p0.z) / sb.d.z : 1e30);
+        sb.tdelta = cs / (abs(sb.d) + 1e-20);
+        sb.stepv = ivec3(sign(sb.d));
+        PERF_ADD(2, 1);
+        scan_neighborhood(l, sb.ic, sb.o, sb.d, t_far, max(tminB, sb.t_cur - pad), r_mul, sb.best_t, sb.found);
+    }
+    for (int iter = 0; iter < 256 && (actA || actB); ++iter) {
+        if (actA) dda_step(sa, l, t_far, tminA, r_mul, actA);
+        if (actB) dda_step(sb, l, t_far, tminB, r_mul, actB);
+    }
+    a.best_t = sa.best_t; a.found = sa.found;
+    b.best_t = sb.best_t; b.found = sb.found;
+}
+
+// Fused pair traversal of the coarsest grid. Outputs best-hit ray parameters
+// (-1 on miss) for both rays. Ray B is optional (actB=false skips it).
+void trace_best2(inout DdaX a, inout DdaX b, float t_near, float t_far, float r_mul) {
+    uint trav0 = 0;
+    if (u_perf != 0) trav0 = clock2x32ARB().x;
+    float cs0 = 1.0 / u_l_inv_cell[0];
+    float pad = search_r(r_mul);
+    vec3 bmin = u_l_min[0];
+    vec3 bmax = u_l_min[0] + vec3(u_l_res[0]) * cs0;
+
+    float tminA = t_near, tmaxA = t_far;
+    if (a.act) {
+        for (int ax = 0; ax < 3; ++ax) {
+            float da = a.d[ax], oa = a.o[ax];
+            if (abs(da) < 1e-20) {
+                if (oa < bmin[ax] || oa > bmax[ax]) { a.act = false; break; }
+            } else {
+                float t0 = (bmin[ax] - oa) / da;
+                float t1 = (bmax[ax] - oa) / da;
+                if (t0 > t1) { float tmp = t0; t0 = t1; t1 = tmp; }
+                tminA = max(tminA, t0);
+                tmaxA = min(tmaxA, t1);
+                if (tminA > tmaxA) { a.act = false; break; }
+            }
+        }
+        if (a.act && (tmaxA < t_near || tminA > t_far)) a.act = false;
+    }
+    float tminB = t_near, tmaxB = t_far;
+    if (b.act) {
+        for (int ax = 0; ax < 3; ++ax) {
+            float da = b.d[ax], oa = b.o[ax];
+            if (abs(da) < 1e-20) {
+                if (oa < bmin[ax] || oa > bmax[ax]) { b.act = false; break; }
+            } else {
+                float t0 = (bmin[ax] - oa) / da;
+                float t1 = (bmax[ax] - oa) / da;
+                if (t0 > t1) { float tmp = t0; t0 = t1; t1 = tmp; }
+                tminB = max(tminB, t0);
+                tmaxB = min(tmaxB, t1);
+                if (tminB > tmaxB) { b.act = false; break; }
+            }
+        }
+        if (b.act && (tmaxB < t_near || tminB > t_far)) b.act = false;
+    }
+    if (!a.act && !b.act) {
+        if (u_perf != 0) { PERF_CYC(7, trav0); }
+        return;
+    }
+
+    // Entry cells + boundary state.
+    if (a.act) {
+        vec3 p0 = a.o + a.d * tminA;
+        a.ic = clamp(ivec3(floor((p0 - bmin) * u_l_inv_cell[0])), ivec3(0), u_l_res[0] - 1);
+        vec3 cell_min = bmin + vec3(a.ic) * cs0;
+        a.tmaxv.x = (a.d.x > 1e-12) ? (cell_min.x + cs0 - p0.x) / a.d.x : ((a.d.x < -1e-12) ? (cell_min.x - p0.x) / a.d.x : 1e30);
+        a.tmaxv.y = (a.d.y > 1e-12) ? (cell_min.y + cs0 - p0.y) / a.d.y : ((a.d.y < -1e-12) ? (cell_min.y - p0.y) / a.d.y : 1e30);
+        a.tmaxv.z = (a.d.z > 1e-12) ? (cell_min.z + cs0 - p0.z) / a.d.z : ((a.d.z < -1e-12) ? (cell_min.z - p0.z) / a.d.z : 1e30);
+        a.tdelta = cs0 / (abs(a.d) + 1e-20);
+        a.stepv = ivec3(sign(a.d));
+        a.t_cur = tminA; a.tmax = tmaxA;
+        PERF_ADD(1, 1);
+        scan_neighborhood(0, a.ic, a.o, a.d, t_far, max(tminA, a.t_cur - pad), r_mul, a.best_t, a.found);
+    }
+    if (b.act) {
+        vec3 p0 = b.o + b.d * tminB;
+        b.ic = clamp(ivec3(floor((p0 - bmin) * u_l_inv_cell[0])), ivec3(0), u_l_res[0] - 1);
+        vec3 cell_min = bmin + vec3(b.ic) * cs0;
+        b.tmaxv.x = (b.d.x > 1e-12) ? (cell_min.x + cs0 - p0.x) / b.d.x : ((b.d.x < -1e-12) ? (cell_min.x - p0.x) / b.d.x : 1e30);
+        b.tmaxv.y = (b.d.y > 1e-12) ? (cell_min.y + cs0 - p0.y) / b.d.y : ((b.d.y < -1e-12) ? (cell_min.y - p0.y) / b.d.y : 1e30);
+        b.tmaxv.z = (b.d.z > 1e-12) ? (cell_min.z + cs0 - p0.z) / b.d.z : ((b.d.z < -1e-12) ? (cell_min.z - p0.z) / b.d.z : 1e30);
+        b.tdelta = cs0 / (abs(b.d) + 1e-20);
+        b.stepv = ivec3(sign(b.d));
+        b.t_cur = tminB; b.tmax = tmaxB;
+        PERF_ADD(1, 1);
+        scan_neighborhood(0, b.ic, b.o, b.d, t_far, max(tminB, b.t_cur - pad), r_mul, b.best_t, b.found);
+    }
+    // Entry descents for both rays (level by level, both rays together).
+    for (int l = 1; l < u_levels; ++l) {
+        float eA = min(min(a.tmaxv.x, a.tmaxv.y), min(a.tmaxv.z, a.tmax));
+        float eB = min(min(b.tmaxv.x, b.tmaxv.y), min(b.tmaxv.z, b.tmax));
+        descend2(l, t_far, r_mul,
+                 a, a.t_cur, eA, a.act ? -1e30 : 1e30, 1e30,
+                 b, b.t_cur, eB, b.act ? -1e30 : 1e30, 1e30);
+        if (!a.act && !b.act) break;
+    }
+    // Fused coarse march: advance each ray one slab per iteration, descents
+    // via descend2 with the slab's t-interval.
+    float ta_inA[kLevels], ta_outA[kLevels];
+    float ta_inB[kLevels], ta_outB[kLevels];
+    for (int l = 1; l < u_levels; ++l) {
+        ta_inA[l] = -1e30; ta_outA[l] = 1e30;
+        ta_inB[l] = -1e30; ta_outB[l] = 1e30;
+        if (u_l_num[l] == 0u) continue;
+        float lcs = 1.0 / u_l_inv_cell[l];
+        vec3 lbmax = u_l_min[l] + vec3(u_l_res[l]) * lcs;
+        {
+            bool miss = false;
+            for (int ax = 0; ax < 3; ++ax) {
+                float da = a.d[ax], oa = a.o[ax];
+                if (abs(da) < 1e-20) { if (a.o[ax] < u_l_min[l][ax] || a.o[ax] > lbmax[ax]) miss = true; }
+                else {
+                    float t0 = (u_l_min[l][ax] - a.o[ax]) / da;
+                    float t1 = (lbmax[ax] - a.o[ax]) / da;
+                    if (t0 > t1) { float tmp = t0; t0 = t1; t1 = tmp; }
+                    ta_inA[l] = max(ta_inA[l], t0);
+                    ta_outA[l] = min(ta_outA[l], t1);
+                }
+            }
+            if (miss) ta_inA[l] = 1e30;
+        }
+        {
+            bool miss = false;
+            for (int ax = 0; ax < 3; ++ax) {
+                float da = b.d[ax], oa = b.o[ax];
+                if (abs(da) < 1e-20) { if (b.o[ax] < u_l_min[l][ax] || b.o[ax] > lbmax[ax]) miss = true; }
+                else {
+                    float t0 = (u_l_min[l][ax] - b.o[ax]) / da;
+                    float t1 = (lbmax[ax] - b.o[ax]) / da;
+                    if (t0 > t1) { float tmp = t0; t0 = t1; t1 = tmp; }
+                    ta_inB[l] = max(ta_inB[l], t0);
+                    ta_outB[l] = min(ta_outB[l], t1);
+                }
+            }
+            if (miss) ta_inB[l] = 1e30;
+        }
+    }
+    for (int iter = 0; iter < 512 && (a.act || b.act); ++iter) {
+        // Each ray: advance one slab (or deactivate); remember its slab
+        // t-interval for the descents below.
+        float slab_inA = 0.0, slab_outA = 0.0, slab_inB = 0.0, slab_outB = 0.0;
+        bool didA = false, didB = false;
+        if (a.act && a.t_cur <= a.tmax && !(a.found && a.t_cur > a.best_t + pad)) {
+            float tn = min(a.tmaxv.x, min(a.tmaxv.y, a.tmaxv.z));
+            if (tn < a.tmax) {
+                a.t_cur = tn;
+                int axis;
+                if (tn == a.tmaxv.x) { a.ic.x += a.stepv.x; a.tmaxv.x += a.tdelta.x; axis = 0; }
+                else if (tn == a.tmaxv.y) { a.ic.y += a.stepv.y; a.tmaxv.y += a.tdelta.y; axis = 1; }
+                else { a.ic.z += a.stepv.z; a.tmaxv.z += a.tdelta.z; axis = 2; }
+                if (l_in_bounds(0, a.ic) && !(a.found && a.t_cur > a.best_t + pad)) {
+                    PERF_ADD(1, 1);
+                    scan_slab(0, a.ic, axis, a.o, a.d, t_far, max(tminA, a.t_cur - pad), r_mul, a.best_t, a.found);
+                    slab_inA = a.t_cur;
+                    slab_outA = min(min(a.tmaxv.x, a.tmaxv.y), min(a.tmaxv.z, a.tmax));
+                    didA = true;
+                } else a.act = false;
+            } else a.act = false;
+        } else if (a.act) a.act = false;
+        if (b.act && b.t_cur <= b.tmax && !(b.found && b.t_cur > b.best_t + pad)) {
+            float tn = min(b.tmaxv.x, min(b.tmaxv.y, b.tmaxv.z));
+            if (tn < b.tmax) {
+                b.t_cur = tn;
+                int axis;
+                if (tn == b.tmaxv.x) { b.ic.x += b.stepv.x; b.tmaxv.x += b.tdelta.x; axis = 0; }
+                else if (tn == b.tmaxv.y) { b.ic.y += b.stepv.y; b.tmaxv.y += b.tdelta.y; axis = 1; }
+                else { b.ic.z += b.stepv.z; b.tmaxv.z += b.tdelta.z; axis = 2; }
+                if (l_in_bounds(0, b.ic) && !(b.found && b.t_cur > b.best_t + pad)) {
+                    PERF_ADD(1, 1);
+                    scan_slab(0, b.ic, axis, b.o, b.d, t_far, max(tminB, b.t_cur - pad), r_mul, b.best_t, b.found);
+                    slab_inB = b.t_cur;
+                    slab_outB = min(min(b.tmaxv.x, b.tmaxv.y), min(b.tmaxv.z, b.tmax));
+                    didB = true;
+                } else b.act = false;
+            } else b.act = false;
+        } else if (b.act) b.act = false;
+        if (didA || didB) {
+            for (int l = 1; l < u_levels; ++l)
+                descend2(l, t_far, r_mul,
+                         a, slab_inA, slab_outA, didA ? ta_inA[l] : 1e30, ta_outA[l],
+                         b, slab_inB, slab_outB, didB ? ta_inB[l] : 1e30, ta_outB[l]);
+        }
+    }
+    if (u_perf != 0) PERF_CYC(7, trav0);
+}
+
+
 // Trace a ray: DDA through the coarsest grid; on every coarse cell, descend
 // into all finer levels whose AABB overlaps the cell's t-interval. The first
 // surfel disk hit is found per the paper; the surface is then reconstructed
@@ -409,7 +688,32 @@ void main() {
     barrier();
 
     uint rid = gl_GlobalInvocationID.x;
-    if (rid < counts[u_bounce]) {
+    uint n = counts[u_bounce];
+    if (u_pair != 0) {
+        // Two interleaved rays per thread: the second ray's independent load
+        // stream hides the first ray's grid-probe latency (occupancy is
+        // capped by the ray count, not by SM resources).
+        uint r0 = rid * 2u, r1 = r0 + 1u;
+        bool hasA = r0 < n, hasB = r1 < n;
+        DdaX a, b;
+        a.best_t = 1e30; a.found = false; a.act = hasA;
+        b.best_t = 1e30; b.found = false; b.act = hasB;
+        if (hasA) {
+            vec4 e0 = stream_in[2u * r0];
+            vec4 e1 = stream_in[2u * r0 + 1u];
+            a.o = e0.yzw; a.d = e1.xyz;
+        }
+        if (hasB) {
+            vec4 e0 = stream_in[2u * r1];
+            vec4 e1 = stream_in[2u * r1 + 1u];
+            b.o = e0.yzw; b.d = e1.xyz;
+        }
+        PERF_ADD(0, hasA ? 1u : 0u);
+        PERF_ADD(0, hasB ? 1u : 0u);
+        trace_best2(a, b, 1e-3, u_far, 1.0);
+        if (hasA) hit_buf[r0] = a.found ? a.best_t : -1.0;
+        if (hasB) hit_buf[r1] = b.found ? b.best_t : -1.0;
+    } else if (rid < n) {
         uint t_setup0 = 0;
         if (u_perf != 0) t_setup0 = clock2x32ARB().x;
 

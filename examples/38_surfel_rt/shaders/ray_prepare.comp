@@ -6,12 +6,12 @@ layout(local_size_x = 1) in;
 // extra workgroup is dispatched when the count is 0 or not a multiple of the
 // workgroup size: the trace kernel bounds-checks rid < counts[u_bounce].
 layout(std430, binding = 13) readonly buffer RayCounts { uint counts[]; };
-layout(std430, binding = 16) writeonly buffer DispCmd { uint cmd[3]; };
+layout(std430, binding = 22) writeonly buffer DispCmd { uint cmd[3]; };
 
 uniform uint u_bounce;
 
 void main() {
-    uint groups = (counts[u_bounce] + 127u) / 128u;
+    uint groups = (counts[u_bounce] + 64u - 1u) / 64u;
     if (groups == 0u) groups = 1u;
     cmd[0] = groups;
     cmd[1] = 1u;

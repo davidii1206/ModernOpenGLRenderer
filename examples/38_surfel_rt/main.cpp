@@ -1504,7 +1504,9 @@ int main() {
     float mega_dot = 0.98f;       // merge normal-coherence threshold
                                   // (merged radius cap = level cell size)
     bool mega_ok = true;          // hierarchy built (false => fine-only fallback)
-    if (getenv("SRT_MEGA")) render_mega = true;
+    if (const char* m = getenv("SRT_MEGA")) render_mega = std::atoi(m) != 0;
+    bool pair_rays = false;
+    if (const char* p = getenv("SRT_PAIR")) pair_rays = std::atoi(p) != 0;
     if (getenv("SRT_MEGA_DOT")) mega_dot = std::clamp(std::atof(getenv("SRT_MEGA_DOT")), 0.5, 0.999999);
 
     // Scan trio over an arbitrary uint array segment (count -> exclusive
@@ -1791,44 +1793,6 @@ int main() {
                 }
                 gl::dispatch_compute((levels[l].volume + kBlockSize - 1) / kBlockSize, 1, 1);
                 glMemoryBarrier(GL_ALL_BARRIER_BITS);
-            }
-        }
-
-        if (getenv("SRT_DEBUG")) {
-            glMemoryBarrier(GL_ALL_BARRIER_BITS);
-            glFinish();
-            auto dump = [&](gl::Buffer& b, uint32_t n, const char* name) {
-                std::vector<uint32_t> v(n);
-                void* ptr = b.map_range(0, size_t(n) * 4, GL_MAP_READ_BIT);
-                if (ptr) { std::memcpy(v.data(), ptr, size_t(n) * 4); b.unmap(); }
-                uint64_t sum = 0; uint32_t nz = 0;
-                for (uint32_t x : v) { sum += x; if (x) ++nz; }
-                printf("DBG %s: n=%u sum=%llu nonzero=%u\n", name, n, (unsigned long long)sum, nz);
-                return sum;
-            };
-            dump(mega_count_all, cnt_total, "mega_count(per cell)");
-            dump(leftover_count_all, cnt_total, "comb_count(per cell)");
-            dump(mega_cnt_all, packed_total, "mega_cnt(per mega members)");
-            // first 6 combined sc entries + first 8 order entries + first 3 rdr records
-            {
-                std::vector<uint32_t> scv(12);
-                void* ptr = left_sc_all.map_range(0, 24, GL_MAP_READ_BIT);
-                if (ptr) { std::memcpy(scv.data(), ptr, 24); left_sc_all.unmap(); }
-                printf("DBG comb_sc[0..5] =");
-                for (int i = 0; i < 6; ++i) printf(" (%u,%u)", scv[2*i], scv[2*i+1]);
-                printf("\n");
-                std::vector<uint32_t> ov(8);
-                ptr = left_idx_all.map_range(0, 32, GL_MAP_READ_BIT);
-                if (ptr) { std::memcpy(ov.data(), ptr, 32); left_idx_all.unmap(); }
-                printf("DBG comb_order[0..7] =");
-                for (int i = 0; i < 8; ++i) printf(" %08x", ov[i]);
-                printf("\n");
-                std::vector<glm::vec4> rp(6);
-                ptr = rdr_pn_all.map_range(0, 6 * 16, GL_MAP_READ_BIT);
-                if (ptr) { std::memcpy(rp.data(), ptr, 6 * 16); rdr_pn_all.unmap(); }
-                for (int i = 0; i < 3; ++i)
-                    printf("DBG rdr_pn[%d] = (%.3f %.3f %.3f r=%.3f | n=%.2f %.2f %.2f)\n", i,
-                           rp[2*i].x, rp[2*i].y, rp[2*i].z, rp[2*i].w, rp[2*i+1].x, rp[2*i+1].y, rp[2*i+1].z);
             }
         }
 
@@ -2246,6 +2210,7 @@ int main() {
         l = loc("u_search_radius"); if (l >= 0) raytrace->uniform1f(l, search_radius);
         l = loc("u_radius_scale"); if (l >= 0) raytrace->uniform1f(l, radius_scale);
         l = loc("u_mega");         if (l >= 0) raytrace->uniform1i(l, render_mega && mega_ok ? 1 : 0);
+        l = loc("u_pair");         if (l >= 0) raytrace->uniform1i(l, pair_rays ? 1 : 0);
         l = loc("u_perf");         if (l >= 0) raytrace->uniform1i(l, perf_on ? 1 : 0);
 
         // Gather kernel uniforms (reconstruction + shading + next-bounce appends).
@@ -2298,11 +2263,15 @@ int main() {
         glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, dispatch_buf.handle());
         gl::Buffer* streams[2] = {&stream_a_buf, &stream_b_buf};
         for (int b = 0; b < max_bounces; ++b) {
-            dispatch_buf.bind_base(16);
+            dispatch_buf.bind_base(22);
             prepare_cs->use();
             {
                 GLint u = prepare_cs->uniform_location("u_bounce");
                 if (u >= 0) prepare_cs->uniform1ui(u, GLuint(b));
+            }
+            {
+                GLint u = prepare_cs->uniform_location("u_pair");
+                if (u >= 0) prepare_cs->uniform1ui(u, pair_rays ? 1u : 0u);
             }
             gl::dispatch_compute(1, 1, 1);
             glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_COMMAND_BARRIER_BIT);
@@ -2314,13 +2283,6 @@ int main() {
             l = loc("u_bounce");       if (l >= 0) raytrace->uniform1i(l, b);
             gl::dispatch_compute_indirect(0);
             glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-            if (getenv("SRT_DEBUG")) {
-                printf("DBG b=%d glErr=0x%x counts=[", b, glGetError());
-                GLuint dbg[4] = {0,0,0,0};
-                glGetNamedBufferSubData(ray_count_buf.handle(), 0, 16, dbg);
-                printf("%u %u %u %u]\n", dbg[0], dbg[1], dbg[2], dbg[3]);
-            }
-
             // Reconstruction + shading + next-bounce appends (same ray set:
             // reuses the indirect command).
             gather_cs->use();
@@ -2333,67 +2295,6 @@ int main() {
             perf_fence = gl::Sync{};   // fence ordered after the last bounce
             perf_pending = true;
             perf_write ^= 1;
-        }
-        if (getenv("SRT_DEBUG")) {
-            glMemoryBarrier(GL_ALL_BARRIER_BITS);
-            glFinish();
-            int fw2 = window.framebuffer_width(), fh2 = window.framebuffer_height();
-            std::vector<float> hb(size_t(fw2) * size_t(fh2));
-            void* ptr = hit_buf.map_range(0, hb.size() * 4, GL_MAP_READ_BIT);
-            if (ptr) { std::memcpy(hb.data(), ptr, hb.size() * 4); hit_buf.unmap(); }
-            uint32_t nmiss = 0, nnan = 0, nhit = 0; float tmin = 1e30, tmax = -1e30;
-            for (float t : hb) {
-                if (std::isnan(t)) ++nnan;
-                else if (t < 0.0f) ++nmiss;
-                else { ++nhit; tmin = std::min(tmin, t); tmax = std::max(tmax, t); }
-            }
-            printf("DBG hit_buf: nan=%u miss=%u hit=%u t=[%.3f..%.3f]\n", nnan, nmiss, nhit,
-                   nhit ? tmin : 0.f, nhit ? tmax : 0.f);
-            {
-                std::vector<uint32_t> rc(packed_total);
-                void* ptr2 = rdr_cut_all.map_range(0, rc.size() * 4, GL_MAP_READ_BIT);
-                if (ptr2) { std::memcpy(rc.data(), ptr2, rc.size() * 4); rdr_cut_all.unmap(); }
-                uint32_t zeros = 0, nones = 0, other = 0, first_zero = 0;
-                for (uint32_t i = 0; i < packed_total; ++i) {
-                    if (rc[i] == 0u) { if (!zeros) first_zero = i; ++zeros; }
-                    else if (rc[i] == 0xFFFFFFFFu) ++nones;
-                    else ++other;
-                }
-                printf("DBG rdr_cut: zeros=%u (first at %u) nones=%u other=%u\n", zeros, first_zero, nones, other);
-                std::vector<glm::vec4> rp2(size_t(packed_total) * 2u);
-                ptr2 = rdr_pn_all.map_range(0, rp2.size() * 16, GL_MAP_READ_BIT);
-                if (ptr2) { std::memcpy(rp2.data(), ptr2, rp2.size() * 16); rdr_pn_all.unmap(); }
-                uint32_t nanr = 0, zr = 0; uint32_t first_bad = 0;
-                for (uint32_t i = 0; i < packed_total; ++i) {
-                    glm::vec4 a = rp2[2 * i];
-                    if (std::isnan(a.x + a.y + a.z + a.w)) { if (!nanr) first_bad = i; ++nanr; }
-                    else if (a.x == 0.f && a.y == 0.f && a.z == 0.f && a.w == 0.f) { if (!zr) first_bad = i; ++zr; }
-                }
-                printf("DBG rdr_pn: nan=%u zero=%u (first bad at %u)\n", nanr, zr, first_bad);
-            }
-
-            // first non-empty comb cell + its rdr entries
-            std::vector<uint32_t> scv(size_t(cnt_total) * 2u);
-            ptr = left_sc_all.map_range(0, scv.size() * 4, GL_MAP_READ_BIT);
-            if (ptr) { std::memcpy(scv.data(), ptr, scv.size() * 4); left_sc_all.unmap(); }
-            for (uint32_t ci = 0; ci < cnt_total; ++ci) {
-                if (scv[2 * ci + 1] == 0) continue;
-                uint32_t st = scv[2 * ci], cnt = scv[2 * ci + 1];
-                printf("DBG first nonempty comb cell %u: start=%u count=%u\n", ci, st, cnt);
-                std::vector<float> rp(size_t(cnt) * 8);
-                ptr = rdr_pn_all.map_range(size_t(st) * 32, rp.size() * 4, GL_MAP_READ_BIT);
-                if (ptr) { std::memcpy(rp.data(), ptr, rp.size() * 4); rdr_pn_all.unmap(); }
-                for (uint32_t k = 0; k < cnt && k < 4; ++k)
-                    printf("DBG rdr entry %u: (%.3f %.3f %.3f r=%.4f | n=%.2f %.2f %.2f)\n", k,
-                           rp[k*8], rp[k*8+1], rp[k*8+2], rp[k*8+3], rp[k*8+4], rp[k*8+5], rp[k*8+6], rp[k*8+7]);
-                std::vector<uint32_t> rc(cnt);
-                ptr = rdr_cut_all.map_range(size_t(st) * 4, rc.size() * 4, GL_MAP_READ_BIT);
-                if (ptr) { std::memcpy(rc.data(), ptr, rc.size() * 4); rdr_cut_all.unmap(); }
-                printf("DBG rdr cuts[0..%u] =", std::min<uint32_t>(cnt, 6u) - 1u);
-                for (uint32_t k = 0; k < cnt && k < 6; ++k) printf(" %08x", rc[k]);
-                printf("\n");
-                break;
-            }
         }
         t_ray.end();
         traced = true;
