@@ -20,6 +20,11 @@ layout(std430, binding = 8) readonly buffer PackedPN { vec4 packed_pn[]; };   //
 layout(std430, binding = 9) readonly buffer PackedAlb { vec4 packed_alb[]; }; // rgb, w = mirror
 layout(std430, binding = 11) readonly buffer CellMask { uint cell_mask[]; };
 
+// The reconstruction always gathers FINE surfels: the (r - d_i) weighting
+// needs the local detail set, and merged disks would widen the blend window
+// (window bound scales with candidate radius) — cancelling the candidate
+// reduction. Megas accelerate the traversal; the gather stays fine.
+
 // Ray stream for this bounce + counts + the traversal kernel's hit buffer.
 layout(std430, binding = 12) readonly buffer StreamIn { vec4 stream_in[]; };
 layout(std430, binding = 13) buffer RayCounts { uint counts[]; };   // [bounce]

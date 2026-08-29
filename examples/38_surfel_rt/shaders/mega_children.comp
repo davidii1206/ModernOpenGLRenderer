@@ -1,0 +1,45 @@
+#version 460 core
+layout(local_size_x = 256) in;
+
+// Mega-surfel hierarchy, pass 5: one thread per fine surfel of the level.
+// Members append their packed index to their mega's child list (the per-mega
+// cursor starts at 0 each build; child_base was produced by scanning the
+// member counts). Leftovers do nothing here.
+layout(std430, binding = 3) readonly buffer LevelIdx { uint level_idx[]; };
+layout(std430, binding = 4) readonly buffer SurfelSlot { uint surfel_slot[]; };
+layout(std430, binding = 5) readonly buffer CellStart { uint cell_start[]; };
+layout(std430, binding = 0) readonly buffer SurfPos { vec4 surfel_pos[]; };
+layout(std430, binding = 22) readonly buffer MegaAssign { uint mega_assign[]; };
+layout(std430, binding = 23) readonly buffer MegaStart { uint mega_start[]; };
+layout(std430, binding = 26) buffer MegaCur { uint mega_cur[]; };
+layout(std430, binding = 28) readonly buffer MegaCnt { uint mega_cnt[]; };
+layout(std430, binding = 29) readonly buffer ChildBase { uint child_base[]; };
+layout(std430, binding = 30) writeonly buffer Children { uint children[]; };
+
+uniform vec3 u_grid_min;
+uniform float u_inv_cell;
+uniform ivec3 u_grid_res;
+uniform uint u_num;
+uniform uint u_cnt_off;
+uniform uint u_start_off;  // original cell_start segment (fine packed lists)
+uniform uint u_packed_off;
+uniform uint u_idx_off;
+
+uint cell_index(ivec3 c) {
+    return uint(c.x + u_grid_res.x * (c.y + u_grid_res.y * c.z));
+}
+
+void main() {
+    uint k = gl_GlobalInvocationID.x;
+    if (k >= u_num) return;
+    uint s = level_idx[u_idx_off + k];
+    vec3 p = surfel_pos[s].xyz;
+    ivec3 c = clamp(ivec3(floor((p - u_grid_min) * u_inv_cell)), ivec3(0), u_grid_res - 1);
+    uint lci = cell_index(c);
+    uint ci = u_cnt_off + lci;
+    uint pi = u_packed_off + cell_start[u_start_off + lci] + surfel_slot[s];
+    if (mega_assign[pi] == 0xFFFFFFFFu) return;
+    uint mega = u_packed_off + mega_start[ci] + mega_assign[pi];
+    uint slot = atomicAdd(mega_cur[mega], 1u);
+    children[u_packed_off + child_base[mega] + slot] = pi;
+}

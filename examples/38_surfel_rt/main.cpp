@@ -1040,6 +1040,16 @@ int main() {
     compact_prog.add_stage("shaders/grid_compact.comp", gl::ShaderType::compute);
     gl::HotReloadProgram merge_prog;
     merge_prog.add_stage("shaders/grid_merge.comp", gl::ShaderType::compute);
+    gl::HotReloadProgram mega_cluster_prog;
+    mega_cluster_prog.add_stage("shaders/mega_cluster.comp", gl::ShaderType::compute);
+    gl::HotReloadProgram mega_scatter_prog;
+    mega_scatter_prog.add_stage("shaders/mega_scatter.comp", gl::ShaderType::compute);
+    gl::HotReloadProgram mega_children_prog;
+    mega_children_prog.add_stage("shaders/mega_children.comp", gl::ShaderType::compute);
+    gl::HotReloadProgram mega_finalize_prog;
+    mega_finalize_prog.add_stage("shaders/mega_finalize.comp", gl::ShaderType::compute);
+    gl::HotReloadProgram mega_renderlist_prog;
+    mega_renderlist_prog.add_stage("shaders/mega_renderlist.comp", gl::ShaderType::compute);
     gl::HotReloadProgram mark_prog;
     mark_prog.add_stage("shaders/ray_mark.comp", gl::ShaderType::compute);
     gl::HotReloadProgram gather_prog;
@@ -1058,6 +1068,11 @@ int main() {
     scan_finish_prog.poll();
     compact_prog.poll();
     merge_prog.poll();
+    mega_cluster_prog.poll();
+    mega_scatter_prog.poll();
+    mega_children_prog.poll();
+    mega_finalize_prog.poll();
+    mega_renderlist_prog.poll();
     mark_prog.poll();
     gather_prog.poll();
     prepare_prog.poll();
@@ -1073,12 +1088,19 @@ int main() {
     auto scan_finish_cs = scan_finish_prog.take_program();
     auto compact_cs = compact_prog.take_program();
     auto merge_cs = merge_prog.take_program();
+    auto mega_cluster_cs = mega_cluster_prog.take_program();
+    auto mega_scatter_cs = mega_scatter_prog.take_program();
+    auto mega_children_cs = mega_children_prog.take_program();
+    auto mega_finalize_cs = mega_finalize_prog.take_program();
+    auto mega_renderlist_cs = mega_renderlist_prog.take_program();
     auto mark_cs = mark_prog.take_program();
     auto gather_cs = gather_prog.take_program();
     auto prepare_cs = prepare_prog.take_program();
     if (!display || !gbuf || !raytrace || !pc || !boxp ||
         !count_cs || !scan_block_cs || !scan_blocks_cs || !scan_finish_cs || !compact_cs ||
-        !merge_cs || !mark_cs || !gather_cs || !prepare_cs)
+        !merge_cs || !mega_cluster_cs || !mega_scatter_cs ||
+        !mega_children_cs || !mega_finalize_cs || !mega_renderlist_cs ||
+        !mark_cs || !gather_cs || !prepare_cs)
         return EXIT_FAILURE;
 
     // Fullscreen triangle for display.
@@ -1282,6 +1304,32 @@ int main() {
     gl::Buffer hit_buf(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);         // per-ray best-t, trace -> gather
     gl::Buffer dispatch_buf(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);
 
+    // Mega-surfel hierarchy (per level, built on the GPU at grid-build time):
+    // merged representatives for zero-cut, normal-coherent fine surfels.
+    // Runtime (u_mega): ray tests/gathers read mega lists + leftover lists
+    // (border fines with exact cuts); children/meta link megas to their fine
+    // surfels for a later gather extension.
+    gl::Buffer mega_pn_all(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);      // 2 vec4 per mega (pos+r, nrm)
+    gl::Buffer mega_alb_all(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);     // vec4 per mega
+    gl::Buffer mega_sc_all(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);      // uvec2 per cell (build-time mega bases)
+    gl::Buffer left_idx_all(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);     // build temp: combined order list
+    gl::Buffer left_sc_all(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);      // combined (start, count) per cell
+    gl::Buffer rdr_pn_all(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);       // combined render SoA: 2 vec4 per entry
+    gl::Buffer rdr_alb_all(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);      // vec4 per entry
+    gl::Buffer rdr_cut_all(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);      // uint per entry (packed_idx or none)
+    // Build temps (mega slots live in the packed segment space, sizes packed_total).
+    gl::Buffer mega_assign_all(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);  // uint per fine surfel
+    gl::Buffer mega_count_all(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);   // uint per cell
+    gl::Buffer mega_start_all(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);   // uint per cell
+    gl::Buffer leftover_count_all(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);  // combined counts (clusters + leftovers)
+    gl::Buffer leftover_start_all(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);  // combined-list starts
+    gl::Buffer leftover_cur_all(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);    // combined leftover cursor
+    gl::Buffer mega_cnt_all(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);     // uint per mega (members)
+    gl::Buffer child_base_all(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);   // uint per mega
+    gl::Buffer mega_cur_all(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);
+    gl::Buffer children_all(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);     // uint per merged member
+    gl::Buffer mega_meta_all(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);    // uvec2 per mega (child_base, count)
+
     std::vector<glm::vec4> vp, vn, va, cuts;
     auto upload_surfel_buffers = [&]() {
         vp.assign(size_t(N), glm::vec4(0.0f));
@@ -1390,6 +1438,28 @@ int main() {
         cell_mask_all.data(nullptr, size_t(mask_total) * sizeof(uint32_t));
         surfel_slot_buf.data(nullptr, size_t(N) * sizeof(uint32_t));
         block_sum_buf.data(nullptr, kScanBlocksMax * sizeof(uint32_t));
+        // Mega hierarchy: mega slots reuse the packed segment partitioning
+        // (level l's megas live at [packed_off, packed_off + count)), so the
+        // packed offsets also address the mega arrays.
+        mega_pn_all.data(nullptr, size_t(packed_total) * 2 * sizeof(glm::vec4));
+        mega_alb_all.data(nullptr, size_t(packed_total) * sizeof(glm::vec4));
+        mega_meta_all.data(nullptr, size_t(packed_total) * 2 * sizeof(uint32_t));
+        mega_sc_all.data(nullptr, size_t(cnt_total) * 2 * sizeof(uint32_t));
+        left_idx_all.data(nullptr, size_t(packed_total) * sizeof(uint32_t));
+        left_sc_all.data(nullptr, size_t(cnt_total) * 2 * sizeof(uint32_t));
+        mega_assign_all.data(nullptr, size_t(packed_total) * sizeof(uint32_t));
+        mega_count_all.data(nullptr, size_t(cnt_total) * sizeof(uint32_t));
+        mega_start_all.data(nullptr, size_t(cnt_total) * sizeof(uint32_t));
+        leftover_count_all.data(nullptr, size_t(cnt_total) * sizeof(uint32_t));
+        leftover_start_all.data(nullptr, size_t(cnt_total) * sizeof(uint32_t));
+        leftover_cur_all.data(nullptr, size_t(cnt_total) * sizeof(uint32_t));
+        mega_cnt_all.data(nullptr, size_t(packed_total) * sizeof(uint32_t));
+        child_base_all.data(nullptr, size_t(packed_total) * sizeof(uint32_t));
+        mega_cur_all.data(nullptr, size_t(packed_total) * sizeof(uint32_t));
+        children_all.data(nullptr, size_t(packed_total) * sizeof(uint32_t));
+        rdr_pn_all.data(nullptr, size_t(packed_total) * 2 * sizeof(glm::vec4));
+        rdr_alb_all.data(nullptr, size_t(packed_total) * sizeof(glm::vec4));
+        rdr_cut_all.data(nullptr, size_t(packed_total) * sizeof(uint32_t));
     };
     upload_level_buffers();
 
@@ -1424,12 +1494,74 @@ int main() {
         stream_a_buf.bind_base(12);
         ray_count_buf.bind_base(13);
         hit_buf.bind_base(15);
+        rdr_pn_all.bind_base(16);
+        rdr_alb_all.bind_base(17);
+        left_sc_all.bind_base(18);          // combined (start, count) per cell
+        rdr_cut_all.bind_base(21);          // combined render cut refs
+    };
+
+    bool render_mega = false;     // render from merged mega surfels + leftovers
+    float mega_dot = 0.98f;       // merge normal-coherence threshold
+                                  // (merged radius cap = level cell size)
+    bool mega_ok = true;          // hierarchy built (false => fine-only fallback)
+    if (getenv("SRT_MEGA")) render_mega = true;
+    if (getenv("SRT_MEGA_DOT")) mega_dot = std::clamp(std::atof(getenv("SRT_MEGA_DOT")), 0.5, 0.999999);
+
+    // Scan trio over an arbitrary uint array segment (count -> exclusive
+    // start): reused by the grid build and by the mega hierarchy (per-cell
+    // mega/leftover bases, per-mega child bases).
+    auto run_scan = [&](gl::Buffer& counts, gl::Buffer& starts,
+                        uint32_t n, uint32_t off) {
+        const uint32_t nblocks = (n + kBlockSize - 1) / kBlockSize;
+        counts.bind_base(0);
+        starts.bind_base(1);
+        block_sum_buf.bind_base(2);
+        scan_block_cs->use();
+        {
+            GLint u = scan_block_cs->uniform_location("u_n");
+            if (u >= 0) scan_block_cs->uniform1ui(u, n);
+            u = scan_block_cs->uniform_location("u_cnt_off");
+            if (u >= 0) scan_block_cs->uniform1ui(u, off);
+            u = scan_block_cs->uniform_location("u_start_off");
+            if (u >= 0) scan_block_cs->uniform1ui(u, off);
+        }
+        gl::dispatch_compute(nblocks, 1, 1);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+        block_sum_buf.bind_base(0);
+        scan_blocks_cs->use();
+        {
+            GLint u = scan_blocks_cs->uniform_location("u_nblocks");
+            if (u >= 0) scan_blocks_cs->uniform1ui(u, nblocks);
+        }
+        gl::dispatch_compute(1, 1, 1);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+        starts.bind_base(0);
+        block_sum_buf.bind_base(1);
+        scan_finish_cs->use();
+        {
+            GLint u = scan_finish_cs->uniform_location("u_n");
+            if (u >= 0) scan_finish_cs->uniform1ui(u, n);
+            u = scan_finish_cs->uniform_location("u_start_off");
+            if (u >= 0) scan_finish_cs->uniform1ui(u, off);
+        }
+        gl::dispatch_compute(nblocks, 1, 1);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
     };
 
     auto build_grid = [&]() {
         // Zero ALL level count + mask segments at once.
         cell_count_all.clear(GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, &zero);
         cell_mask_all.clear(GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, &zero);
+        // Mega hierarchy temps: counters/accumulators must start from zero
+        // each build (mega slots are only touched where clusters exist, but
+        // the per-cell/per-mega counters gate everything downstream).
+        mega_count_all.clear(GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, &zero);
+        leftover_count_all.clear(GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, &zero);
+        leftover_cur_all.clear(GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, &zero);
+        mega_cnt_all.clear(GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, &zero);
+        mega_cur_all.clear(GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, &zero);
         for (int l = 0; l < kGridLevels; ++l) {
             if (levels[l].count == 0) continue;
             const uint32_t n = levels[l].count;
@@ -1506,6 +1638,199 @@ int main() {
         }
         gl::dispatch_compute((cnt_total + kBlockSize - 1) / kBlockSize, 1, 1);
         glMemoryBarrier(GL_ALL_BARRIER_BITS);
+
+        // ---- Mega-surfel hierarchy (per level, see the pass comments) ----
+        // Guard: the per-mega child-base scan reuses the single-workgroup
+        // block-scan (kScanBlocksMax blocks of kBlockSize) over the packed
+        // segment space; dense clouds beyond that fall back to fine-only
+        // rendering for every level (u_l_mega_on = 0).
+        bool mega_buildable = packed_total <= uint32_t(kBlockSize * kScanBlocksMax);
+        mega_ok = mega_buildable;
+        if (!mega_buildable)
+            gllib::log(gllib::LogLevel::info,
+                       "mega hierarchy skipped: cloud exceeds the single-workgroup scan limit");
+        if (mega_buildable) {
+            for (int l = 0; l < kGridLevels; ++l) {
+                if (levels[l].count == 0) continue;
+                const uint32_t n = levels[l].count;
+                const uint32_t vol = levels[l].volume;
+
+                // 1: cluster (per cell) -> local cluster ids + per-cell counts.
+                cell_sc_all.bind_base(3);
+                packed_all.bind_base(5);
+                surfel_cut_buf.bind_base(6);
+                packed_pn_all.bind_base(8);
+                packed_alb_all.bind_base(9);
+                mega_assign_all.bind_base(22);
+                mega_count_all.bind_base(23);
+                leftover_count_all.bind_base(24);
+                mega_cluster_cs->use();
+                set_level_uniforms(*mega_cluster_cs, l);
+                {
+                    GLint u = mega_cluster_cs->uniform_location("u_mega_dot");
+                    if (u >= 0) mega_cluster_cs->uniform1f(u, mega_dot);
+                    u = mega_cluster_cs->uniform_location("u_cap");
+                    if (u >= 0) mega_cluster_cs->uniform1f(u, levels[l].cell);
+                }
+                gl::dispatch_compute((vol + kBlockSize - 1) / kBlockSize, 1, 1);
+                glMemoryBarrier(GL_ALL_BARRIER_BITS);
+
+                // 2/3: per-cell mega + leftover bases.
+                run_scan(mega_count_all, mega_start_all, vol, levels[l].cnt_off);
+                run_scan(leftover_count_all, leftover_start_all, vol, levels[l].cnt_off);
+
+                // 4: scatter (per surfel): leftovers into lists, members bump counts.
+                surfel_pos_buf.bind_base(0);
+                level_idx_all.bind_base(3);
+                surfel_slot_buf.bind_base(4);
+                cell_start_all.bind_base(5);
+                mega_assign_all.bind_base(22);
+                mega_start_all.bind_base(23);
+                leftover_start_all.bind_base(24);   // combined-list starts
+                leftover_cur_all.bind_base(25);     // combined leftover cursor
+                mega_cnt_all.bind_base(26);
+                left_idx_all.bind_base(27);         // combined render list
+                mega_count_all.bind_base(28);
+                mega_scatter_cs->use();
+                set_level_uniforms(*mega_scatter_cs, l);
+                {
+                    GLint u = mega_scatter_cs->uniform_location("u_mega_flag");
+                    if (u >= 0) mega_scatter_cs->uniform1ui(u, 0x80000000u);
+                }
+                gl::dispatch_compute((n + kBlockSize - 1) / kBlockSize, 1, 1);
+                glMemoryBarrier(GL_ALL_BARRIER_BITS);
+            }
+
+            // 5: ONE child-base scan over the whole packed segment space
+            // (levels processed above have member counts; the rest are zero).
+            run_scan(mega_cnt_all, child_base_all, packed_total, 0);
+
+            for (int l = 0; l < kGridLevels; ++l) {
+                if (levels[l].count == 0) continue;
+                const uint32_t n = levels[l].count;
+
+                // 6: children lists (per surfel).
+                surfel_pos_buf.bind_base(0);
+                level_idx_all.bind_base(3);
+                surfel_slot_buf.bind_base(4);
+                cell_start_all.bind_base(5);
+                mega_assign_all.bind_base(22);
+                mega_start_all.bind_base(23);
+                mega_cur_all.bind_base(26);
+                mega_cnt_all.bind_base(28);
+                child_base_all.bind_base(29);
+                children_all.bind_base(30);
+                mega_children_cs->use();
+                set_level_uniforms(*mega_children_cs, l);
+                gl::dispatch_compute((n + kBlockSize - 1) / kBlockSize, 1, 1);
+                glMemoryBarrier(GL_ALL_BARRIER_BITS);
+
+                // 7: finalize megas (per mega slot of the level segment). The
+                // packed data is read through bindings 8/9, the merged records
+                // written through 31/32/33 (same buffer objects, legal).
+                packed_pn_all.bind_base(8);
+                packed_alb_all.bind_base(9);
+                mega_cnt_all.bind_base(28);
+                child_base_all.bind_base(29);
+                children_all.bind_base(30);
+                mega_pn_all.bind_base(31);
+                mega_alb_all.bind_base(32);
+                mega_meta_all.bind_base(33);
+                mega_finalize_cs->use();
+                set_level_uniforms(*mega_finalize_cs, l);
+                {
+                    GLint u = mega_finalize_cs->uniform_location("u_cap");
+                    if (u >= 0) mega_finalize_cs->uniform1f(u, levels[l].cell);
+                }
+                gl::dispatch_compute((n + kBlockSize - 1) / kBlockSize, 1, 1);
+                glMemoryBarrier(GL_ALL_BARRIER_BITS);
+            }
+
+        // 8: per-cell mega/leftover (start, count) via the merge kernel.
+        mega_start_all.bind_base(0);
+        mega_count_all.bind_base(1);
+        mega_sc_all.bind_base(2);
+        merge_cs->use();
+        {
+            GLint u = merge_cs->uniform_location("u_n");
+            if (u >= 0) merge_cs->uniform1ui(u, cnt_total);
+        }
+        gl::dispatch_compute((cnt_total + kBlockSize - 1) / kBlockSize, 1, 1);
+        glMemoryBarrier(GL_ALL_BARRIER_BITS);
+
+            leftover_start_all.bind_base(0);   // combined-list starts
+            leftover_count_all.bind_base(1);   // combined counts (clusters + leftovers)
+            left_sc_all.bind_base(2);          // combined (start, count) per cell
+            merge_cs->use();
+            {
+                GLint u = merge_cs->uniform_location("u_n");
+                if (u >= 0) merge_cs->uniform1ui(u, cnt_total);
+            }
+            gl::dispatch_compute((cnt_total + kBlockSize - 1) / kBlockSize, 1, 1);
+            glMemoryBarrier(GL_ALL_BARRIER_BITS);
+
+            // 9: materialize the combined render lists (per cell, after the
+            // merged sc is final).
+            for (int l = 0; l < kGridLevels; ++l) {
+                if (levels[l].count == 0) continue;
+                packed_all.bind_base(5);
+                packed_pn_all.bind_base(8);
+                packed_alb_all.bind_base(9);
+                mega_pn_all.bind_base(16);
+                mega_alb_all.bind_base(17);
+                left_idx_all.bind_base(19);        // combined order list (temp)
+                left_sc_all.bind_base(24);         // combined (start, count)
+                rdr_pn_all.bind_base(34);
+                rdr_alb_all.bind_base(35);
+                rdr_cut_all.bind_base(36);
+                mega_renderlist_cs->use();
+                set_level_uniforms(*mega_renderlist_cs, l);
+                {
+                    GLint u = mega_renderlist_cs->uniform_location("u_mega_flag");
+                    if (u >= 0) mega_renderlist_cs->uniform1ui(u, 0x80000000u);
+                }
+                gl::dispatch_compute((levels[l].volume + kBlockSize - 1) / kBlockSize, 1, 1);
+                glMemoryBarrier(GL_ALL_BARRIER_BITS);
+            }
+        }
+
+        if (getenv("SRT_DEBUG")) {
+            glMemoryBarrier(GL_ALL_BARRIER_BITS);
+            glFinish();
+            auto dump = [&](gl::Buffer& b, uint32_t n, const char* name) {
+                std::vector<uint32_t> v(n);
+                void* ptr = b.map_range(0, size_t(n) * 4, GL_MAP_READ_BIT);
+                if (ptr) { std::memcpy(v.data(), ptr, size_t(n) * 4); b.unmap(); }
+                uint64_t sum = 0; uint32_t nz = 0;
+                for (uint32_t x : v) { sum += x; if (x) ++nz; }
+                printf("DBG %s: n=%u sum=%llu nonzero=%u\n", name, n, (unsigned long long)sum, nz);
+                return sum;
+            };
+            dump(mega_count_all, cnt_total, "mega_count(per cell)");
+            dump(leftover_count_all, cnt_total, "comb_count(per cell)");
+            dump(mega_cnt_all, packed_total, "mega_cnt(per mega members)");
+            // first 6 combined sc entries + first 8 order entries + first 3 rdr records
+            {
+                std::vector<uint32_t> scv(12);
+                void* ptr = left_sc_all.map_range(0, 24, GL_MAP_READ_BIT);
+                if (ptr) { std::memcpy(scv.data(), ptr, 24); left_sc_all.unmap(); }
+                printf("DBG comb_sc[0..5] =");
+                for (int i = 0; i < 6; ++i) printf(" (%u,%u)", scv[2*i], scv[2*i+1]);
+                printf("\n");
+                std::vector<uint32_t> ov(8);
+                ptr = left_idx_all.map_range(0, 32, GL_MAP_READ_BIT);
+                if (ptr) { std::memcpy(ov.data(), ptr, 32); left_idx_all.unmap(); }
+                printf("DBG comb_order[0..7] =");
+                for (int i = 0; i < 8; ++i) printf(" %08x", ov[i]);
+                printf("\n");
+                std::vector<glm::vec4> rp(6);
+                ptr = rdr_pn_all.map_range(0, 6 * 16, GL_MAP_READ_BIT);
+                if (ptr) { std::memcpy(rp.data(), ptr, 6 * 16); rdr_pn_all.unmap(); }
+                for (int i = 0; i < 3; ++i)
+                    printf("DBG rdr_pn[%d] = (%.3f %.3f %.3f r=%.3f | n=%.2f %.2f %.2f)\n", i,
+                           rp[2*i].x, rp[2*i].y, rp[2*i].z, rp[2*i].w, rp[2*i+1].x, rp[2*i+1].y, rp[2*i+1].z);
+            }
+        }
 
         bind_rt();   // restore raytrace bindings
     };
@@ -1920,6 +2245,7 @@ int main() {
         }
         l = loc("u_search_radius"); if (l >= 0) raytrace->uniform1f(l, search_radius);
         l = loc("u_radius_scale"); if (l >= 0) raytrace->uniform1f(l, radius_scale);
+        l = loc("u_mega");         if (l >= 0) raytrace->uniform1i(l, render_mega && mega_ok ? 1 : 0);
         l = loc("u_perf");         if (l >= 0) raytrace->uniform1i(l, perf_on ? 1 : 0);
 
         // Gather kernel uniforms (reconstruction + shading + next-bounce appends).
@@ -2008,6 +2334,67 @@ int main() {
             perf_pending = true;
             perf_write ^= 1;
         }
+        if (getenv("SRT_DEBUG")) {
+            glMemoryBarrier(GL_ALL_BARRIER_BITS);
+            glFinish();
+            int fw2 = window.framebuffer_width(), fh2 = window.framebuffer_height();
+            std::vector<float> hb(size_t(fw2) * size_t(fh2));
+            void* ptr = hit_buf.map_range(0, hb.size() * 4, GL_MAP_READ_BIT);
+            if (ptr) { std::memcpy(hb.data(), ptr, hb.size() * 4); hit_buf.unmap(); }
+            uint32_t nmiss = 0, nnan = 0, nhit = 0; float tmin = 1e30, tmax = -1e30;
+            for (float t : hb) {
+                if (std::isnan(t)) ++nnan;
+                else if (t < 0.0f) ++nmiss;
+                else { ++nhit; tmin = std::min(tmin, t); tmax = std::max(tmax, t); }
+            }
+            printf("DBG hit_buf: nan=%u miss=%u hit=%u t=[%.3f..%.3f]\n", nnan, nmiss, nhit,
+                   nhit ? tmin : 0.f, nhit ? tmax : 0.f);
+            {
+                std::vector<uint32_t> rc(packed_total);
+                void* ptr2 = rdr_cut_all.map_range(0, rc.size() * 4, GL_MAP_READ_BIT);
+                if (ptr2) { std::memcpy(rc.data(), ptr2, rc.size() * 4); rdr_cut_all.unmap(); }
+                uint32_t zeros = 0, nones = 0, other = 0, first_zero = 0;
+                for (uint32_t i = 0; i < packed_total; ++i) {
+                    if (rc[i] == 0u) { if (!zeros) first_zero = i; ++zeros; }
+                    else if (rc[i] == 0xFFFFFFFFu) ++nones;
+                    else ++other;
+                }
+                printf("DBG rdr_cut: zeros=%u (first at %u) nones=%u other=%u\n", zeros, first_zero, nones, other);
+                std::vector<glm::vec4> rp2(size_t(packed_total) * 2u);
+                ptr2 = rdr_pn_all.map_range(0, rp2.size() * 16, GL_MAP_READ_BIT);
+                if (ptr2) { std::memcpy(rp2.data(), ptr2, rp2.size() * 16); rdr_pn_all.unmap(); }
+                uint32_t nanr = 0, zr = 0; uint32_t first_bad = 0;
+                for (uint32_t i = 0; i < packed_total; ++i) {
+                    glm::vec4 a = rp2[2 * i];
+                    if (std::isnan(a.x + a.y + a.z + a.w)) { if (!nanr) first_bad = i; ++nanr; }
+                    else if (a.x == 0.f && a.y == 0.f && a.z == 0.f && a.w == 0.f) { if (!zr) first_bad = i; ++zr; }
+                }
+                printf("DBG rdr_pn: nan=%u zero=%u (first bad at %u)\n", nanr, zr, first_bad);
+            }
+
+            // first non-empty comb cell + its rdr entries
+            std::vector<uint32_t> scv(size_t(cnt_total) * 2u);
+            ptr = left_sc_all.map_range(0, scv.size() * 4, GL_MAP_READ_BIT);
+            if (ptr) { std::memcpy(scv.data(), ptr, scv.size() * 4); left_sc_all.unmap(); }
+            for (uint32_t ci = 0; ci < cnt_total; ++ci) {
+                if (scv[2 * ci + 1] == 0) continue;
+                uint32_t st = scv[2 * ci], cnt = scv[2 * ci + 1];
+                printf("DBG first nonempty comb cell %u: start=%u count=%u\n", ci, st, cnt);
+                std::vector<float> rp(size_t(cnt) * 8);
+                ptr = rdr_pn_all.map_range(size_t(st) * 32, rp.size() * 4, GL_MAP_READ_BIT);
+                if (ptr) { std::memcpy(rp.data(), ptr, rp.size() * 4); rdr_pn_all.unmap(); }
+                for (uint32_t k = 0; k < cnt && k < 4; ++k)
+                    printf("DBG rdr entry %u: (%.3f %.3f %.3f r=%.4f | n=%.2f %.2f %.2f)\n", k,
+                           rp[k*8], rp[k*8+1], rp[k*8+2], rp[k*8+3], rp[k*8+4], rp[k*8+5], rp[k*8+6], rp[k*8+7]);
+                std::vector<uint32_t> rc(cnt);
+                ptr = rdr_cut_all.map_range(size_t(st) * 4, rc.size() * 4, GL_MAP_READ_BIT);
+                if (ptr) { std::memcpy(rc.data(), ptr, rc.size() * 4); rdr_cut_all.unmap(); }
+                printf("DBG rdr cuts[0..%u] =", std::min<uint32_t>(cnt, 6u) - 1u);
+                for (uint32_t k = 0; k < cnt && k < 6; ++k) printf(" %08x", rc[k]);
+                printf("\n");
+                break;
+            }
+        }
         t_ray.end();
         traced = true;
     };
@@ -2056,6 +2443,11 @@ int main() {
         if (scan_finish_prog.poll()) scan_finish_cs = scan_finish_prog.take_program();
         if (compact_prog.poll()) compact_cs = compact_prog.take_program();
         if (merge_prog.poll()) merge_cs = merge_prog.take_program();
+        if (mega_cluster_prog.poll()) mega_cluster_cs = mega_cluster_prog.take_program();
+        if (mega_scatter_prog.poll()) mega_scatter_cs = mega_scatter_prog.take_program();
+        if (mega_children_prog.poll()) mega_children_cs = mega_children_prog.take_program();
+        if (mega_finalize_prog.poll()) mega_finalize_cs = mega_finalize_prog.take_program();
+        if (mega_renderlist_prog.poll()) mega_renderlist_cs = mega_renderlist_prog.take_program();
         if (mark_prog.poll()) mark_cs = mark_prog.take_program();
         if (gather_prog.poll()) gather_cs = gather_prog.take_program();
         if (prepare_prog.poll()) prepare_cs = prepare_prog.take_program();
@@ -2422,6 +2814,16 @@ int main() {
             ImGui::Separator();
             ImGui::SliderInt("Mirror bounces", &max_bounces, 0, 3);
             ImGui::SliderFloat("Cylinder radius scale", &radius_scale, 0.5f, 2.0f);
+            ImGui::Checkbox("Render mega surfels", &render_mega);
+            static float last_mega_dot = mega_dot;
+            if (ImGui::SliderFloat("Mega merge dot", &mega_dot, 0.90f, 0.9995f, "%.4f")) {
+                if (mega_dot != last_mega_dot) {
+                    last_mega_dot = mega_dot;
+                    build_grid();
+                    refresh_occupied_cells();
+                }
+            }
+            if (!mega_ok) ImGui::TextWrapped("(mega hierarchy unavailable: cloud too large)");
 
             ImGui::Separator();
             ImGui::Text("GPU timings (ms)");

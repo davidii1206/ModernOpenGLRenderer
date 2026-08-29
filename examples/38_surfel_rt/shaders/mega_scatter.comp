@@ -1,0 +1,60 @@
+#version 460 core
+layout(local_size_x = 256) in;
+
+// Mega-surfel hierarchy, pass 3: one thread per fine surfel of the level.
+// Members of a merged cluster bump their mega's member count (children are
+// appended later, after a scan turns the counts into child bases). Leftover
+// surfels (cut-plane border rows + unmergeable singletons) are scattered into
+// the level's leftover index list — they keep being rendered as fine surfels
+// with their exact cuts when u_mega is on.
+layout(std430, binding = 0) readonly buffer SurfPos { vec4 surfel_pos[]; };
+layout(std430, binding = 3) readonly buffer LevelIdx { uint level_idx[]; };
+layout(std430, binding = 4) readonly buffer SurfelSlot { uint surfel_slot[]; };
+layout(std430, binding = 5) readonly buffer CellStart { uint cell_start[]; };
+layout(std430, binding = 22) readonly buffer MegaAssign { uint mega_assign[]; };
+layout(std430, binding = 23) readonly buffer MegaStart { uint mega_start[]; };
+layout(std430, binding = 28) readonly buffer MegaCount { uint mega_count[]; };
+layout(std430, binding = 24) readonly buffer CombStart { uint comb_start[]; };
+layout(std430, binding = 25) buffer CombCur { uint comb_cur[]; };
+layout(std430, binding = 26) buffer MegaCnt { uint mega_cnt[]; };
+layout(std430, binding = 27) writeonly buffer CombList { uint comb_list[]; };
+
+uniform vec3 u_grid_min;
+uniform float u_inv_cell;
+uniform ivec3 u_grid_res;
+uniform uint u_num;        // surfels in this level
+uniform uint u_cnt_off;    // cell segment of this level
+uniform uint u_start_off;  // original cell_start segment (fine packed lists)
+uniform uint u_packed_off; // packed/mega segment of this level
+uniform uint u_idx_off;    // level_idx segment of this level
+uniform uint u_mega_flag;  // 0x80000000: combined-list entry is a mega id
+
+uint cell_index(ivec3 c) {
+    return uint(c.x + u_grid_res.x * (c.y + u_grid_res.y * c.z));
+}
+
+void main() {
+    uint k = gl_GlobalInvocationID.x;
+    if (k >= u_num) return;
+    uint s = level_idx[u_idx_off + k];
+    vec3 p = surfel_pos[s].xyz;                        // original SoA (packed slot needs the cell first)
+    ivec3 c = clamp(ivec3(floor((p - u_grid_min) * u_inv_cell)), ivec3(0), u_grid_res - 1);
+    uint lci = cell_index(c);
+    uint ci = u_cnt_off + lci;
+    uint pi = u_packed_off + cell_start[u_start_off + lci] + surfel_slot[s];
+    if (mega_assign[pi] == 0xFFFFFFFFu) {
+        // Leftover fine surfel: inline packed index, after the cell's megas.
+        uint slot = atomicAdd(comb_cur[ci], 1u);
+        comb_list[u_packed_off + comb_start[ci] + mega_count[ci] + slot] = pi;
+    } else {
+        uint mega = u_packed_off + mega_start[ci] + mega_assign[pi];
+        atomicAdd(mega_cnt[mega], 1u);
+    }
+    // The cell's first surfel (slot 0) also fills the flagged mega entries
+    // (ids are known once the mega-base scan has run).
+    if (surfel_slot[s] == 0u) {
+        uint base = u_packed_off + comb_start[ci];
+        for (uint j = 0u; j < mega_count[ci]; ++j)
+            comb_list[base + j] = (u_packed_off + mega_start[ci] + j) | u_mega_flag;
+    }
+}

@@ -55,6 +55,17 @@ layout(std430, binding = 9) readonly buffer PackedAlb { vec4 packed_alb[]; }; //
 // skips empty cells in the 27-cell windows and the 5x5x5 gather.
 layout(std430, binding = 11) readonly buffer CellMask { uint cell_mask[]; };
 
+// Mega-surfel hierarchy (u_mega): the per-cell COMBINED RENDER LIST as
+// contiguous SoA — merged mega records first, then leftover fine surfels
+// (border rows) — materialized by mega_renderlist.comp. Same direct-load
+// structure as the fine lists (cut reference inline, 0xFFFFFFFF = none),
+// just fewer entries where surfels merged.
+layout(std430, binding = 16) readonly buffer RdrPN { vec4 rdr_pn[]; };   // 2i pos+r, 2i+1 nrm
+layout(std430, binding = 17) readonly buffer RdrAlb { vec4 rdr_alb[]; }; // (unused by traversal)
+layout(std430, binding = 18) readonly buffer CombSC { uvec2 comb_sc[]; };
+layout(std430, binding = 21) readonly buffer RdrCut { uint rdr_cut[]; };
+uniform int u_mega;       // 0 = fine lists, 1 = combined render lists
+
 // Ray streams (2 vec4 per ray: [px_packed, ro.xyz], [rd.xyz, 0]). Bounce k
 // reads its stream (written by the mark kernel for k=0, by the previous trace
 // dispatch otherwise) and appends surviving mirror hits to the next one.
@@ -136,35 +147,62 @@ bool cell_occupied(int l, uint ci) {
     return (cell_mask[u_l_mask_off[l] + (ci >> 5)] >> (ci & 31u)) != 0u;
 }
 
+// Test one fine candidate (packed index): plane, radius, then edge cut. The
+// original surfel index is only needed for the cut planes, so the packed_idx
+// indirection load happens only for candidates that pass the radius.
+void scan_fine_pi(uint pi, vec3 o, vec3 d, float t_near, float t_far, float r_mul,
+                  inout float best_t, inout bool found) {
+    vec4 pc = packed_pn[2u * pi];
+    PERF_ADD(4, 1);
+    float ht;
+    if (!plane_hit(pc.xyz, packed_pn[2u * pi + 1u].xyz, o, d, t_near, t_far, ht)) return;
+    if (ht >= best_t) return;
+    float r = pc.w * u_radius_scale * r_mul;
+    vec3 p = o + ht * d;
+    if (dot(p - pc.xyz, p - pc.xyz) > r * r) return;
+    if (cut_rejects(int(packed_idx[pi]), p)) return;
+    best_t = ht;
+    found = true;
+}
+
 // Scan one cell's surfels (cell-sorted contiguous data). The window callers
 // pass t_far already min-clamped against the current best hit, so disks that
 // cannot win are rejected by the cheap plane test; the ht >= best_t check
 // covers further improvements while the cell is being scanned.
+// u_mega: merged representatives first (no cut planes — clusters never span
+// edges), then the cell's leftover fine surfels (border rows, exact cuts).
 void scan_cell(int l, ivec3 nc, vec3 o, vec3 d, float t_near, float t_far, float r_mul,
                inout float best_t, inout bool found) {
     if (!l_in_bounds(l, nc)) return;
     uint nci = l_cell_index(l, nc);
     if (!cell_occupied(l, nci)) return;
     PERF_ADD(3, 1);
+    if (u_mega != 0) {
+        uvec2 cs = comb_sc[u_l_cnt_off[l] + nci];
+        uint base = u_l_packed_off[l] + cs.x;
+        for (uint k = 0; k < cs.y; ++k) {
+            uint di = base + k;
+            vec4 pc = rdr_pn[2u * di];
+            PERF_ADD(4, 1);
+            float ht;
+            if (!plane_hit(pc.xyz, rdr_pn[2u * di + 1u].xyz, o, d, t_near, t_far, ht)) continue;
+            if (ht >= best_t) continue;
+            float r = pc.w * u_radius_scale * r_mul;
+            vec3 p = o + ht * d;
+            if (dot(p - pc.xyz, p - pc.xyz) > r * r) continue;
+            // Cut reference inline: merged records carry none (clusters never
+            // span edges), leftover fine surfels keep their exact cuts.
+            uint cr = rdr_cut[di];
+            if (cr != 0xFFFFFFFFu && cut_rejects(int(cr), p)) continue;
+            best_t = ht;
+            found = true;
+        }
+        return;
+    }
     uvec2 sc = cell_sc[u_l_cnt_off[l] + nci];
     uint pbase = u_l_packed_off[l] + sc.x;
-    for (uint k = 0; k < sc.y; ++k) {
-        uint pi = pbase + k;
-        vec4 pc = packed_pn[2u * pi];
-        PERF_ADD(4, 1);
-        float ht;
-        if (!plane_hit(pc.xyz, packed_pn[2u * pi + 1u].xyz, o, d, t_near, t_far, ht)) continue;
-        if (ht >= best_t) continue;
-        // Radius test (squared distance, no sqrt), then edge cut. The original
-        // surfel index is only needed for the cut planes, so the packed_idx
-        // indirection load happens only for candidates that pass the radius.
-        float r = pc.w * u_radius_scale * r_mul;
-        vec3 p = o + ht * d;
-        if (dot(p - pc.xyz, p - pc.xyz) > r * r) continue;
-        if (cut_rejects(int(packed_idx[pi]), p)) continue;
-        best_t = ht;
-        found = true;
-    }
+    for (uint k = 0; k < sc.y; ++k)
+        scan_fine_pi(pbase + k, o, d, t_near, t_far, r_mul, best_t, found);
 }
 
 // Full 3x3x3 neighborhood hit scan at level l around cell ic (entry windows).

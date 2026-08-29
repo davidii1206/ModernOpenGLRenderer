@@ -1,0 +1,54 @@
+#version 460 core
+layout(local_size_x = 256) in;
+
+// Mega-surfel hierarchy, final pass: materialize the per-cell COMBINED RENDER
+// LIST as contiguous SoA — merged mega records first, then the cell's
+// leftover fine surfels. The traversal kernel's u_mega path reads this list
+// exactly like the fine path (direct contiguous pos/nrm loads, cut reference
+// inline): no per-candidate index indirection, just fewer entries where
+// surfels merged. One thread per cell; per-cell entry counts are small.
+layout(std430, binding = 3) readonly buffer CellSC { uvec2 cell_sc[]; };
+layout(std430, binding = 5) readonly buffer PackedIdx { uint packed_idx[]; };
+layout(std430, binding = 8) readonly buffer PackedPN { vec4 packed_pn[]; };
+layout(std430, binding = 9) readonly buffer PackedAlb { vec4 packed_alb[]; };
+layout(std430, binding = 16) readonly buffer MegaPN { vec4 mega_pn[]; };
+layout(std430, binding = 17) readonly buffer MegaAlb { vec4 mega_alb[]; };
+layout(std430, binding = 19) readonly buffer CombOrder { uint comb_order[]; }; // build temp
+layout(std430, binding = 23) readonly buffer MegaStart { uint mega_start[]; };
+layout(std430, binding = 24) readonly buffer CombSC { uvec2 comb_sc2[]; };      // left_sc: (combined start, combined count)
+layout(std430, binding = 34) writeonly buffer RdrPN { vec4 rdr_pn[]; };       // 2i pos+r, 2i+1 nrm
+layout(std430, binding = 35) writeonly buffer RdrAlb { vec4 rdr_alb[]; };
+layout(std430, binding = 36) writeonly buffer RdrCut { uint rdr_cut[]; };     // packed_idx or 0xFFFFFFFF
+
+uniform vec3 u_grid_min;
+uniform float u_inv_cell;
+uniform ivec3 u_grid_res;
+uniform uint u_cnt_off;    // cell segment of this level
+uniform uint u_packed_off; // packed/mega/render-list segment of this level
+uniform uint u_mega_flag;
+
+void main() {
+    uint lci = gl_GlobalInvocationID.x;
+    uint volume = uint(u_grid_res.x) * uint(u_grid_res.y) * uint(u_grid_res.z);
+    if (lci >= volume) return;
+    uint ci = u_cnt_off + lci;
+    uvec2 cc = comb_sc2[ci];   // combined start + count (clusters + leftovers)
+    if (cc.y == 0u) return;
+    uint base = u_packed_off + cc.x;
+    for (uint k = 0u; k < cc.y; ++k) {
+        uint dst = base + k;
+        uint e = comb_order[dst];
+        if ((e & u_mega_flag) != 0u) {
+            uint mi = e & ~u_mega_flag;
+            rdr_pn[2u * dst] = mega_pn[2u * mi];
+            rdr_pn[2u * dst + 1u] = mega_pn[2u * mi + 1u];
+            rdr_alb[dst] = mega_alb[mi];
+            rdr_cut[dst] = 0xFFFFFFFFu;          // megas carry no cuts
+        } else {
+            rdr_pn[2u * dst] = packed_pn[2u * e];
+            rdr_pn[2u * dst + 1u] = packed_pn[2u * e + 1u];
+            rdr_alb[dst] = packed_alb[e];
+            rdr_cut[dst] = packed_idx[e];
+        }
+    }
+}

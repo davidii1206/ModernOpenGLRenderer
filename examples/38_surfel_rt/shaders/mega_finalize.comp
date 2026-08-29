@@ -1,0 +1,54 @@
+#version 460 core
+layout(local_size_x = 256) in;
+
+// Mega-surfel hierarchy, pass 6: one thread per mega slot of the level's
+// segment (empty slots have count 0 and stay untouched). Reduces the mega's
+// children into the merged representative: center_pt, average normal and
+// albedo, and the covering radius max_j(|p_j - center_pt| + r_j) — which the
+// cluster join rule already bounds by u_cap, so the mega disk covers every
+// child disk and the cell >= 2r traversal invariant holds. Also stores the
+// child range (base, count) into the level's fine packed list — the entry
+// point for a later gather/traversal extension.
+layout(std430, binding = 8) readonly buffer PackedPN { vec4 packed_pn[]; };
+layout(std430, binding = 9) readonly buffer PackedAlb { vec4 packed_alb[]; };
+layout(std430, binding = 28) readonly buffer MegaCnt { uint mega_cnt[]; };
+layout(std430, binding = 29) readonly buffer ChildBase { uint child_base[]; };
+layout(std430, binding = 30) readonly buffer Children { uint children[]; };
+layout(std430, binding = 31) writeonly buffer MegaPN { vec4 mega_pn[]; };
+layout(std430, binding = 32) writeonly buffer MegaAlb { vec4 mega_alb[]; };
+layout(std430, binding = 33) writeonly buffer MegaMeta { uvec2 mega_meta[]; };
+
+uniform uint u_num;        // fine surfels in this level (segment length)
+uniform uint u_packed_off; // packed/mega segment of this level
+uniform float u_cap;       // max merged radius (level max fine radius)
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= u_num) return;
+    uint m = u_packed_off + gid;
+    uint cnt = mega_cnt[m];
+    if (cnt == 0u) return;
+    uint cb = u_packed_off + child_base[m];
+
+    vec3 psum = vec3(0.0), nsum = vec3(0.0), asum = vec3(0.0);
+    for (uint k = 0u; k < cnt; ++k) {
+        uint pi = children[cb + k];
+        psum += packed_pn[2u * pi].xyz;
+        nsum += packed_pn[2u * pi + 1u].xyz;
+        asum += packed_alb[pi].rgb;
+    }
+    vec3 center_pt = psum / float(cnt);
+    float radius = 0.0;
+    for (uint k = 0u; k < cnt; ++k) {
+        uint pi = children[cb + k];
+        vec4 pc = packed_pn[2u * pi];
+        radius = max(radius, length(pc.xyz - center_pt) + pc.w);
+    }
+    radius = min(radius, u_cap);
+    float mirror = packed_alb[children[cb]].w;   // clusters never mix flags
+
+    mega_pn[2u * m] = vec4(center_pt, radius);
+    mega_pn[2u * m + 1u] = vec4(normalize(nsum), 0.0);
+    mega_alb[m] = vec4(asum / float(cnt), mirror);
+    mega_meta[m] = uvec2(child_base[m], cnt);
+}

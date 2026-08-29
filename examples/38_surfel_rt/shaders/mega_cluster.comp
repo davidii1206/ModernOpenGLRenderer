@@ -1,0 +1,86 @@
+#version 460 core
+layout(local_size_x = 256) in;
+
+// Mega-surfel hierarchy, pass 1: greedy per-cell clustering. One thread per
+// cell. A fine surfel joins the first cluster whose representative normal is
+// close (dot >= u_mega_dot), whose mirror flag matches, and whose distance
+// keeps the merged radius under u_cap (join rule |p - p_rep| + r <= cap
+// guarantees, via the triangle inequality, that the final centroid radius
+// max_j(|p_j - centroid| + r_j) never exceeds the cap — the mega disk then
+// provably covers all its children, and the cell >= 2r traversal invariant
+// survives since cap is the level's max fine radius). Surfels with cut planes
+// (mesh border rows) never merge — edges stay rendered by fine surfels with
+// exact cuts. Overlong cell lists skip clustering entirely (everything
+// becomes leftover) so worst-case registers stay bounded.
+// Output: per-surfel local cluster id (0xFFFFFFFF = leftover) + per-cell
+// cluster counts (mega id space) and COMBINED render counts (clusters +
+// leftovers — the runtime scans one merged list per cell: mega entries
+// flagged 0x80000000, then inline packed fine indices).
+layout(std430, binding = 3) readonly buffer CellSC { uvec2 cell_sc[]; };
+layout(std430, binding = 5) readonly buffer PackedIdx { uint packed_idx[]; };
+layout(std430, binding = 6) readonly buffer SurfCut { vec4 surfel_cut[]; };
+layout(std430, binding = 8) readonly buffer PackedPN { vec4 packed_pn[]; };
+layout(std430, binding = 9) readonly buffer PackedAlb { vec4 packed_alb[]; };
+layout(std430, binding = 22) writeonly buffer MegaAssign { uint mega_assign[]; };
+layout(std430, binding = 23) buffer MegaCount { uint mega_count[]; };
+layout(std430, binding = 24) buffer CombCount { uint comb_count[]; };   // clusters + leftovers
+
+uniform vec3 u_grid_min;
+uniform float u_inv_cell;
+uniform ivec3 u_grid_res;
+uniform uint u_cnt_off;    // cell segment of this level (mega/leftover counts)
+uniform uint u_packed_off; // packed/mega segment of this level
+uniform float u_mega_dot;
+uniform float u_cap;       // max merged radius (level max fine radius)
+
+const uint kMaxClusters = 16u;
+const uint kMaxCellSurfels = 32u;
+
+void main() {
+    uint ci = gl_GlobalInvocationID.x;
+    if (ci >= uint(u_grid_res.x) * uint(u_grid_res.y) * uint(u_grid_res.z)) return;
+    uvec2 sc = cell_sc[u_cnt_off + ci];
+
+    uint nclusters = 0u;
+    uint nleft = 0u;
+    vec3 crep[16];
+    vec3 nrep[16];
+    float mrep[16];
+    if (sc.y <= kMaxCellSurfels) {
+        for (uint k = 0u; k < sc.y; ++k) {
+            uint pi = u_packed_off + sc.x + k;
+            vec4 pc = packed_pn[2u * pi];
+            vec4 pn = packed_pn[2u * pi + 1u];
+            vec4 pa = packed_alb[pi];
+            uint s = packed_idx[pi];
+            bool has_cut = any(notEqual(surfel_cut[s * 12u].xyz, vec3(0.0)));
+            bool placed = false;
+            if (!has_cut) {
+                for (uint c = 0u; c < nclusters && !placed; ++c) {
+                    if (mrep[c] != pa.w) continue;                       // other mirror flag
+                    if (dot(pn.xyz, nrep[c]) < u_mega_dot) continue;     // normals deviate
+                    if (length(pc.xyz - crep[c]) + pc.w > u_cap) continue;
+                    mega_assign[pi] = c;
+                    placed = true;
+                }
+                if (!placed && nclusters < kMaxClusters) {
+                    crep[nclusters] = pc.xyz;
+                    nrep[nclusters] = pn.xyz;
+                    mrep[nclusters] = pa.w;
+                    mega_assign[pi] = nclusters;
+                    ++nclusters;
+                    placed = true;
+                }
+            }
+            if (!placed) {
+                mega_assign[pi] = 0xFFFFFFFFu;
+                ++nleft;
+            }
+        }
+    } else {
+        for (uint k = 0u; k < sc.y; ++k) mega_assign[u_packed_off + sc.x + k] = 0xFFFFFFFFu;
+        nleft = sc.y;
+    }
+    mega_count[u_cnt_off + ci] = nclusters;
+    comb_count[u_cnt_off + ci] = nclusters + nleft;
+}
