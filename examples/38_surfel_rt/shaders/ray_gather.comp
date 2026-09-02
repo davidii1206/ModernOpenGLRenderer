@@ -2,15 +2,25 @@
 #extension GL_ARB_shader_clock : enable
 layout(local_size_x = 128) in;
 
+// Ray stream for this bounce + counts + the traversal kernel's hit buffer.
 // Mirror-ray reconstruction kernel: runs after the traversal kernel for the
 // same bounce dispatch. Reads each ray's best-hit parameter, reconstructs the
 // surface (paper §4.2, Eq. 1) from the surrounding surfels, shades, and
 // accumulates the contribution into the RGBA32F image (one ray per pixel per
-// bounce: no races). Surviving mirror hits are appended to the next bounce's
-// stream here, so every dispatch has uniform full warps.
+// bounce: no races). Survivors of the next bounce are STAGED at the ray's
+// slot with a survivor flag; the bounce scan (run_scan on the flag buffer)
+// plus ray_scatter_bounce.comp compact them into the next stream IN RAY
+// ORDER — warps keep adjacent pixels' rays and stay coherent (the old
+// atomicAdd append shuffled survivors arbitrarily). Every slot < count is
+// written every frame, so the flag buffer never needs clearing.
 // Splitting traversal and reconstruction into two kernels keeps both lean:
 // lower register pressure -> higher occupancy for the latency-bound parts.
 layout(binding = 3, rgba32f) uniform image2D u_accum;
+
+// Stage buffer: stores new-ray payloads from gather; compacted by bounce scan.
+layout(std430, binding = 14) writeonly buffer StreamStage { vec4 stream_stage[]; };
+// Survivor flag per ray slot; read by run_scan + ray_scatter_bounce.comp.
+layout(std430, binding = 19) writeonly buffer RayFlag { uint ray_flag[]; };
 
 // Grid + surfel data (same bindings as the traversal kernel).
 layout(std430, binding = 3) readonly buffer CellSC { uvec2 cell_sc[]; };
@@ -19,6 +29,8 @@ layout(std430, binding = 6) readonly buffer SurfCut { vec4 surfel_cut[]; };
 layout(std430, binding = 8) readonly buffer PackedPN { vec4 packed_pn[]; };   // 2i pos xyz+r, 2i+1 nrm
 layout(std430, binding = 9) readonly buffer PackedAlb { vec4 packed_alb[]; }; // rgb, w = mirror
 layout(std430, binding = 11) readonly buffer CellMask { uint cell_mask[]; };
+// Baked radiance cache: mirror hits shade by the hit surface's radiance.
+layout(std430, binding = 39) readonly buffer SurfRad { vec4 surf_rad[]; };
 
 // The reconstruction always gathers FINE surfels: the (r - d_i) weighting
 // needs the local detail set, and merged disks would widen the blend window
@@ -46,14 +58,11 @@ uniform uint  u_l_num[kLevels];
 uniform float u_l_max_r[kLevels];
 uniform int   u_levels;
 
-uniform vec3 u_light_pos;
-uniform vec3 u_light_color;
-uniform float u_light_intensity;
 uniform int u_max_bounces;
 uniform int u_bounce;              // which bounce this dispatch processes
 uniform float u_radius_scale;      // multiplies each surfel's stored radius
-uniform float u_ambient;
 uniform float u_far;
+uniform int u_no_light;            // 1 = skip radiance cache lighting
 
 shared uint lperf[10];
 #define PERF_ADD(i, v) if (u_perf != 0) atomicAdd(lperf[i], uint(v))
@@ -88,19 +97,11 @@ struct Hit {
     vec3 pos;
     vec3 nrm;
     vec3 alb;
+    vec3 rad;      // outgoing radiance of the hit surface (radiance cache)
     float t;
     bool is_mirror;
 };
 
-vec3 shade(vec3 alb, vec3 n, vec3 pos) {
-    vec3 to_light = u_light_pos - pos;
-    float dist2 = dot(to_light, to_light);
-    float dist = sqrt(dist2);
-    vec3 L = to_light / max(dist, 1e-5);
-    float ndl = max(dot(n, L), 0.0);
-    return alb * (u_light_color * u_light_intensity) * ndl / max(dist2, 1e-4)
-         + alb * u_ambient;
-}
 
 // Surface reconstruction for the hit at best_t (paper §4.2, Eq. 1). Collect
 // surfels whose tangent-plane disk distance d_i is < r (distance measured IN
@@ -118,7 +119,7 @@ bool reconstruct(vec3 o, vec3 d, float t_near, float t_far, float best_t, out Hi
     uint recon0 = 0;
     if (u_perf != 0) recon0 = clock2x32ARB().x;
     vec3 hit_pos = o + d * best_t;
-    vec3 acc_nrm = vec3(0.0), acc_alb = vec3(0.0);
+    vec3 acc_nrm = vec3(0.0), acc_alb = vec3(0.0), acc_rad = vec3(0.0);
     float acc_t = 0.0;
     float wsum = 0.0;
     bool mirror = false;
@@ -126,6 +127,7 @@ bool reconstruct(vec3 o, vec3 d, float t_near, float t_far, float best_t, out Hi
     nearest.t = 1e30;
     nearest.nrm = vec3(0.0, 1.0, 0.0);
     nearest.alb = vec3(0.8);
+    vec3 nearest_rad = vec3(0.0);
 
     for (int l = 0; l < u_levels; ++l) {
         if (u_l_num[l] == 0u) continue;
@@ -181,6 +183,7 @@ bool reconstruct(vec3 o, vec3 d, float t_near, float t_far, float best_t, out Hi
                 acc_t += t_i * wgt;
                 acc_nrm += n * wgt;
                 acc_alb += packed_alb[pi].rgb * wgt;
+                if (u_no_light == 0) acc_rad += surf_rad[pi].rgb * wgt;
                 wsum += wgt;
                 mirror = mirror || packed_alb[pi].w > 0.5;
 
@@ -188,6 +191,7 @@ bool reconstruct(vec3 o, vec3 d, float t_near, float t_far, float best_t, out Hi
                     nearest.t = t_i;
                     nearest.nrm = n;
                     nearest.alb = packed_alb[pi].rgb;
+                    nearest_rad = u_no_light == 0 ? surf_rad[pi].rgb : vec3(0.0);
                 }
             }
         }
@@ -197,10 +201,12 @@ bool reconstruct(vec3 o, vec3 d, float t_near, float t_far, float best_t, out Hi
         hit.pos = o + d * (acc_t / wsum);
         hit.nrm = normalize(acc_nrm / wsum);
         hit.alb = acc_alb / wsum;
+        hit.rad = acc_rad / max(wsum, 1e-3);
     } else {
         hit.pos = hit_pos;
         hit.nrm = nearest.nrm;
         hit.alb = nearest.alb;
+        hit.rad = nearest_rad;
     }
     hit.t = best_t;
     hit.is_mirror = mirror;
@@ -217,6 +223,7 @@ void main() {
 
     uint rid = gl_GlobalInvocationID.x;
     if (rid < counts[u_bounce]) {
+        ray_flag[rid] = 0u;  // default: not a survivor, cleared every frame
         float best_t = hit_buf[rid];
         if (best_t > 0.0) {
             vec4 e0 = stream_in[2u * rid];
@@ -229,23 +236,13 @@ void main() {
             Hit hit;
             reconstruct(ro, rd, 1e-3, u_far, best_t, hit);
 
-            uint t_shade0 = 0;
-            if (u_perf != 0) t_shade0 = clock2x32ARB().x;
-            vec3 c = shade(hit.alb, hit.nrm, hit.pos);
-            PERF_CYC(9, t_shade0);
-            // Accumulate this bounce's contribution (each pixel belongs to
-            // exactly one ray per bounce: no races). fp32 adds in the same
-            // order as the old in-thread loop; display rounds to half float.
-            imageStore(u_accum, px, imageLoad(u_accum, px) + vec4(c, 0.0));
-
-            if (hit.is_mirror && u_bounce + 1 < u_max_bounces) {
-                // Paper §5 origin pad: fixed constant, see ray_mark.comp.
+            bool survive = hit.is_mirror && (u_bounce + 1 < u_max_bounces);
+            ray_flag[rid] = survive ? 1u : 0u;
+            if (survive) {
                 vec3 nro = hit.pos + hit.nrm * 0.02;
                 vec3 nrd = reflect(rd, hit.nrm);
-                uint ni = atomicAdd(counts[uint(u_bounce) + 1u], 1u);
-                stream_out[2u * ni] = vec4(uintBitsToFloat(
-                                               uint(px.x) | (uint(px.y) << 16)), nro);
-                stream_out[2u * ni + 1u] = vec4(nrd, 0.0);
+                stream_stage[2u * rid] = vec4(uintBitsToFloat(uint(px.x) | (uint(px.y) << 16)), nro);
+                stream_stage[2u * rid + 1u] = vec4(nrd, 0.0);
             }
         }
     }

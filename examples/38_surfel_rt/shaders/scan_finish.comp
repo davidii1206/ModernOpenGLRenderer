@@ -3,14 +3,18 @@ layout(local_size_x = 256) in;
 
 // Pass 2c: add each block's exclusive offset to the block-local prefix,
 // yielding the global exclusive prefix sum cell_start.
+// u_n_from_buf: see scan_block.comp (GPU-sized indirect ray-flag scans).
 layout(std430, binding = 0) buffer CellStart { uint cell_start[]; };
 layout(std430, binding = 1) readonly buffer BlockSum { uint bsum[]; };
+layout(std430, binding = 3) readonly buffer NVal { uint nval[]; };   // bound only when u_n_from_buf
 
-uniform uint u_n;          // this level's grid volume
+uniform uint u_n;          // element count (ignored when u_n_from_buf)
 uniform uint u_start_off;  // cell_start segment offset
+uniform int  u_n_from_buf; // 1 = n = nval[0]
 
 void main() {
     uint gid = gl_GlobalInvocationID.x;
     uint bid = gl_WorkGroupID.x;
-    if (gid < u_n) cell_start[u_start_off + gid] += bsum[bid];
+    uint n = (u_n_from_buf != 0) ? nval[0] : u_n;
+    if (gid < n) cell_start[u_start_off + gid] += bsum[bid];
 }

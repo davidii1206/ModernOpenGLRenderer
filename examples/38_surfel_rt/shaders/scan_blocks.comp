@@ -1,20 +1,42 @@
 #version 460 core
 layout(local_size_x = 1024) in;
 
-// Pass 2b: exclusive prefix sum of the block sums (single workgroup; requires
-// u_nblocks <= 1024, enforced on the host). Result stored back into bsum as
-// exclusive block offsets.
+// Pass 2b: exclusive prefix sum of the block sums (single workgroup).
+// Scales to u_nblocks <= kMaxPer * 1024 = 65536 blocks (16.7M elements):
+// each thread serially scans its slice of block sums, the 1024 thread
+// totals are scanned in shared memory, then the slices are written back as
+// exclusive block offsets (slice values re-read from L1 instead of holding
+// a register array). Slots the scan_block dispatch never wrote must read 0
+// for this to be correct with a CPU-side upper bound of u_nblocks: run_scan
+// clears block_sum_buf before every scan.
+//
+// Optional grand-total write (u_total_write): the ray-stream compaction
+// reuses this scan to produce the NEXT BOUNCE'S ray count (ray_bounce_cmd
+// -> scan -> ray_scatter_bounce), so counts[] never touches the CPU.
+// tot[u_total_off] = sum of ALL bsum[0..u_nblocks).
 layout(std430, binding = 0) buffer BlockSum { uint bsum[]; };
+layout(std430, binding = 1) buffer TotBuf { uint tot[]; };   // bound only when u_total_write
 
 uniform uint u_nblocks;
+uniform int  u_total_write;   // 0 = off
+uniform uint u_total_off;
+
+const uint kMaxPer = 64u;     // max blocks per thread (u_nblocks <= 65536)
 
 shared uint s[1024];
 
 void main() {
     uint lid = gl_LocalInvocationID.x;
-    s[lid] = (lid < u_nblocks) ? bsum[lid] : 0u;
+    uint lo = lid * kMaxPer;
+    uint cnt = (u_nblocks > lo) ? min(u_nblocks - lo, kMaxPer) : 0u;
+
+    // Serial in-thread total of this thread's slice (registers only).
+    uint acc = 0u;
+    for (uint j = 0u; j < cnt; ++j) acc += bsum[lo + j];
+    s[lid] = acc;
     barrier();
 
+    // Inclusive scan of the 1024 thread totals.
     for (uint stride = 1u; stride < 1024u; stride <<= 1u) {
         uint v = 0u;
         if (lid >= stride) v = s[lid - stride];
@@ -22,7 +44,17 @@ void main() {
         s[lid] += v;
         barrier();
     }
+    uint tbase = (lid == 0u) ? 0u : s[lid - 1u];
 
-    uint excl = (lid == 0u) ? 0u : s[lid - 1u];
-    if (lid < u_nblocks) bsum[lid] = excl;
+    // Write back exclusive block offsets (slice re-read is L1-hot).
+    uint run = tbase;
+    for (uint j = 0u; j < cnt; ++j) {
+        uint v = bsum[lo + j];
+        bsum[lo + j] = run;
+        run += v;
+    }
+
+    // Grand total: the last slot of the inclusive scan (threads without
+    // blocks contribute 0). One thread, after s[] is final.
+    if (u_total_write != 0 && lid == 1023u) tot[u_total_off] = s[1023u];
 }

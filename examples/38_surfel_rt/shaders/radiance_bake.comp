@@ -1,0 +1,168 @@
+#version 460 core
+layout(local_size_x = 256) in;
+
+// Radiance cache bake: one thread per cell, baking every entry of the
+// combined render list (megas + leftover fines) into the radiance cache.
+// Each entry's outgoing radiance = its emissive term + albedo x the direct
+// light it gathers FROM THE EMISSIVE SURFELS through 5 cosine-weighted cones
+// (VCT-style: fixed steps, level by footprint, occupancy transmittance).
+// The gather reads the EMISSIVE snapshot (surf_emissive/mega_emis), not the
+// cache being written, so the bake is order-independent and equals
+// "direct light + one emissive bounce" — the indirect term of the final
+// composite comes from the pixel cones reading this cache.
+layout(std430, binding = 3) readonly buffer CellSC { uvec2 cell_sc[]; };
+layout(std430, binding = 18) readonly buffer CombSC { uvec2 comb_sc[]; };
+layout(std430, binding = 19) readonly buffer CombList { uint comb_list[]; };
+layout(std430, binding = 5) readonly buffer PackedIdx { uint packed_idx[]; };
+layout(std430, binding = 11) readonly buffer CellMask { uint cell_mask[]; };
+layout(std430, binding = 16) readonly buffer RdrPN { vec4 rdr_pn[]; };   // 2i pos+r, 2i+1 nrm
+layout(std430, binding = 17) readonly buffer RdrAlb { vec4 rdr_alb[]; }; // rgb albedo
+layout(std430, binding = 37) readonly buffer SurfEmis { vec4 surf_emis[]; }; // per fine surfel
+layout(std430, binding = 38) readonly buffer MegaEmis { vec4 mega_emis[]; }; // per mega
+layout(std430, binding = 39) writeonly buffer SurfRad { vec4 surf_rad[]; };  // per fine surfel
+layout(std430, binding = 40) writeonly buffer MegaRad { vec4 mega_rad[]; };  // per mega
+
+uniform vec3  u_grid_min;
+uniform float u_inv_cell;
+uniform ivec3 u_grid_res;
+uniform vec3  u_l_min[4];
+uniform float u_l_inv_cell[4];
+uniform ivec3 u_l_res[4];
+uniform uint  u_l_cnt_off[4];
+uniform uint  u_l_packed_off[4];
+uniform uint  u_l_mask_off[4];
+uniform uint  u_l_num[4];
+uniform int   u_levels;
+uniform uint  u_cnt_off;
+uniform uint  u_packed_off;
+uniform uint  u_mega_flag;
+uniform float u_strength;   // emissive strength multiplier
+uniform float u_max_t;      // cone march length (scene diagonal)
+
+#define kConeLevels 4
+
+bool l_in_bounds(int l, ivec3 c) {
+    return c.x >= 0 && c.y >= 0 && c.z >= 0 &&
+           c.x < u_l_res[l].x && c.y < u_l_res[l].y && c.z < u_l_res[l].z;
+}
+
+bool cell_occupied(int l, uint ci) {
+    return (cell_mask[u_l_mask_off[l] + (ci >> 5)] >> (ci & 31u)) != 0u;
+}
+
+// Gather direct emissive radiance at pos along one cone. src = emissive
+// snapshot; occupancy from disk-vs-cone-cross-section coverage with
+// transmittance (soft shadows fall out of this term).
+vec4 cone_march(vec3 pos, vec3 dir, float tan_half, float r0) {
+    vec3 rad = vec3(0.0);
+    float T = 1.0;
+    float t = r0 * 2.0;
+    for (int s = 0; s < 64 && t < u_max_t && T > 0.02; ++s) {
+        float R = max(r0, t * tan_half) + r0;
+        vec3 p = pos + dir * (t + R);
+        int l = -1;
+        for (int li = kConeLevels - 1; li >= 0; --li) {
+            if (u_l_num[li] == 0u) continue;
+            float cell = 1.0 / u_l_inv_cell[li];
+            if (cell < R) continue;
+            vec3 g = (p - u_l_min[li]) * u_l_inv_cell[li];
+            if (any(lessThan(g, vec3(0.0))) || any(greaterThanEqual(g, vec3(u_l_res[li])))) continue;
+            l = li;
+            break;
+        }
+        if (l < 0 && u_l_num[0] != 0u) {
+            vec3 g0 = (p - u_l_min[0]) * u_l_inv_cell[0];
+            bool inside0 = !any(lessThan(g0, vec3(0.0))) && !any(greaterThanEqual(g0, vec3(u_l_res[0])));
+            if (inside0) l = 0;
+        }
+        if (l < 0) { t += R; continue; }
+        float cell = 1.0 / u_l_inv_cell[l];
+        ivec3 ic = clamp(ivec3(floor((p - u_l_min[l]) * u_l_inv_cell[l])), ivec3(0), u_l_res[l] - 1);
+        float Rs = min(R, 4.0 * cell);
+        int lat = int(min(ceil(Rs / cell - 0.5), 4.0));
+        uint off = u_l_cnt_off[l], poff = u_l_packed_off[l];
+        for (int dz = -lat; dz <= lat; ++dz)
+        for (int dy = -lat; dy <= lat; ++dy)
+        for (int dx = -lat; dx <= lat; ++dx) {
+            ivec3 lc = ic + ivec3(dx, dy, dz);
+            if (!l_in_bounds(l, lc)) continue;
+            uint ci = uint(lc.x + u_l_res[l].x * (lc.y + u_l_res[l].y * lc.z));
+            if (!cell_occupied(l, ci)) continue;
+            uvec2 csc = comb_sc[off + ci];
+            uint cb = poff + csc.x;
+            for (uint k = 0u; k < csc.y; ++k) {
+                uint e = comb_list[cb + k];
+                vec4 pc;
+                vec4 rn;
+                vec3 sr;
+                if ((e & u_mega_flag) != 0u) {
+                    uint mi = e & ~u_mega_flag;
+                    pc = rdr_pn[2u * mi];
+                    rn = rdr_pn[2u * mi + 1u];
+                    sr = mega_emis[mi].rgb * u_strength;
+                } else {
+                    uint pi = e;
+                    pc = rdr_pn[2u * pi];
+                    rn = rdr_pn[2u * pi + 1u];
+                    sr = surf_emis[packed_idx[pi]].rgb * u_strength;
+                }
+                float facing = clamp(dot(rn.xyz, -dir), 0.0, 1.0);
+                float rr = pc.w / max(Rs, 1e-4);
+                float cov = min(1.0, rr * rr) * facing;
+                rad += sr * cov * T;
+                T *= (1.0 - min(1.0, rr * rr));
+            }
+        }
+        t += max(cell, R);
+    }
+    return vec4(rad, T);
+}
+void main() {
+    uint lci = gl_GlobalInvocationID.x;
+    uint volume = uint(u_grid_res.x) * uint(u_grid_res.y) * uint(u_grid_res.z);
+    if (lci >= volume) return;
+    uint ci = u_cnt_off + lci;
+    uvec2 csc = comb_sc[ci];
+    if (csc.y == 0u) return;
+    uint base = u_packed_off + csc.x;
+
+    // Level-0 grid params for the march (the bake kernel's own level vars
+    // alias the uniforms above; the march uses them through u_l_*).
+    for (uint k = 0u; k < csc.y; ++k) {
+        uint dst = base + k;
+        uint e = comb_list[dst];
+        vec4 pc = rdr_pn[2u * dst];
+        vec4 rn = rdr_pn[2u * dst + 1u];
+        vec4 alb = rdr_alb[dst];
+        // Cone axes: normal + 4 tilted (VCT diffuse layout), cosine weights.
+        vec3 n = rn.xyz;
+        vec3 t1 = normalize(abs(n.y) < 0.99 ? cross(n, vec3(0, 1, 0)) : cross(n, vec3(1, 0, 0)));
+        vec3 t2 = cross(n, t1);
+        const float tilt = 1.0;               // ~45 degrees
+        const float tanh_ = 0.577;            // 30 degrees half-angle
+        vec3 dirs[5] = vec3[5](n,
+                               normalize(n + tilt * t1),
+                               normalize(n - tilt * t1),
+                               normalize(n + tilt * t2),
+                               normalize(n - tilt * t2));
+        float wts[5] = float[5](1.0, 0.707, 0.707, 0.707, 0.707);
+        vec3 irr = vec3(0.0);
+        float ao = 0.0;
+        float wsum2 = 0.0;
+        for (int c = 0; c < 5; ++c) {
+            vec4 rt = cone_march(pc.xyz + n * (0.5 * 0.05), dirs[c], tanh_, 0.05);
+            irr += rt.rgb * wts[c];
+            ao += rt.a * wts[c];
+            wsum2 += wts[c];
+        }
+        irr /= max(wsum2, 1e-3);
+        ao /= max(wsum2, 1e-3);
+        // Outgoing radiance = own emissive + albedo x gathered direct irradiance
+        vec3 emis = ((e & u_mega_flag) != 0u)
+            ? mega_emis[(e & ~u_mega_flag)].rgb * u_strength
+            : surf_emis[packed_idx[e]].rgb * u_strength;
+        vec3 out_rad = emis + alb.rgb * irr;
+        if ((e & u_mega_flag) != 0u) mega_rad[(e & ~u_mega_flag)] = vec4(out_rad, ao);
+        else surf_rad[e] = vec4(out_rad, ao);
+    }
+}

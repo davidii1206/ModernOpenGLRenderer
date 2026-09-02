@@ -415,6 +415,16 @@ bool Model::load_gltf(const std::string& path) {
         info.emissive_factor[0] = static_cast<float>(mat.emissiveFactor[0]);
         info.emissive_factor[1] = static_cast<float>(mat.emissiveFactor[1]);
         info.emissive_factor[2] = static_cast<float>(mat.emissiveFactor[2]);
+        // KHR_materials_emissive_strength: tinygltf keeps raw extension JSON
+        // in a std::map<std::string, tinygltf::Value>.
+        {
+            auto ext_it = mat.extensions.find("KHR_materials_emissive_strength");
+            if (ext_it != mat.extensions.end()) {
+                const tinygltf::Value& ext = ext_it->second;
+                if (ext.Has("emissiveStrength"))
+                    info.emissive_strength = static_cast<float>(ext.Get("emissiveStrength").GetNumberAsDouble());
+            }
+        }
 
         // Alpha mode
         if (mat.alphaMode == "MASK") {

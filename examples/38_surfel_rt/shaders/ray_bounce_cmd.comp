@@ -1,0 +1,21 @@
+#version 460 core
+layout(local_size_x = 1) in;
+
+// Bounce compaction driver: turn this bounce's ray count into (a) the
+// element count for the survivor-flag scan (scan_block/scan_finish read it
+// via u_n_from_buf) and (b) the indirect dispatch command both scans share
+// (ceil(n / 256) workgroups). Keeps the bounce compaction fully GPU-driven
+// — the CPU never reads a ray count (no pipeline bubble).
+layout(std430, binding = 13) readonly buffer RayCounts { uint counts[]; };
+layout(std430, binding = 20) writeonly buffer NVal { uint nval[]; };
+layout(std430, binding = 22) writeonly buffer ScanCmd { uint cmd[3]; };
+
+uniform uint u_bounce;
+
+void main() {
+    uint n = counts[u_bounce];
+    nval[0] = n;
+    cmd[0] = (n + 255u) / 256u;
+    cmd[1] = 1u;
+    cmd[2] = 1u;
+}

@@ -2,15 +2,15 @@
 in vec2 v_uv;
 out vec4 frag_color;
 
-// The trace kernel only writes pixels that cast rays (mirror surfaces); the
-// composite finishes here: mirror pixels take the traced color, everything
-// else the rasterized direct shading. Debug views read the rasterized
-// G-buffer textures directly (the old aux image was a redundant copy of them).
-uniform sampler2D u_tex;      // traced color (view 0) or the debug source texture
-uniform sampler2D u_direct;   // rasterized direct shading
+// Composite: non-mirror pixels = emissive term + albedo x cone-gathered
+// irradiance (bilinear-upsampled from the half-res GI buffer); mirror pixels
+// take the ray-traced radiance. Debug views read the G-buffer directly.
+uniform sampler2D u_tex;      // traced radiance (view 0) or the debug source texture
+uniform sampler2D u_direct;   // emissive term per pixel
 uniform sampler2D u_mirror;   // rasterized albedo (alpha = mirror flag)
+uniform sampler2D u_gi;       // half-res gather irradiance (rgb) + ao (a)
 uniform int u_view;           // 0 composite, 1 albedo, 2 normal, 3 position, 4 depth
-uniform int u_composite;      // 1 = blend u_tex over u_direct by the mirror flag
+uniform int u_composite;      // 1 = mirror pixels take u_tex
 uniform vec3 u_cam_pos;
 uniform float u_far;
 uniform float u_exposure;
@@ -24,14 +24,19 @@ vec3 aces(vec3 x) {
 void main() {
     vec3 col;
     if (u_view == 0) {
-        col = texture(u_direct, v_uv).rgb;
-        if (u_composite == 1) {
-            // The accumulation image is fp32; the old single-dispatch pipeline
-            // stored its total through an RGBA16F texture before display, so
-            // round to half float here to stay byte-identical.
-            vec3 rt = texture(u_tex, v_uv).rgb;
-            float m = texture(u_mirror, v_uv).a;
-            col = mix(col, rt, step(0.5, m));
+        vec4 alb_m = texture(u_mirror, v_uv);
+        // The accumulated radiance is fp32; round to half float like the
+        // legacy path so the mirror content stays stable across refactors.
+        vec3 rt = texture(u_tex, v_uv).rgb;
+        vec2 h0 = unpackHalf2x16(packHalf2x16(rt.xy));
+        vec2 h1 = unpackHalf2x16(packHalf2x16(rt.zz));
+        vec3 rt16 = vec3(h0.x, h0.y, h1.x);
+        if (u_composite == 1 && step(0.5, alb_m.a) == 1.0) {
+            col = rt16;
+        } else {
+            // Diffuse: emissive term + albedo x gathered irradiance.
+            col = texture(u_direct, v_uv).rgb
+                + alb_m.rgb * texture(u_gi, v_uv).rgb;
         }
     } else {
         vec4 g = texture(u_tex, v_uv);

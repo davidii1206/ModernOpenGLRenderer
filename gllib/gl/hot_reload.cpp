@@ -74,6 +74,17 @@ bool HotReloadProgram::poll() {
     // Compile all stages from current source
     std::vector<Shader> shaders;
     for (const auto& stage : stages_) {
+        // An empty source means the file could not be read (missing path,
+        // wrong working directory, failed #include). Bail out with a clear
+        // message instead of feeding "" to the driver, which "compiles" it
+        // and then fails linking with a cryptic "must write to gl_Position"
+        // / "no work group size specified".
+        if (stage.source().empty()) {
+            gllib::logf(gllib::LogLevel::error,
+                "HotReloadProgram: no source for %s (missing file or wrong "
+                "working directory?)", stage.path().c_str());
+            return false;
+        }
         Shader s(stage.type(), stage.source());
         if (!s.compiled()) {
             gllib::logf(gllib::LogLevel::error,

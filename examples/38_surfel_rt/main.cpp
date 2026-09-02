@@ -85,6 +85,7 @@ struct Tri {
     float curvature = 0.0f;   // max smooth-edge dihedral / edge length [1/m]
     int object = 0;           // connected-component id (see extract_triangles)
     glm::vec3 alb{0.0f};
+    glm::vec3 emissive{0.0f}; // material emissive factor (area-light patches)
 };
 
 struct SamplePoint {
@@ -94,6 +95,7 @@ struct SamplePoint {
     float radius = 0.0f;   // per-sample disk radius (adaptive step derived)
     bool is_mirror = false;
     int object = 0;        // home triangle's object id (per-object cuts)
+    glm::vec3 emissive{0.0f};
 };
 
 // Sharp/boundary mesh feature edge (world space). Cut planes for the surfel
@@ -392,6 +394,9 @@ ExtractedMesh extract_triangles(const gfx::Model& model, const glm::mat4& model_
         glm::vec3 alb(mat.base_color_factor[0], mat.base_color_factor[1], mat.base_color_factor[2]);
         bool is_mirror = (mat.name.find("tallBox") != std::string::npos) ||
                          (mat.roughness_factor < 0.05f);
+        glm::vec3 emissive(mat.emissive_factor[0] * mat.emissive_strength,
+                           mat.emissive_factor[1] * mat.emissive_strength,
+                           mat.emissive_factor[2] * mat.emissive_strength);
         
         // Combine the mesh's node transform with the global model transform
         glm::mat4 combined_xform = model_mat * model.mesh_transform(int(mi));
@@ -417,6 +422,7 @@ ExtractedMesh extract_triangles(const gfx::Model& model, const glm::mat4& model_
             t.area = 0.5f * glm::length(glm::cross(t.p[1] - t.p[0], t.p[2] - t.p[0]));
             if (t.area < 1e-9f) return;
             t.alb = alb;
+            t.emissive = emissive;
             out.tris.push_back(t);
             out.tri_mirror.push_back(is_mirror);
         };
@@ -697,6 +703,7 @@ static std::vector<SamplePoint> sample_points_lattice(
             s.nrm = glm::normalize(t.n[0] * w + t.n[1] * a + t.n[2] * b);
         }
         s.alb = t.alb;
+        s.emissive = t.emissive;
         s.is_mirror = tri_mirror[ti];
         s.object = t.object;
         s.radius = r_i[ti];
@@ -1050,6 +1057,10 @@ int main() {
     mega_finalize_prog.add_stage("shaders/mega_finalize.comp", gl::ShaderType::compute);
     gl::HotReloadProgram mega_renderlist_prog;
     mega_renderlist_prog.add_stage("shaders/mega_renderlist.comp", gl::ShaderType::compute);
+    gl::HotReloadProgram bake_prog;
+    bake_prog.add_stage("shaders/radiance_bake.comp", gl::ShaderType::compute);
+    gl::HotReloadProgram cones_prog;
+    cones_prog.add_stage("shaders/light_cones.comp", gl::ShaderType::compute);
     gl::HotReloadProgram mark_prog;
     mark_prog.add_stage("shaders/ray_mark.comp", gl::ShaderType::compute);
     gl::HotReloadProgram gather_prog;
@@ -1073,6 +1084,8 @@ int main() {
     mega_children_prog.poll();
     mega_finalize_prog.poll();
     mega_renderlist_prog.poll();
+    bake_prog.poll();
+    cones_prog.poll();
     mark_prog.poll();
     gather_prog.poll();
     prepare_prog.poll();
@@ -1093,6 +1106,8 @@ int main() {
     auto mega_children_cs = mega_children_prog.take_program();
     auto mega_finalize_cs = mega_finalize_prog.take_program();
     auto mega_renderlist_cs = mega_renderlist_prog.take_program();
+    auto bake_cs = bake_prog.take_program();
+    auto cones_cs = cones_prog.take_program();
     auto mark_cs = mark_prog.take_program();
     auto gather_cs = gather_prog.take_program();
     auto prepare_cs = prepare_prog.take_program();
@@ -1100,7 +1115,7 @@ int main() {
         !count_cs || !scan_block_cs || !scan_blocks_cs || !scan_finish_cs || !compact_cs ||
         !merge_cs || !mega_cluster_cs || !mega_scatter_cs ||
         !mega_children_cs || !mega_finalize_cs || !mega_renderlist_cs ||
-        !mark_cs || !gather_cs || !prepare_cs)
+        !bake_cs || !cones_cs || !mark_cs || !gather_cs || !prepare_cs)
         return EXIT_FAILURE;
 
     // Fullscreen triangle for display.
@@ -1252,6 +1267,15 @@ int main() {
     // Feature edges are needed on every launch (cut planes are computed from
     // them even when the surfel cloud itself comes from the cache).
     
+    // Emissive strength default: the strongest emissive material in the model
+    // (the area-light patch), overridable by the UI slider.
+    float light_strength = 0.0f;
+    float light_strength_file = 0.0f;
+    for (size_t mi2 = 0; mi2 < model.material_count(); ++mi2)
+        light_strength = std::max(light_strength, model.material_info(mi2).emissive_strength);
+    if (light_strength <= 0.0f) light_strength = 1.0f;
+    light_strength_file = light_strength;
+
     // Max per-surfel radius bounds the grid cell size and ray-traversal search
     // radius (must cover the largest disk so neighborhood windows reach it).
     search_radius = 0.0f;
@@ -1273,6 +1297,10 @@ int main() {
     gl::Buffer surfel_nrm_buf(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);
     gl::Buffer surfel_alb_buf(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);
     gl::Buffer surfel_cut_buf(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);
+    // Emissive material factors per surfel (area-light patches); the strength
+    // slider scales at upload time.
+    gl::Buffer surf_emissive_all(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);
+    std::vector<glm::vec3> surf_emissive_cpu;
     // Multi-LOD grids: one combined uint buffer per array, segmented per level.
     gl::Buffer cell_count_all(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);
     gl::Buffer cell_start_all(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);
@@ -1317,6 +1345,12 @@ int main() {
     gl::Buffer rdr_pn_all(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);       // combined render SoA: 2 vec4 per entry
     gl::Buffer rdr_alb_all(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);      // vec4 per entry
     gl::Buffer rdr_cut_all(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);      // uint per entry (packed_idx or none)
+    // Radiance cache (cone-traced emissive lighting): per fine surfel and per
+    // mega — baked once per grid build from the emissive snapshot, gathered
+    // by the half-res cone pass and the mirror-hit shading.
+    gl::Buffer surf_rad_all(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);
+    gl::Buffer mega_rad_all(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);
+    gl::Buffer mega_emis_all(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);
     // Build temps (mega slots live in the packed segment space, sizes packed_total).
     gl::Buffer mega_assign_all(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);  // uint per fine surfel
     gl::Buffer mega_count_all(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);   // uint per cell
@@ -1345,6 +1379,14 @@ int main() {
         surfel_alb_buf.data(va.data(), va.size() * sizeof(glm::vec4));
         cuts = compute_surfel_cuts(surfels, em.edges, search_radius, leaf_radius);
         surfel_cut_buf.data(cuts.data(), cuts.size() * sizeof(glm::vec4));
+        // Emissive factors x current strength (the light-strength slider
+        // re-runs this upload; no resampling needed).
+        surf_emissive_cpu.assign(size_t(N), glm::vec3(0.0f));
+        for (int i = 0; i < N; ++i)
+            surf_emissive_cpu[size_t(i)] = surfels[i].emissive * light_strength;
+        std::vector<glm::vec4> ev(size_t(N), glm::vec4(0.0f));
+        for (int i = 0; i < N; ++i) ev[size_t(i)] = glm::vec4(surf_emissive_cpu[size_t(i)], 1.0f);
+        surf_emissive_all.data(ev.data(), ev.size() * sizeof(glm::vec4));
     };
     upload_surfel_buffers();
 
@@ -1460,6 +1502,9 @@ int main() {
         rdr_pn_all.data(nullptr, size_t(packed_total) * 2 * sizeof(glm::vec4));
         rdr_alb_all.data(nullptr, size_t(packed_total) * sizeof(glm::vec4));
         rdr_cut_all.data(nullptr, size_t(packed_total) * sizeof(uint32_t));
+        surf_rad_all.data(nullptr, size_t(packed_total) * sizeof(glm::vec4));
+        mega_rad_all.data(nullptr, size_t(packed_total) * sizeof(glm::vec4));
+        mega_emis_all.data(nullptr, size_t(packed_total) * sizeof(glm::vec4));
     };
     upload_level_buffers();
 
@@ -1497,7 +1542,12 @@ int main() {
         rdr_pn_all.bind_base(16);
         rdr_alb_all.bind_base(17);
         left_sc_all.bind_base(18);          // combined (start, count) per cell
+        left_idx_all.bind_base(19);         // combined order list (cone kernels)
         rdr_cut_all.bind_base(21);          // combined render cut refs
+        surf_emissive_all.bind_base(37);
+        mega_emis_all.bind_base(38);
+        surf_rad_all.bind_base(39);
+        mega_rad_all.bind_base(40);
     };
 
     bool render_mega = false;     // render from merged mega surfels + leftovers
@@ -1507,6 +1557,12 @@ int main() {
     if (const char* m = getenv("SRT_MEGA")) render_mega = std::atoi(m) != 0;
     bool pair_rays = false;
     if (const char* p = getenv("SRT_PAIR")) pair_rays = std::atoi(p) != 0;
+    bool gi_enabled = false;
+    if (const char* g = getenv("SRT_GI")) gi_enabled = std::atoi(g) != 0;
+    bool no_lighting = false;
+    if (const char* n = getenv("SRT_NOLIGHT")) no_lighting = std::atoi(n) != 0;
+    int gi_cones = 5;
+    float gi_gain = 8.0f;
     if (getenv("SRT_MEGA_DOT")) mega_dot = std::clamp(std::atof(getenv("SRT_MEGA_DOT")), 0.5, 0.999999);
 
     // Scan trio over an arbitrary uint array segment (count -> exclusive
@@ -1735,9 +1791,12 @@ int main() {
                 mega_cnt_all.bind_base(28);
                 child_base_all.bind_base(29);
                 children_all.bind_base(30);
+                packed_all.bind_base(5);
                 mega_pn_all.bind_base(31);
                 mega_alb_all.bind_base(32);
                 mega_meta_all.bind_base(33);
+                surf_emissive_all.bind_base(37);
+                mega_emis_all.bind_base(38);
                 mega_finalize_cs->use();
                 set_level_uniforms(*mega_finalize_cs, l);
                 {
@@ -1793,6 +1852,72 @@ int main() {
                 }
                 gl::dispatch_compute((levels[l].volume + kBlockSize - 1) / kBlockSize, 1, 1);
                 glMemoryBarrier(GL_ALL_BARRIER_BITS);
+            }
+
+            // 10: radiance cache bake (per cell, per level) — cone gather of
+            // the emissive snapshot into the per-entry radiance cache.
+            for (int l = 0; l < kGridLevels; ++l) {
+                if (levels[l].count == 0) continue;
+                cell_sc_all.bind_base(3);
+                left_sc_all.bind_base(18);
+                left_idx_all.bind_base(19);
+                cell_mask_all.bind_base(11);
+                rdr_pn_all.bind_base(16);
+                rdr_alb_all.bind_base(17);
+                surf_emissive_all.bind_base(37);
+                mega_emis_all.bind_base(38);
+                surf_rad_all.bind_base(39);
+                mega_rad_all.bind_base(40);
+                bake_cs->use();
+                set_level_uniforms(*bake_cs, l);
+                {
+                    GLfloat lmin[12], linv[4];
+                    GLint lres[12];
+                    GLuint moff[4], lnum[4], coff[4], poff[4];
+                    for (int li = 0; li < kGridLevels; ++li) {
+                        lmin[li * 3] = levels[li].mn.x;
+                        lmin[li * 3 + 1] = levels[li].mn.y;
+                        lmin[li * 3 + 2] = levels[li].mn.z;
+                        linv[li] = 1.0f / levels[li].cell;
+                        lres[li * 3] = levels[li].res.x;
+                        lres[li * 3 + 1] = levels[li].res.y;
+                        lres[li * 3 + 2] = levels[li].res.z;
+                        moff[li] = levels[li].mask_off;
+                        lnum[li] = levels[li].count;
+                        coff[li] = levels[li].cnt_off;
+                        poff[li] = levels[li].packed_off;
+                    }
+                    GLint u = bake_cs->uniform_location("u_l_min");      if (u >= 0) glUniform3fv(u, kGridLevels, lmin);
+                    u = bake_cs->uniform_location("u_l_inv_cell");       if (u >= 0) glUniform1fv(u, kGridLevels, linv);
+                    u = bake_cs->uniform_location("u_l_res");            if (u >= 0) glUniform3iv(u, kGridLevels, lres);
+                    u = bake_cs->uniform_location("u_l_num");            if (u >= 0) glUniform1uiv(u, kGridLevels, lnum);
+                    u = bake_cs->uniform_location("u_l_cnt_off");        if (u >= 0) glUniform1uiv(u, kGridLevels, coff);
+                    u = bake_cs->uniform_location("u_l_packed_off");     if (u >= 0) glUniform1uiv(u, kGridLevels, poff);
+                    u = bake_cs->uniform_location("u_l_mask_off");       if (u >= 0) glUniform1uiv(u, kGridLevels, moff);
+                    u = bake_cs->uniform_location("u_levels");           if (u >= 0) bake_cs->uniform1i(u, kGridLevels);
+                    u = bake_cs->uniform_location("u_mega_flag");        if (u >= 0) bake_cs->uniform1ui(u, 0x80000000u);
+                    u = bake_cs->uniform_location("u_strength");         if (u >= 0) bake_cs->uniform1f(u, light_strength);
+                    u = bake_cs->uniform_location("u_max_t");            if (u >= 0) bake_cs->uniform1f(u, glm::length(scene_size));
+                }
+                gl::dispatch_compute((levels[l].volume + kBlockSize - 1) / kBlockSize, 1, 1);
+                glMemoryBarrier(GL_ALL_BARRIER_BITS);
+            }
+        }
+
+        if (getenv("SRT_DEBUG")) {
+            glMemoryBarrier(GL_ALL_BARRIER_BITS);
+            glFinish();
+            {
+                std::vector<glm::vec4> sr(size_t(packed_total), glm::vec4(0.0f)), mr(size_t(packed_total), glm::vec4(0.0f));
+                void* ptr = surf_rad_all.map_range(0, sr.size() * 16, GL_MAP_READ_BIT);
+                if (ptr) { std::memcpy(sr.data(), ptr, sr.size() * 16); surf_rad_all.unmap(); }
+                ptr = mega_rad_all.map_range(0, mr.size() * 16, GL_MAP_READ_BIT);
+                if (ptr) { std::memcpy(mr.data(), ptr, mr.size() * 16); mega_rad_all.unmap(); }
+                uint32_t snz = 0, mnz = 0; glm::vec3 smx(0.0f);
+                for (auto& v : sr) if (v.r + v.g + v.b > 0.0f) { ++snz; smx = glm::max(smx, glm::vec3(v.r, v.g, v.b)); }
+                for (auto& v : mr) if (v.r + v.g + v.b > 0.0f) { ++mnz; smx = glm::max(smx, glm::vec3(v.r, v.g, v.b)); }
+                printf("DBG bake: surf_rad nonzero=%u mega_rad nonzero=%u max=(%.2f %.2f %.2f)\n",
+                       snz, mnz, smx.x, smx.y, smx.z);
             }
         }
 
@@ -1859,9 +1984,9 @@ int main() {
 
     // Ray trace output texture (mirror pixels only; display composites).
     // RGBA32F: the per-bounce trace dispatches accumulate fp32 shade
-    // contributions into it; display.frag reproduces the old RGBA16F rounding
-    // so the output stays byte-identical to the single-dispatch pipeline.
+    // contributions into it.
     gl::Texture color_tex{gl::TextureType::tex_2d};
+    gl::Texture gi_tex{gl::TextureType::tex_2d};   // half-res cone-gather irradiance
     auto create_rt_tex = [&](int w, int h) {
         color_tex = gl::Texture{gl::TextureType::tex_2d};
         color_tex.image_2d(0, GL_RGBA32F, w, h, GL_RGBA, GL_FLOAT, nullptr, 1);
@@ -1872,6 +1997,12 @@ int main() {
         // Worst case: every pixel is a mirror ray (each bounce's stream is
         // bounded by the previous bounce's, so one screenful per buffer).
         stream_a_buf.data(nullptr, size_t(w) * size_t(h) * 2 * sizeof(glm::vec4));
+        gi_tex = gl::Texture{gl::TextureType::tex_2d};
+        gi_tex.image_2d(0, GL_RGBA16F, (w + 1) / 2, (h + 1) / 2, GL_RGBA, GL_FLOAT, nullptr, 1);
+        gi_tex.parameter(GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        gi_tex.parameter(GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        gi_tex.parameter(GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        gi_tex.parameter(GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         stream_b_buf.data(nullptr, size_t(w) * size_t(h) * 2 * sizeof(glm::vec4));
         ray_count_buf.data(nullptr, 4 * sizeof(uint32_t));
         hit_buf.data(nullptr, size_t(w) * size_t(h) * sizeof(float));
@@ -2113,10 +2244,6 @@ int main() {
             auto loc = [&](const char* n) { return gbuf->uniform_location(n); };
             GLint l;
             l = loc("u_view_proj");      if (l >= 0) gbuf->uniform_matrix4fv(l, glm::value_ptr(vp));
-            l = loc("u_light_pos");       if (l >= 0) gbuf->uniform3f(l, light_pos.x, light_pos.y, light_pos.z);
-            l = loc("u_light_color");     if (l >= 0) gbuf->uniform3f(l, light_color.x, light_color.y, light_color.z);
-            l = loc("u_light_intensity"); if (l >= 0) gbuf->uniform1f(l, light_intensity);
-            l = loc("u_ambient");         if (l >= 0) gbuf->uniform1f(l, ambient);
 
             for (size_t i = 0; i < model.mesh_count(); ++i) {
                 // Apply per-mesh transform combined with global model transform
@@ -2124,11 +2251,21 @@ int main() {
                 glm::mat3 normal_mat = glm::transpose(glm::inverse(glm::mat3(combined_xform)));
                 l = loc("u_model");           if (l >= 0) gbuf->uniform_matrix4fv(l, glm::value_ptr(combined_xform));
                 l = loc("u_normal_mat");      if (l >= 0) gbuf->uniform_matrix3fv(l, glm::value_ptr(normal_mat));
-                
+
                 int mi = model.mesh_material(int(i));
                 const auto& mat = model.material_info(size_t(mi >= 0 ? mi : 0));
                 l = loc("u_albedo");    if (l >= 0) gbuf->uniform3f(l, mat.base_color_factor[0], mat.base_color_factor[1], mat.base_color_factor[2]);
                 l = loc("u_is_mirror"); if (l >= 0) gbuf->uniform1f(l, mesh_is_mirror(i) ? 1.0f : 0.0f);
+                if (!no_lighting) {
+                    l = loc("u_emissive");  if (l >= 0) {
+                        float st = mat.emissive_strength > 0.0f ? light_strength : 0.0f;
+                        float sc = mat.emissive_strength > 0.0f ? (light_strength / mat.emissive_strength) : 0.0f;
+                        (void)st;
+                        gbuf->uniform3f(l, mat.emissive_factor[0] * sc,
+                                           mat.emissive_factor[1] * sc,
+                                           mat.emissive_factor[2] * sc);
+                    }
+                }
                 model.mesh(i).draw();
             }
         }
@@ -2226,9 +2363,10 @@ int main() {
         l = gloc("u_l_mask_off");   if (l >= 0) glUniform1uiv(l, kGridLevels, moff);
         l = gloc("u_l_max_r");      if (l >= 0) glUniform1fv(l, kGridLevels, lmaxr);
         l = gloc("u_levels");       if (l >= 0) gather_cs->uniform1i(l, kGridLevels);
-        l = gloc("u_light_pos");    if (l >= 0) gather_cs->uniform3f(l, light_pos.x, light_pos.y, light_pos.z);
-        l = gloc("u_light_color");  if (l >= 0) gather_cs->uniform3f(l, light_color.x, light_color.y, light_color.z);
-        l = gloc("u_light_intensity"); if (l >= 0) gather_cs->uniform1f(l, light_intensity);
+        l = gloc("u_no_light");     if (l >= 0) gather_cs->uniform1i(l, no_lighting ? 1 : 0);
+        l = gloc("u_light_pos");    if (l >= 0 && !no_lighting) gather_cs->uniform3f(l, light_pos.x, light_pos.y, light_pos.z);
+        l = gloc("u_light_color");  if (l >= 0 && !no_lighting) gather_cs->uniform3f(l, light_color.x, light_color.y, light_color.z);
+        l = gloc("u_light_intensity"); if (l >= 0 && !no_lighting) gather_cs->uniform1f(l, light_intensity);
         l = gloc("u_max_bounces");  if (l >= 0) gather_cs->uniform1i(l, max_bounces);
         l = gloc("u_radius_scale"); if (l >= 0) gather_cs->uniform1f(l, radius_scale);
         l = gloc("u_ambient");      if (l >= 0) gather_cs->uniform1f(l, ambient);
@@ -2296,6 +2434,56 @@ int main() {
             perf_pending = true;
             perf_write ^= 1;
         }
+
+        // Diffuse GI: half-res cone gather over the radiance cache (megas +
+        // leftover fines per level), occupancy transmittance for shadows/AO.
+        if (gi_enabled && mega_ok) {
+            gbuf_t.position.bind(1);
+            gbuf_t.normal.bind(2);
+            gbuf_t.albedo.bind(3);
+            gi_tex.bind_image(5, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
+            cones_cs->use();
+            {
+                GLfloat lmin[12], linv[4];
+                GLint lres[12];
+                GLuint moff[4], lnum[4];
+                for (int li = 0; li < kGridLevels; ++li) {
+                    lmin[li * 3] = levels[li].mn.x;
+                    lmin[li * 3 + 1] = levels[li].mn.y;
+                    lmin[li * 3 + 2] = levels[li].mn.z;
+                    linv[li] = 1.0f / levels[li].cell;
+                    lres[li * 3] = levels[li].res.x;
+                    lres[li * 3 + 1] = levels[li].res.y;
+                    lres[li * 3 + 2] = levels[li].res.z;
+                    moff[li] = levels[li].mask_off;
+                    lnum[li] = levels[li].count;
+                }
+                GLuint coff[4], poff[4];
+                for (int li = 0; li < kGridLevels; ++li) {
+                    coff[li] = levels[li].cnt_off;
+                    poff[li] = levels[li].packed_off;
+                }
+                GLint l;
+                l = cones_cs->uniform_location("u_grid_min");  if (l >= 0) cones_cs->uniform3f(l, levels[0].mn.x, levels[0].mn.y, levels[0].mn.z);
+                l = cones_cs->uniform_location("u_inv_cell");  if (l >= 0) cones_cs->uniform1f(l, 1.0f / levels[0].cell);
+                l = cones_cs->uniform_location("u_grid_res");  if (l >= 0) { GLint r[3] = {levels[0].res.x, levels[0].res.y, levels[0].res.z}; cones_cs->uniform3iv(l, r); }
+                l = cones_cs->uniform_location("u_l_min");     if (l >= 0) glUniform3fv(l, kGridLevels, lmin);
+                l = cones_cs->uniform_location("u_l_inv_cell");if (l >= 0) glUniform1fv(l, kGridLevels, linv);
+                l = cones_cs->uniform_location("u_l_res");     if (l >= 0) glUniform3iv(l, kGridLevels, lres);
+                l = cones_cs->uniform_location("u_l_num");     if (l >= 0) glUniform1uiv(l, kGridLevels, lnum);
+                l = cones_cs->uniform_location("u_l_cnt_off"); if (l >= 0) glUniform1uiv(l, kGridLevels, coff);
+                l = cones_cs->uniform_location("u_l_packed_off"); if (l >= 0) glUniform1uiv(l, kGridLevels, poff);
+                l = cones_cs->uniform_location("u_l_mask_off");if (l >= 0) glUniform1uiv(l, kGridLevels, moff);
+                l = cones_cs->uniform_location("u_levels");    if (l >= 0) cones_cs->uniform1i(l, kGridLevels);
+                l = cones_cs->uniform_location("u_mega_flag"); if (l >= 0) cones_cs->uniform1ui(l, 0x80000000u);
+                l = cones_cs->uniform_location("u_half_size"); if (l >= 0) { GLint hs[2] = {(fw + 1) / 2, (fh + 1) / 2}; cones_cs->uniform2iv(l, hs); }
+                l = cones_cs->uniform_location("u_max_t");     if (l >= 0) cones_cs->uniform1f(l, glm::length(scene_size));
+                l = cones_cs->uniform_location("u_cone_count");if (l >= 0) cones_cs->uniform1i(l, gi_cones);
+                l = cones_cs->uniform_location("u_gain");      if (l >= 0) cones_cs->uniform1f(l, gi_gain);
+            }
+            gl::dispatch_compute((fw + 15) / 16, (fh + 15) / 16, 1);
+            glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+        }
         t_ray.end();
         traced = true;
     };
@@ -2349,6 +2537,8 @@ int main() {
         if (mega_children_prog.poll()) mega_children_cs = mega_children_prog.take_program();
         if (mega_finalize_prog.poll()) mega_finalize_cs = mega_finalize_prog.take_program();
         if (mega_renderlist_prog.poll()) mega_renderlist_cs = mega_renderlist_prog.take_program();
+        if (bake_prog.poll()) bake_cs = bake_prog.take_program();
+        if (cones_prog.poll()) cones_cs = cones_prog.take_program();
         if (mark_prog.poll()) mark_cs = mark_prog.take_program();
         if (gather_prog.poll()) gather_cs = gather_prog.take_program();
         if (prepare_prog.poll()) prepare_cs = prepare_prog.take_program();
@@ -2391,9 +2581,11 @@ int main() {
             src->bind(0);
             gbuf_t.direct.bind(1);
             gbuf_t.albedo.bind(2);
+            gi_tex.bind(3);
             l = dl("u_tex");      if (l >= 0) display->uniform1i(l, 0);
             l = dl("u_direct");   if (l >= 0) display->uniform1i(l, 1);
             l = dl("u_mirror");   if (l >= 0) display->uniform1i(l, 2);
+            l = dl("u_gi");       if (l >= 0) display->uniform1i(l, 3);
             l = dl("u_view");     if (l >= 0) display->uniform1i(l, view_mode);
             l = dl("u_cam_pos");  if (l >= 0) display->uniform3f(l, cam.position().x, cam.position().y, cam.position().z);
             l = dl("u_far");      if (l >= 0) display->uniform1f(l, far_plane);
@@ -2704,17 +2896,24 @@ int main() {
             ImGui::TextWrapped("(grid built on GPU via counting sort + prefix sum + compact)");
 
             ImGui::Separator();
-            ImGui::Text("Light (point)");
-            ImGui::SliderFloat("Intensity", &light_intensity, 0.0f, 50.0f);
-            ImGui::SliderFloat("Ambient", &ambient, 0.0f, 1.0f);
-            ImGui::SliderFloat("L x", &light_pos.x, mn.x, mx.x);
-            ImGui::SliderFloat("L y", &light_pos.y, mn.y, mx.y);
-            ImGui::SliderFloat("L z", &light_pos.z, mn.z, mx.z);
-            ImGui::ColorEdit3("L color", &light_color.x);
+            ImGui::Checkbox("Cone GI", &gi_enabled);
+            if (gi_enabled) {
+                ImGui::SliderInt("GI cones", &gi_cones, 1, 5);
+                ImGui::SliderFloat("GI gain", &gi_gain, 0.0f, 30.0f);
+            }
 
             ImGui::Separator();
             ImGui::SliderInt("Mirror bounces", &max_bounces, 0, 3);
             ImGui::SliderFloat("Cylinder radius scale", &radius_scale, 0.5f, 2.0f);
+            if (ImGui::SliderFloat("Light strength", &light_strength, 0.0f,
+                                   std::max(40.0f, light_strength_file * 2.0f), "%.1f")) {
+                upload_surfel_buffers();          // re-upload emissive x strength
+                if (gi_enabled && mega_ok) {      // refresh the radiance cache
+                    build_grid();
+                    refresh_occupied_cells();
+                }
+            }
+            ImGui::Checkbox("No lighting", &no_lighting);
             ImGui::Checkbox("Render mega surfels", &render_mega);
             static float last_mega_dot = mega_dot;
             if (ImGui::SliderFloat("Mega merge dot", &mega_dot, 0.90f, 0.9995f, "%.4f")) {

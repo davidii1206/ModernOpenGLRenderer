@@ -1,0 +1,48 @@
+#version 460 core
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// Ray stream generation, pass C: scatter the mirror pixels' rays into the
+// bounce-0 stream at tile_base + within-tile shared-atomic index (pass A
+// counted the tiles, pass B scanned the bases). Payload computation is the
+// old monolithic mark kernel's, unchanged; also zeroes the accumulation
+// image for ray pixels. Within-tile order is arbitrary (shared atomics) but
+// confined to 64 adjacent pixels of one tile - harmless for warp coherence.
+// No early returns before the barrier (see ray_mark.comp).
+layout(binding = 1) uniform sampler2D gbuf_pos;    // RGBA16F world position
+layout(binding = 2) uniform sampler2D gbuf_nrm;    // RGBA16F world normal
+layout(binding = 3) uniform sampler2D gbuf_alb;    // RGBA8 albedo + mirror flag
+layout(binding = 3, rgba32f) writeonly uniform image2D u_accum;
+
+// Ray stream: 2 vec4 per ray — [px_packed, ro.xyz], [rd.xyz, 0].
+layout(std430, binding = 12) writeonly buffer StreamOut { vec4 stream_out[]; };
+layout(std430, binding = 20) readonly buffer TileStart { uint tile_start[]; };
+
+uniform ivec2 u_img_size;
+uniform vec3 u_cam_pos;
+
+shared uint scur;
+
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (gl_LocalInvocationIndex == 0u) scur = 0u;
+    barrier();
+    if (all(lessThan(px, u_img_size)) && texelFetch(gbuf_alb, px, 0).a > 0.5) {
+        uint i = tile_start[gl_WorkGroupIndex] + atomicAdd(scur, 1u);
+        vec3 gpos = texelFetch(gbuf_pos, px, 0).xyz;
+        vec3 gnrm = normalize(texelFetch(gbuf_nrm, px, 0).xyz);
+        // Ensure the normal faces the camera (double-sided box faces).
+        vec3 view_dir = normalize(gpos - u_cam_pos);
+        if (dot(gnrm, view_dir) > 0.0) gnrm = -gnrm;
+        // Paper §5: pad the ray ORIGIN along the normal (shadow-offset trick):
+        // the mirror's own disks all lie in its tangent plane, so they are
+        // behind the origin for ANY positive pad and never hit. Fixed constant
+        // (see the trace kernel's comment for why it must not scale).
+        const float self_off = 0.02;
+        vec3 ro = gpos + gnrm * self_off;
+        vec3 rd = reflect(view_dir, gnrm);
+        stream_out[2u * i] = vec4(uintBitsToFloat(
+                                      uint(px.x) | (uint(px.y) << 16)), ro);
+        stream_out[2u * i + 1u] = vec4(rd, 0.0);
+        imageStore(u_accum, px, vec4(0.0));
+    }
+}

@@ -17,6 +17,9 @@ layout(std430, binding = 30) readonly buffer Children { uint children[]; };
 layout(std430, binding = 31) writeonly buffer MegaPN { vec4 mega_pn[]; };
 layout(std430, binding = 32) writeonly buffer MegaAlb { vec4 mega_alb[]; };
 layout(std430, binding = 33) writeonly buffer MegaMeta { uvec2 mega_meta[]; };
+layout(std430, binding = 37) readonly buffer SurfEmis { vec4 surf_emis[]; };
+layout(std430, binding = 5) readonly buffer PackedIdx2 { uint packed_idx[]; };
+layout(std430, binding = 38) writeonly buffer MegaEmis { vec4 mega_emis[]; };
 
 uniform uint u_num;        // fine surfels in this level (segment length)
 uniform uint u_packed_off; // packed/mega segment of this level
@@ -30,12 +33,13 @@ void main() {
     if (cnt == 0u) return;
     uint cb = u_packed_off + child_base[m];
 
-    vec3 psum = vec3(0.0), nsum = vec3(0.0), asum = vec3(0.0);
+    vec3 psum = vec3(0.0), nsum = vec3(0.0), asum = vec3(0.0), esum = vec3(0.0);
     for (uint k = 0u; k < cnt; ++k) {
         uint pi = children[cb + k];
         psum += packed_pn[2u * pi].xyz;
         nsum += packed_pn[2u * pi + 1u].xyz;
         asum += packed_alb[pi].rgb;
+        esum += surf_emis[packed_idx[pi]].rgb;
     }
     vec3 center_pt = psum / float(cnt);
     float radius = 0.0;
@@ -50,5 +54,6 @@ void main() {
     mega_pn[2u * m] = vec4(center_pt, radius);
     mega_pn[2u * m + 1u] = vec4(normalize(nsum), 0.0);
     mega_alb[m] = vec4(asum / float(cnt), mirror);
+    mega_emis[m] = vec4(esum / float(cnt), 1.0);
     mega_meta[m] = uvec2(child_base[m], cnt);
 }

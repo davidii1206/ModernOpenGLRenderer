@@ -1,0 +1,27 @@
+#version 460 core
+layout(local_size_x = 128) in;
+
+// Order-preserving compaction of the next bounce's ray stream: copy the
+// survivors' staged payloads (ray_gather.comp) to their scanned positions
+// (flag_start[rid] = number of survivors before rid). The output stream
+// keeps ray order, so warps stay coherent through every bounce — the old
+// atomicAdd append shuffled survivors arbitrarily. Dispatched with the SAME
+// indirect command as this bounce's trace/gather kernels (it is sized from
+// the same count, so every ray slot is covered; no shared memory, so early
+// outs need no barriers).
+layout(std430, binding = 14) readonly buffer StreamStage { vec4 stream_stage[]; };
+layout(std430, binding = 19) readonly buffer RayFlag { uint ray_flag[]; };
+layout(std430, binding = 20) readonly buffer FlagStart { uint flag_start[]; };
+layout(std430, binding = 12) writeonly buffer StreamOut { vec4 stream_out[]; };
+layout(std430, binding = 13) readonly buffer RayCounts { uint counts[]; };
+
+uniform int u_bounce;
+
+void main() {
+    uint rid = gl_GlobalInvocationID.x;
+    if (rid < counts[uint(u_bounce)] && ray_flag[rid] != 0u) {
+        uint dst = flag_start[rid];
+        stream_out[2u * dst] = stream_stage[2u * rid];
+        stream_out[2u * dst + 1u] = stream_stage[2u * rid + 1u];
+    }
+}
