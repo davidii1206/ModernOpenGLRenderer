@@ -1,0 +1,30 @@
+#version 460 core
+layout(local_size_x = 1) in;
+
+// S1 pass 2b — per-cascade base offsets into packed_idx.
+//
+// The prefix sum runs once per cascade over that cascade's own 64^3 segment (a
+// single scan is capped at 262144 elements, which is exactly one cascade), so
+// cell_start restarts at 0 for every cascade. Without a per-cascade base the
+// compacted membership ranges of different cascades OVERLAP and silently
+// overwrite each other — visible only where more than one cascade is non-empty,
+// which is why an outside-the-scene camera never shows it.
+//
+// A cascade's total is the exclusive start of its last cell plus that cell's
+// count; the three totals are prefix-summed here by a single thread.
+
+layout(std430, binding = 0) readonly buffer CellStart { uint cell_start[]; };
+layout(std430, binding = 1) readonly buffer CellCount { uint cell_count[]; };
+layout(std430, binding = 2) writeonly buffer CascadeBase { uint cascade_base[]; };
+
+uniform uint u_cells;       // cells per cascade
+uniform int  u_cascades;
+
+void main() {
+    uint running = 0u;
+    for (int l = 0; l < u_cascades; ++l) {
+        cascade_base[l] = running;
+        uint last = uint(l) * u_cells + (u_cells - 1u);
+        running += cell_start[last] + cell_count[last];
+    }
+}

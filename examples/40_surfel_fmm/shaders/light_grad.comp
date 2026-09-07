@@ -1,0 +1,192 @@
+#version 460 core
+layout(local_size_x = 128) in;
+
+// ---------------------------------------------------------------------------
+// Spatial gradient of light_vis, per surfel, in world space.
+//
+// The isotropic edge stop (finding 19) rejects any neighbour whose emitter
+// visibility differs -- which stops light bending into a shadow, but also stops
+// the denoise dead in a PENUMBRA, because that is precisely where visibility
+// varies. The penumbra then keeps its full sampling noise, which is the cost
+// finding 19 records.
+//
+// A penumbra is not a discontinuity though: it is a smooth RAMP. So fit a linear
+// model of visibility around each surfel and let the edge stop test the RESIDUAL
+// against that model rather than the raw difference:
+//
+//     residual = v_j - v_i - grad_i . (p_j - p_i)
+//
+// Along a ramp the residual is ~0 and every neighbour is accepted, so the
+// penumbra is denoised at full strength -- and averaging a linear function with a
+// symmetric kernel returns its centre value, so the ramp survives the averaging
+// rather than being flattened by it. At a real discontinuity -- a contact
+// shadow, a silhouette -- no linear model fits, the residual stays large, and
+// the neighbour is still rejected. This is "average along the iso-visibility
+// direction", with the bonus that it also averages ACROSS the ramp wherever the
+// ramp is genuinely linear.
+//
+// Weighted least squares in the tangent plane, solved as a 2x2 and rotated back
+// to world so nothing downstream has to agree on a tangent frame:
+//
+//     [ Sxx Sxy ] [gx]   [Sxv]
+//     [ Sxy Syy ] [gy] = [Syv]
+// ---------------------------------------------------------------------------
+
+#include "surfel.glsl"
+#include "micro.glsl"
+
+layout(std430, binding = 8)  readonly  buffer CellSC   { uvec2 cell_sc[]; };
+layout(std430, binding = 9)  readonly  buffer CellIt   { uint  cell_item[]; };
+layout(std430, binding = 10) readonly  buffer CellPR   { vec4  cell_pr[]; };
+layout(std430, binding = 16) readonly  buffer LightVis { float light_vis[]; };
+layout(std430, binding = 17) readonly  buffer LightMax { uint  light_max[]; };
+layout(std430, binding = 18) writeonly buffer LightGrd { vec4  light_grad[]; };
+
+uniform uint  u_count;
+uniform vec3  u_grid_min;
+uniform ivec3 u_grid_res;
+uniform float u_inv_cell;
+uniform float u_radius;      // world units
+uniform float u_plane_tol;   // world units
+uniform float u_normal_tol;
+uniform float u_light_sigma;   // same width the edge stop uses
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= u_count) return;
+
+    const vec3  p = s_pos_rad[i].xyz;
+    const vec3  n = surfel_normal(i);
+    const float lnorm = 1.0 / max(uintBitsToFloat(light_max[0]), 1e-8);
+    const float vi = light_vis[i] * lnorm;
+
+    vec3 T, B;
+    sgi_onb(n, T, B);
+
+    float Sxx = 0.0, Sxy = 0.0, Syy = 0.0, Sxv = 0.0, Syv = 0.0;
+
+    const vec3  g  = (p - u_grid_min) * u_inv_cell;
+    const ivec3 hc = clamp(ivec3(floor(g)), ivec3(0), u_grid_res - 1);
+    const float r2max = u_radius * u_radius;
+    const float inv_sigma2 = 1.0 / max(0.5 * r2max, 1e-12);
+
+    for (int dz = -1; dz <= 1; ++dz) {
+        const int cz = hc.z + dz;
+        if (cz < 0 || cz >= u_grid_res.z) continue;
+        for (int dy = -1; dy <= 1; ++dy) {
+            const int cy = hc.y + dy;
+            if (cy < 0 || cy >= u_grid_res.y) continue;
+            for (int dx = -1; dx <= 1; ++dx) {
+                const int cx = hc.x + dx;
+                if (cx < 0 || cx >= u_grid_res.x) continue;
+                const uint ci = uint(cx) + uint(u_grid_res.x) *
+                                (uint(cy) + uint(u_grid_res.y) * uint(cz));
+                const uvec2 sc = cell_sc[ci];
+                for (uint k = 0u; k < sc.y; ++k) {
+                    const uint e = sc.x + k;
+                    const uint j = cell_item[e];
+                    if (j == i) continue;
+                    const vec3  dv = cell_pr[e].xyz - p;
+                    const float r2 = dot(dv, dv);
+                    if (r2 >= r2max) continue;
+                    const vec3  nj = surfel_normal(j);
+                    const float nd = dot(n, nj);
+                    if (nd <= u_normal_tol) continue;
+                    if (abs(dot(dv, n)) > u_plane_tol) continue;
+
+                    const float w  = exp(-r2 * inv_sigma2) * nd;
+                    const float lx = dot(dv, T);
+                    const float ly = dot(dv, B);
+                    const float dvv = light_vis[j] * lnorm - vi;
+
+                    Sxx += w * lx * lx;
+                    Sxy += w * lx * ly;
+                    Syy += w * ly * ly;
+                    Sxv += w * lx * dvv;
+                    Syv += w * ly * dvv;
+                }
+            }
+        }
+    }
+
+    // A near-singular fit means the neighbours are collinear or too few to
+    // constrain a plane. Fall back to zero gradient, which degrades exactly to
+    // the isotropic edge stop rather than to an extrapolated guess.
+    const float det = Sxx * Syy - Sxy * Sxy;
+    const float scale = max(Sxx + Syy, 1e-20);
+    vec2 gr = vec2(0.0);
+    if (abs(det) > 1e-6 * scale * scale)
+        gr = vec2(Syy * Sxv - Sxy * Syv, Sxx * Syv - Sxy * Sxv) / det;
+
+    // ROBUST REFIT. A least-squares fit always returns a plane, including across
+    // a hard shadow boundary, and there it returns a steep one that "explains"
+    // the jump -- so the edge stop accepts the neighbour and light crosses the
+    // boundary anyway (measured: umbra leak back from 0.554 to 1.819).
+    //
+    // Rejecting the whole gradient when the fit is poor does not work either,
+    // because light_vis carries its own sampling noise, so the residual is large
+    // almost everywhere and the gradient is thrown away in the penumbra too --
+    // which is the case it exists for (measured: penumbra noise 9.88, barely
+    // better than isotropic's 10.15).
+    //
+    // So refit instead of judging: one reweighted pass that downweights the
+    // neighbours the first fit disagrees with. Across a discontinuity that
+    // discards the far side and leaves a gradient fitted to the surfel's OWN
+    // side, which is both the correct local model and one that no longer
+    // explains away the jump. The tolerance is generous (3 sigma) so ordinary
+    // noise is not treated as an outlier.
+    const float rtol = 3.0 * max(u_light_sigma, 1e-4);
+    float Rxx = 0.0, Rxy = 0.0, Ryy = 0.0, Rxv = 0.0, Ryv = 0.0;
+    float rss = 0.0, wtot = 0.0;
+    for (int dz = -1; dz <= 1; ++dz) {
+        const int cz = hc.z + dz;
+        if (cz < 0 || cz >= u_grid_res.z) continue;
+        for (int dy = -1; dy <= 1; ++dy) {
+            const int cy = hc.y + dy;
+            if (cy < 0 || cy >= u_grid_res.y) continue;
+            for (int dx = -1; dx <= 1; ++dx) {
+                const int cx = hc.x + dx;
+                if (cx < 0 || cx >= u_grid_res.x) continue;
+                const uint ci = uint(cx) + uint(u_grid_res.x) *
+                                (uint(cy) + uint(u_grid_res.y) * uint(cz));
+                const uvec2 sc = cell_sc[ci];
+                for (uint k = 0u; k < sc.y; ++k) {
+                    const uint e = sc.x + k;
+                    const uint j = cell_item[e];
+                    if (j == i) continue;
+                    const vec3  dv = cell_pr[e].xyz - p;
+                    const float r2 = dot(dv, dv);
+                    if (r2 >= r2max) continue;
+                    const vec3  nj = surfel_normal(j);
+                    const float nd = dot(n, nj);
+                    if (nd <= u_normal_tol) continue;
+                    if (abs(dot(dv, n)) > u_plane_tol) continue;
+                    const float w = exp(-r2 * inv_sigma2) * nd;
+                    const float lx = dot(dv, T);
+                    const float ly = dot(dv, B);
+                    const float dvv = light_vis[j] * lnorm - vi;
+                    const float r = dvv - (gr.x * lx + gr.y * ly);
+
+                    const float rw = w * exp(-(r * r) / (rtol * rtol));
+                    Rxx += rw * lx * lx;
+                    Rxy += rw * lx * ly;
+                    Ryy += rw * ly * ly;
+                    Rxv += rw * lx * dvv;
+                    Ryv += rw * ly * dvv;
+
+                    rss  += w * r * r;
+                    wtot += w;
+                }
+            }
+        }
+    }
+    const float rdet = Rxx * Ryy - Rxy * Rxy;
+    const float rsc  = max(Rxx + Ryy, 1e-20);
+    if (abs(rdet) > 1e-6 * rsc * rsc)
+        gr = vec2(Ryy * Rxv - Rxy * Ryv, Rxx * Ryv - Rxy * Rxv) / rdet;
+
+    // The gradient is used at full strength; the per-neighbour residual test in
+    // the filter and the gather is what still rejects a neighbour the refitted
+    // model does not predict.
+    light_grad[i] = vec4(T * gr.x + B * gr.y, 1.0);
+}

@@ -1,4 +1,5 @@
 build/
+build-release/
 docs/html/
 *.swp
 .DS_Store

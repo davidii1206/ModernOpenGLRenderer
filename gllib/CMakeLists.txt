@@ -117,7 +117,6 @@ add_library(gllib
     gfx/skeleton.cpp
     gfx/animation.cpp
     gfx/imgui_overlay.cpp
-    gfx/fsr2.cpp
     gllib/log.cpp
 )
 
@@ -140,40 +139,51 @@ target_link_libraries(gllib
         glfw
 )
 
-# FidelityFX FSR2 — CPU API only (backend implemented in gfx/fsr2_backend_gl.cpp)
-FetchContent_Declare(
-    ffx_fsr2
-    GIT_REPOSITORY /tmp/opencode/FidelityFX-FSR2-OpenGL
-    GIT_TAG dd62b03
-    SOURCE_SUBDIR src/ffx-fsr2-api
-    GIT_SUBMODULES ""
-)
-FetchContent_GetProperties(ffx_fsr2)
-if(NOT ffx_fsr2_POPULATED)
-    FetchContent_Populate(ffx_fsr2)
-endif()
-
 target_compile_definitions(gllib
     PUBLIC
         GLLIB_GL_NAMESPACE=1
-        FFX_GCC=1
-)
-target_include_directories(gllib
-    PUBLIC
-        ${ffx_fsr2_SOURCE_DIR}/src/ffx-fsr2-api
-)
-target_sources(gllib PRIVATE
-    gfx/fsr2_cpu_api.cpp
-    gfx/fsr2_backend_gl.cpp
-    ${ffx_fsr2_SOURCE_DIR}/src/ffx-fsr2-api/ffx_assert.cpp
 )
 
-# ffx_types.h uses size_t without including <cstddef>; force-include compat header
-set_source_files_properties(
-    ${ffx_fsr2_SOURCE_DIR}/src/ffx-fsr2-api/ffx_assert.cpp
-    PROPERTIES COMPILE_FLAGS "-include ${CMAKE_CURRENT_SOURCE_DIR}/gfx/ffx_compat.h"
-)
+# FidelityFX FSR2 — CPU API only (backend implemented in gfx/fsr2_backend_gl.cpp).
+# Off by default: it is fetched from a local checkout that is not part of this repo,
+# and no example links it. Enable with -DGLLIB_ENABLE_FSR2=ON and point
+# GLLIB_FSR2_REPOSITORY at a FidelityFX-FSR2-OpenGL checkout.
+option(GLLIB_ENABLE_FSR2 "Build the FidelityFX FSR2 integration" OFF)
+set(GLLIB_FSR2_REPOSITORY "/tmp/opencode/FidelityFX-FSR2-OpenGL"
+    CACHE STRING "Path or URL of the FidelityFX-FSR2-OpenGL repository")
 
-target_compile_definitions(gllib PRIVATE
-    FSR2_SHADERS_DIR="${ffx_fsr2_SOURCE_DIR}/src/ffx-fsr2-api/shaders"
-)
+if(GLLIB_ENABLE_FSR2)
+    FetchContent_Declare(
+        ffx_fsr2
+        GIT_REPOSITORY ${GLLIB_FSR2_REPOSITORY}
+        GIT_TAG dd62b03
+        SOURCE_SUBDIR src/ffx-fsr2-api
+        GIT_SUBMODULES ""
+    )
+    FetchContent_GetProperties(ffx_fsr2)
+    if(NOT ffx_fsr2_POPULATED)
+        FetchContent_Populate(ffx_fsr2)
+    endif()
+
+    target_compile_definitions(gllib PUBLIC FFX_GCC=1 GLLIB_HAS_FSR2=1)
+    target_include_directories(gllib
+        PUBLIC
+            ${ffx_fsr2_SOURCE_DIR}/src/ffx-fsr2-api
+    )
+    target_sources(gllib PRIVATE
+        gfx/fsr2.cpp
+        gfx/fsr2_cpu_api.cpp
+        gfx/fsr2_backend_gl.cpp
+        ${ffx_fsr2_SOURCE_DIR}/src/ffx-fsr2-api/ffx_assert.cpp
+    )
+
+    # ffx_types.h uses size_t without including <cstddef>; force-include compat header
+    set_source_files_properties(
+        ${ffx_fsr2_SOURCE_DIR}/src/ffx-fsr2-api/ffx_assert.cpp
+        PROPERTIES COMPILE_FLAGS "-include ${CMAKE_CURRENT_SOURCE_DIR}/gfx/ffx_compat.h"
+    )
+
+    target_compile_definitions(gllib PRIVATE
+        FSR2_SHADERS_DIR="${ffx_fsr2_SOURCE_DIR}/src/ffx-fsr2-api/shaders"
+    )
+endif()

@@ -30,7 +30,10 @@ struct ModelMaterialInfo {
     int normal_tex = -1;
     int occlusion_tex = -1;
     int emissive_tex = -1;
+    // Already multiplied by KHR_materials_emissive_strength, so this may exceed
+    // 1 even though glTF clamps the raw emissiveFactor to [0,1].
     float emissive_factor[3] = {0, 0, 0};
+    float emissive_strength = 1.0f;   // the raw extension value, for reference
     AlphaMode alpha_mode = AlphaMode_Opaque;
     float alpha_cutoff = 0.5f;
     bool double_sided = false;   // glTF material.doubleSided (no backface culling)

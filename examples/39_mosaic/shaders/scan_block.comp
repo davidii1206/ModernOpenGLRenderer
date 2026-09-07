@@ -1,0 +1,35 @@
+#version 460 core
+layout(local_size_x = 256) in;
+
+// Exclusive prefix sum, pass 1 of 3: block-local scan of counts -> starts,
+// plus each block's total into bsum[block].
+layout(std430, binding = 0) readonly buffer Counts { uint counts[]; };
+layout(std430, binding = 1) buffer Starts { uint starts[]; };
+layout(std430, binding = 2) buffer BlockSum { uint bsum[]; };
+
+uniform uint u_n;      // element count in this segment
+uniform uint u_off;    // segment offset (shared by counts and starts)
+
+shared uint s[256];
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint lid = gl_LocalInvocationID.x;
+    uint bid = gl_WorkGroupID.x;
+
+    s[lid] = (gid < u_n) ? counts[u_off + gid] : 0u;
+    barrier();
+
+    // Hillis-Steele inclusive scan in shared memory.
+    for (uint stride = 1u; stride < 256u; stride <<= 1u) {
+        uint v = 0u;
+        if (lid >= stride) v = s[lid - stride];
+        barrier();
+        s[lid] += v;
+        barrier();
+    }
+
+    uint excl = (lid == 0u) ? 0u : s[lid - 1u];
+    if (gid < u_n) starts[u_off + gid] = excl;
+    if (lid == 255u) bsum[bid] = s[lid];
+}

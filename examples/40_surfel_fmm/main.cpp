@@ -1,0 +1,762 @@
+// ---------------------------------------------------------------------------
+// Example 40 — surfel GI, brute-force reference
+//
+// surfel-gi-spec-r3.md section 10 is emphatic that this method must NOT be
+// built in dependency order:
+//
+//   1. Brute-force all-pairs, no occlusion, no hierarchy. O(N^2), slow, but
+//      unambiguously correct for form factors. Do not proceed until this
+//      matches.
+//   2. Add the microbuffer with a brute-force candidate list (still all-pairs).
+//      Now you have correct occlusion. This is the algorithmic core; everything
+//      after is acceleration.
+//
+// This example is exactly those two steps plus the instruments that prove them.
+// There is no sparse grid, no FMM, no interaction list and no temporal
+// amortization here on purpose: steps 3-10 are acceleration, and step 4 is
+// specified as "bit-identical against step 3", which is impossible without this
+// reference existing first.
+//
+// Two path-traced images at a matched camera are the external gate:
+//   CornellBoxGroundTruthDirectLighting.png   sweep 1  (direct only)
+//   CornellBoxOriginalGroundTruth.png         converged multi-bounce
+//
+// Design spec: surfel-gi-spec-r3.md in the repo root.
+// Stage status: implementation.md next to this file.
+//
+// Run from this target's build directory: the model, shaders/ and both
+// reference PNGs are resolved relative to the working directory.
+//
+// Every knob is an env var as well as an ImGui control, so a measurement can be
+// scripted. The ones that matter, with defaults:
+//
+//   SGI_GATE=all            run the 30 assertions and exit
+//   SGI_MODEL=path.glb      CornellBoxOriginal.glb; the references only match it
+//   SGI_SURFELS=30000       target count; the bake floors at one per triangle
+//   SGI_BUCKETS=16          microbuffer edge, 8 or 16
+//   SGI_BOUNCES=8           max sweeps; sweep k == k bounces under per-pixel NEE
+//   SGI_SOLVE=n             pre-solve n sweeps, then hold (scripted shots)
+//   SGI_PAUSE=1             hold the solver from frame 0; with SGI_SOLVE=0 the
+//                           cache stays zero, which is how a direct-only shot
+//                           is taken -- SGI_SOLVE=0 alone keeps solving
+//   SGI_METHOD=0|1          M1 analytic (no occlusion) | M2 microbuffer
+//   SGI_NEE=1               split the direct term out of the microbuffer
+//   SGI_NEE_PIXEL=0         evaluate that direct term per pixel, not per surfel
+//   SGI_NEE_OCC=2.0         occluder radius scale, visibility only (finding 29)
+//   SGI_NEE_CUTS=1          clip occluder discs at mesh feature edges
+//   SGI_NEE_THICK=0.25      surfel slab half-thickness, in radii
+//   SGI_GTCAM=0|1|2         free | reference camera at 512^2 | at 1600x900
+//   SGI_BENCH=n             n frames, print per-pass timings, exit
+//   SGI_SHOT=path.png       write the final frame
+//   SGI_NOGUI=1             no ImGui -- required for a clean screenshot
+// ---------------------------------------------------------------------------
+
+#include "gpu_util.hpp"
+#include "surfels.hpp"
+#include "brute.hpp"
+#include "screen.hpp"
+#include "grid.hpp"
+#include "direct.hpp"
+#include "cuts.hpp"
+#include "validate.hpp"
+
+#include <gl/gl.hpp>
+#include <gfx/gfx.hpp>
+#include <gllib/log.hpp>
+#include <imgui.h>
+
+#include <glm/gtc/matrix_transform.hpp>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <string>
+#include <vector>
+
+using namespace sgi;
+
+namespace {
+
+constexpr const char* kModelPath = "CornellBoxOriginal.glb";
+
+// Camera matched to the two path-traced references.
+//
+// The glb carries no camera, so this was derived from the reference itself: at
+// row 256 of the 512-wide direct-lighting render the back wall spans x in
+// [112, 404], i.e. 57.3% of the frame, and the walls are 2.02 units apart, so
+// the frame is 3.53 units wide at z = -1.04. That fixes the eye distance for a
+// given FOV, and the FOV was then refined against the reference's floor and
+// ceiling lines. The scene is NOT fit-normalized (example 39 normalizes because
+// it must also handle Sponza), so these are native glb units: floor y = 0,
+// ceiling y = 1.99, back wall z = -1.04, opening toward +z.
+constexpr glm::vec3 kGtEye{0.004f, 0.999f, 3.864f};
+constexpr glm::vec3 kGtTarget{0.004f, 0.999f, 0.0f};
+constexpr float     kGtFovY = 38.75f;
+constexpr int       kGtRes  = 512;   // square, so the diff is pixel-aligned
+
+const char* const kTonemapNames[] = {"ACES", "Reinhard", "Clamp", "Filmic"};
+
+struct EnvOpts {
+    std::string gate;            // SGI_GATE=all|p2p,disc,...   run gates and exit
+    std::string model = kModelPath;  // SGI_MODEL=path.glb  (the references only
+                                     // match CornellBoxOriginal.glb; anything else
+                                     // is for testing the estimator, not for a
+                                     // numeric comparison)
+    uint32_t surfels = 30000;    // SGI_SURFELS
+    uint32_t budget  = 2048;     // SGI_BUDGET   receivers per frame
+    uint32_t bounces = 8;        // SGI_BOUNCES  sweeps; 1 == direct only
+    uint32_t buckets = 16;       // SGI_BUCKETS  microbuffer edge (8 or 16)
+    int   method = 1;            // SGI_METHOD   0 = M1 radiance, 1 = M2 micro
+    float sky = 0.0f;            // SGI_SKY
+    float emissive = 1.0f;       // SGI_EMISSIVE
+    int   view = 7;              // SGI_VIEW     display mode index
+    // 1 = reference camera at 512^2 (pixel-aligned against the PNGs)
+    // 2 = reference camera at the normal 1600x900 window. Finding 15's metrics
+    //     were all taken at 512^2 and the surfel spacing is 3x coarser in pixels
+    //     at full resolution, which is a difference the reconstruction is
+    //     sensitive to -- so every reconstruction number now gets taken at both.
+    int   gtcam = 0;             // SGI_GTCAM
+    uint32_t solve = 0;          // SGI_SOLVE=n  n full sweeps before first present
+    int   bench = 0;             // SGI_BENCH=n  n frames, print timing, exit
+    bool  shot = false;          // SGI_SHOT=path
+    std::string shot_path;
+    bool  nogui = false;         // SGI_NOGUI=1
+    bool  stats = false;         // SGI_STATS=1  stalling per-sweep read-back
+    int   tonemap = 0;           // SGI_TONEMAP
+    int   jitter = 1;            // SGI_JITTER   0 none, 1 static, 2 per frame
+    bool  points = false;        // SGI_POINTS=1
+    int   nee = 1;               // SGI_NEE      1 = split direct out of the microbuffer
+    int   neepixel = 0;          // SGI_NEE_PIXEL 1 = direct term per pixel, not per surfel
+    float neethick = 0.25f;      // SGI_NEE_THICK surfel slab half-thickness, in radii
+    float neeself = 0.9f;        // SGI_NEE_SELF  same-surface normal agreement
+    float neeselftol = 1.0f;     // SGI_NEE_SELF_TOL same-surface plane tolerance, in radii
+    float neebias = 0.05f;       // SGI_NEE_BIAS receiver offset, in radii
+    float neeocc = 2.0f;         // SGI_NEE_OCC  occluder radius scale, visibility only
+    int   neecuts = 1;           // SGI_NEE_CUTS 1 = clip discs at mesh feature edges
+    bool  showlight = false;     // SGI_SHOW_LIGHT=1 render light_vis instead of E
+    int   mls = 1;               // SGI_MLS      0 = Shepard, 1 = degree-1 MLS
+    float exposure = 1.0f;       // SGI_EXPOSURE
+    bool  paused = false;        // SGI_PAUSE=1
+    float bias = -1.0f;          // SGI_BIAS     plane bias, in receiver radii
+    float soft = -1.0f;          // SGI_SOFT     disc softening eps, in r^2
+    float horizon = -1.0f;       // SGI_HORIZON  receiver-side cos floor
+    int   twosided = -1;         // SGI_TWOSIDED force all surfels two-sided
+    float cell = 1.0f;           // SGI_CELL     grid cell size, in spacings
+    float gradius = 2.5f;        // SGI_GATHER_R gather radius, in spacings
+    float gplane = 1.0f;         // SGI_GATHER_P gather plane tolerance, in spacings
+    float gnormal = 0.0f;        // SGI_GATHER_N gather min dot(n_px, n_surfel)
+    int   gkernel = 1;           // SGI_GATHER_K 0 = (r-d) cone, 1 = Wendland C2, 2 = Gaussian
+    // The visibility edge stop (findings 19-20) is OFF by default. It was built
+    // when the microbuffer carried the direct term, where the cache held a hard
+    // shadow boundary that the gather would otherwise interpolate across. Under
+    // per-pixel NEE the cache holds the INDIRECT term only, which has no such
+    // boundary -- so the stop has nothing legitimate left to preserve, and all it
+    // does is suppress neighbours wherever light_vis jumps, carving a rough row
+    // out of the reconstruction at every shadow edge. Measured at the ceiling
+    // junction, row 109 of the reference camera: the row's horizontal sd was
+    // 12.21 against the reference's 4.16, and turning the stop off puts it at
+    // 4.40 while the mean error improves from -15.3 to -10.6.
+    //
+    // Still wired up, because `SGI_NEE_PIXEL=0` does put the direct term back in
+    // the cache and then the stop is doing its original job.
+    float lsigma = 0.0f;         // SGI_LIGHT_SIGMA edge-stop width, 0 = off
+    float lgrad = 0.5f;          // SGI_LIGHT_GRAD  trust in the visibility gradient, 0..1
+    int   filter = 6;            // SGI_FILTER   cache denoise iterations, 0 = off
+    float fradius = 3.0f;        // SGI_FILTER_R denoise radius, in spacings
+};
+
+EnvOpts read_env() {
+    EnvOpts o;
+    auto u32 = [](const char* v, uint32_t& dst) { dst = uint32_t(std::max(0, atoi(v))); };
+    if (const char* v = getenv("SGI_GATE"))     o.gate = v;
+    if (const char* v = getenv("SGI_MODEL"))    o.model = v;
+    if (const char* v = getenv("SGI_SURFELS"))  u32(v, o.surfels);
+    if (const char* v = getenv("SGI_BUDGET"))   u32(v, o.budget);
+    if (const char* v = getenv("SGI_BOUNCES"))  u32(v, o.bounces);
+    if (const char* v = getenv("SGI_BUCKETS"))  u32(v, o.buckets);
+    if (const char* v = getenv("SGI_METHOD"))   o.method = atoi(v);
+    if (const char* v = getenv("SGI_SKY"))      o.sky = float(atof(v));
+    if (const char* v = getenv("SGI_EMISSIVE")) o.emissive = float(atof(v));
+    if (const char* v = getenv("SGI_VIEW"))     o.view = atoi(v);
+    if (const char* v = getenv("SGI_GTCAM"))    o.gtcam = atoi(v);
+    if (const char* v = getenv("SGI_SOLVE"))    u32(v, o.solve);
+    if (const char* v = getenv("SGI_BENCH"))    o.bench = atoi(v);
+    if (const char* v = getenv("SGI_SHOT"))     { o.shot = true; o.shot_path = v; }
+    if (const char* v = getenv("SGI_NOGUI"))    o.nogui = atoi(v) != 0;
+    if (const char* v = getenv("SGI_STATS"))    o.stats = atoi(v) != 0;
+    if (const char* v = getenv("SGI_TONEMAP"))  o.tonemap = atoi(v);
+    if (const char* v = getenv("SGI_JITTER"))   o.jitter = atoi(v);
+    if (const char* v = getenv("SGI_POINTS"))   o.points = atoi(v) != 0;
+    if (const char* v = getenv("SGI_NEE"))       o.nee = atoi(v);
+    if (const char* v = getenv("SGI_NEE_PIXEL")) o.neepixel = atoi(v);
+    if (const char* v = getenv("SGI_NEE_THICK")) o.neethick = float(atof(v));
+    if (const char* v = getenv("SGI_NEE_SELF"))  o.neeself = float(atof(v));
+    if (const char* v = getenv("SGI_NEE_SELF_TOL")) o.neeselftol = float(atof(v));
+    if (const char* v = getenv("SGI_NEE_BIAS"))  o.neebias = float(atof(v));
+    if (const char* v = getenv("SGI_NEE_OCC"))   o.neeocc = float(atof(v));
+    if (const char* v = getenv("SGI_NEE_CUTS"))  o.neecuts = atoi(v);
+    if (const char* v = getenv("SGI_SHOW_LIGHT")) o.showlight = atoi(v) != 0;
+    if (const char* v = getenv("SGI_MLS"))       o.mls = atoi(v);
+    if (const char* v = getenv("SGI_EXPOSURE")) o.exposure = float(atof(v));
+    if (const char* v = getenv("SGI_PAUSE"))    o.paused = atoi(v) != 0;
+    if (const char* v = getenv("SGI_BIAS"))     o.bias = float(atof(v));
+    if (const char* v = getenv("SGI_SOFT"))     o.soft = float(atof(v));
+    if (const char* v = getenv("SGI_HORIZON"))  o.horizon = float(atof(v));
+    if (const char* v = getenv("SGI_TWOSIDED")) o.twosided = atoi(v);
+    if (const char* v = getenv("SGI_CELL"))     o.cell = float(atof(v));
+    if (const char* v = getenv("SGI_GATHER_R")) o.gradius = float(atof(v));
+    if (const char* v = getenv("SGI_GATHER_P")) o.gplane = float(atof(v));
+    if (const char* v = getenv("SGI_GATHER_N")) o.gnormal = float(atof(v));
+    if (const char* v = getenv("SGI_GATHER_K")) o.gkernel = atoi(v);
+    if (const char* v = getenv("SGI_LIGHT_SIGMA")) o.lsigma = float(atof(v));
+    if (const char* v = getenv("SGI_LIGHT_GRAD"))  o.lgrad = float(atof(v));
+    if (const char* v = getenv("SGI_FILTER"))   o.filter = atoi(v);
+    if (const char* v = getenv("SGI_FILTER_R")) o.fradius = float(atof(v));
+    return o;
+}
+
+// Percentiles over the steady-state tail. The MINIMUM of the tail is the least
+// clock-perturbed sample on a mobile GPU, so it is the number to compare across
+// runs; the spread says how noisy the machine was.
+void report_bench(std::vector<double> ms) {
+    if (ms.empty()) return;
+    ms.erase(ms.begin(), ms.begin() + ms.size() / 3);
+    if (ms.empty()) return;
+    std::sort(ms.begin(), ms.end());
+    auto pct = [&](double p) { return ms[std::size_t(p * double(ms.size() - 1))]; };
+    printf("[bench] n=%zu  min=%.3f  p10=%.3f  p50=%.3f  p90=%.3f ms\n",
+           ms.size(), ms.front(), pct(0.10), pct(0.50), pct(0.90));
+}
+
+} // namespace
+
+int main() {
+    gllib::log_to_stderr(gllib::LogLevel::info);
+    const EnvOpts env = read_env();
+
+    gfx::WindowDesc wd;
+    wd.title = "40 — surfel GI, brute-force reference";
+    // The reference PNGs are 512x512. Matching the framebuffer exactly makes the
+    // split and diff views pixel-aligned against them, which is the whole point
+    // of having them.
+    wd.width  = env.gtcam == 1 ? kGtRes : 1600;
+    wd.height = env.gtcam == 1 ? kGtRes : 900;
+    wd.vsync = false;
+    wd.debug = true;
+    gfx::Window window(wd);
+    window.vsync(false);
+    gl::enable_debug_output(false);
+
+    gfx::ImGuiOverlay gui;
+    if (!env.nogui) gui.init(window);
+
+    // --- Scene ---------------------------------------------------------------
+
+    auto model = std::make_unique<gfx::Model>();
+    if (!model->load(env.model.c_str())) {
+        gllib::logf(gllib::LogLevel::error, "failed to load '%s'", env.model.c_str());
+        return 1;
+    }
+
+    std::vector<Tri> tris = extract_triangles(*model);
+    if (tris.empty()) {
+        gllib::log(gllib::LogLevel::error, "no triangles extracted");
+        return 1;
+    }
+
+    SurfelSet scene;
+    scene.build(tris, env.surfels);
+    const Bounds& sb = scene.bounds();
+    gllib::logf(gllib::LogLevel::info,
+                "scene: %zu tris, area %.4f, bounds [%.2f %.2f %.2f]..[%.2f %.2f %.2f]",
+                tris.size(), total_area(tris), sb.mn.x, sb.mn.y, sb.mn.z,
+                sb.mx.x, sb.mx.y, sb.mx.z);
+    gllib::logf(gllib::LogLevel::info,
+                "surfels: %u (%u emissive), r = %.5f, spacing = %.5f, "
+                "sum(pi r^2)/A = %.6f, bake %.2f ms, %.2f MB",
+                scene.count(), scene.emissive_count(), scene.radius(), scene.spacing(),
+                double(scene.count()) * 3.14159265358979 * double(scene.radius()) *
+                    double(scene.radius()) / std::max(1e-12, scene.area()),
+                scene.bake_seconds() * 1000.0, double(scene.bytes()) / (1024.0 * 1024.0));
+
+    // --- Passes --------------------------------------------------------------
+
+    GBuffer gbuf;
+    gbuf.create(window.framebuffer_width(), window.framebuffer_height());
+
+    GeometryPass geometry;
+    SurfelFilterPass filter;
+    SurfelGatherPass gather;
+    DirectPixelPass direct_px;
+    SurfelPointsPass points;
+    DisplayPass display;
+    Solver solver;
+    if (!geometry.init() || !filter.init() || !gather.init() ||
+        !direct_px.init() || !points.init() || !display.init() ||
+        !solver.init()) {
+        gllib::log(gllib::LogLevel::error, "shader initialisation failed");
+        return 1;
+    }
+    gather.resize(gbuf.width, gbuf.height);
+
+    // Static set, so the grid is built once. It is Tier 1's candidate lookup and
+    // Tier 2's ray-traversal structure both.
+    SurfelGrid grid;
+    grid.build(scene, env.cell);
+
+    // Emitter proxies for next event estimation: the direct term is split out
+    // of the microbuffer, which resolves this panel with about 4 of 256 buckets.
+    EmitterSet emitters;
+    emitters.build(tris);
+
+    // Cut planes: the mesh's own sharp and boundary edges, resolved per surfel,
+    // so an occluder disc ends where its geometry does. This is what lets
+    // nee_occ inflate the interior without dilating every silhouette -- see
+    // cuts.hpp.
+    CutSet cuts;
+    cuts.build(scene, tris);
+    solver.attach(&grid, &emitters, &cuts);
+
+    float gather_radius = env.gradius;
+    float gather_plane  = env.gplane;
+    float gather_normal = env.gnormal;
+    int   gather_kernel = env.gkernel;
+    float light_sigma   = env.lsigma;
+    float grad_scale    = env.lgrad;
+    bool  show_light    = env.showlight;
+    int   mls_order     = env.mls;
+    bool  gather_debug  = false;
+    int   filter_iters  = std::max(0, env.filter);
+    float filter_radius = env.fradius;
+
+    References refs;
+    refs.load();
+
+    // --- Solver config -------------------------------------------------------
+
+    SolveConfig cfg;
+    cfg.method = env.method == 0 ? Method::Radiance : Method::Micro;
+    cfg.budget = std::max(1u, env.budget);
+    cfg.max_sweeps = env.bounces;
+    cfg.ms = env.buckets >= 16 ? 16u : 8u;
+    cfg.sky = glm::vec3(env.sky);
+    cfg.emissive_scale = env.emissive;
+    cfg.rotate = std::clamp(env.jitter, 0, 2);
+    cfg.nee = env.nee != 0;
+    cfg.nee_pixel = env.neepixel != 0;
+    cfg.nee_thick = env.neethick;
+    cfg.nee_self_cos = env.neeself;
+    cfg.nee_self_tol = env.neeselftol;
+    cfg.nee_bias = env.neebias;
+    cfg.nee_occ = env.neeocc;
+    cfg.nee_cuts = env.neecuts != 0;
+    if (env.bias >= 0.0f) cfg.plane_bias = env.bias;
+    if (env.soft >= 0.0f) cfg.soft_eps = env.soft;
+    if (env.horizon >= 0.0f) cfg.horizon = env.horizon;
+    if (env.twosided >= 0) cfg.two_sided = env.twosided != 0;
+    cfg.running = !env.paused;
+    solver.reset(scene);
+
+    {
+        double sum_dw = 0.0, sum_wcos = 0.0;
+        solver.bucket_sums(cfg.ms, sum_dw, sum_wcos);
+        gllib::logf(gllib::LogLevel::info,
+                    "bucket table %ux%u: sum(dw) = %.7f (2pi = %.7f), "
+                    "sum(wcos) = %.7f (pi = %.7f)",
+                    cfg.ms, cfg.ms, sum_dw, 2.0 * 3.14159265358979,
+                    sum_wcos, 3.14159265358979);
+    }
+
+    // --- Gates ---------------------------------------------------------------
+    //
+    // Section 9 step 0. They need a GL context but not a frame, so they run here
+    // and the process exits: a PI error is invisible in an image and consistent
+    // across near and far, so it can only be caught against an analytic answer.
+    if (!env.gate.empty()) {
+        const bool ok = run_gates(env.gate, scene, solver, cfg, tris);
+        if (!env.nogui) gui.shutdown();
+        return ok ? 0 : 1;
+    }
+
+    // --- Camera --------------------------------------------------------------
+
+    gfx::Camera cam;
+    const float radius = std::max(0.1f, sb.radius());
+    cam.perspective(env.gtcam != 0 ? kGtFovY : 45.0f,
+                    float(window.framebuffer_width()) /
+                        float(std::max(1, window.framebuffer_height())),
+                    radius * 0.002f, radius * 20.0f);
+    if (env.gtcam != 0) {
+        cam.look_at(kGtEye, kGtTarget);
+    } else {
+        cam.look_at(sb.center() + glm::vec3(0.0f, 0.0f, radius * 2.2f), sb.center());
+    }
+
+    // --- Timers --------------------------------------------------------------
+
+    PassTimer t_frame("Frame", false);
+    PassTimer t_gbuf("G-buffer");
+    PassTimer t_recon("Reconstruct");
+    PassTimer t_direct_px("Direct/px");
+    PassTimer t_display("Display");
+    PassTimer t_points("Points");
+    PassTimer t_imgui("ImGui");
+    PassTimer* const timers[] = {&t_frame, &t_gbuf, &t_recon, &t_direct_px,
+                                 &t_display, &t_points, &t_imgui};
+
+    // --- State ---------------------------------------------------------------
+
+    int view_mode = env.view;
+    int gt_index = 0;
+    int tonemap = std::clamp(env.tonemap, 0, 3);
+    float exposure = env.exposure;
+    float irradiance_gain = 1.0f;
+    float diff_gain = 4.0f;
+    float split_x = 0.5f;
+    int   point_color = 4;              // irradiance
+    float point_scale = 1.0f;
+    bool  show_points = env.points;
+    bool  collect_stats = env.stats;
+    bool  captured = false;
+    int   frame_index = 0;
+    bool  shot_done = false;
+    double last_time = window.time();
+    double window_accum = 0.0;
+    std::vector<double> bench_ms;
+
+    // Scripted screenshots want a finished solve, not a progressive one -- and
+    // then they want it to STOP, so that however many frames the shot takes, the
+    // image is exactly n sweeps and not n plus whatever the budget got through.
+    if (env.solve > 0) {
+        solver.run_sweeps(scene, cfg, env.solve, 0);
+        cfg.running = false;
+        gllib::logf(gllib::LogLevel::info, "pre-solved %u sweep(s), holding", env.solve);
+    }
+
+    while (!window.should_close()) {
+        const double now = window.time();
+        const double frame_ms = (now - last_time) * 1000.0;
+        const float dt = float(std::min(now - last_time, 0.1));
+        last_time = now;
+        // Wall clock, not the CPU span of the loop: with vsync off and no sync
+        // point the CPU runs far ahead and would report submission cost.
+        if (frame_index > 0) t_frame.submit_external(frame_ms);
+
+        window.poll_events();
+
+        const int fw = window.framebuffer_width();
+        const int fh = window.framebuffer_height();
+        if (fw > 0 && fh > 0 && (fw != gbuf.width || fh != gbuf.height)) {
+            gbuf.create(fw, fh);
+            gather.resize(fw, fh);
+            cam.set_aspect(float(fw) / float(fh));
+        }
+
+        camera_control(window, cam, dt, !env.nogui && !gui.wants_mouse(), captured);
+
+        geometry.poll();
+        gather.poll();
+        filter.poll();
+        direct_px.poll();
+        points.poll();
+        display.poll();
+        if (solver.poll()) solver.reset(scene);
+
+        const glm::mat4 view_proj = cam.view_projection();
+
+        // 1. G-buffer.
+        {
+            ScopedPass p(t_gbuf);
+            geometry.render(gbuf, *model, view_proj);
+        }
+
+        // 2. One slice of the O(N^2) solve.
+        solver.step(scene, cfg, uint32_t(frame_index), collect_stats);
+
+        // 3. Surfel irradiance -> screen, by scatter or by gather.
+        {
+            ScopedPass p(t_recon);
+            // Denoise the cache first, in object space, on a copy. The solve is
+            // still iterating on the unfiltered buffer.
+            // Version = (sweeps, cursor): the irradiance only changes when the
+            // solve advances, so a converged or paused solve reuses the filtered
+            // buffer instead of rebuilding it every frame.
+            // Bind explicitly rather than relying on the solve having done it:
+            // a paused or converged solve does not dispatch, and a stale binding
+            // here would silently feed the edge stop garbage.
+            if (solver.light_vis_valid()) solver.bind_light_vis();
+            const uint64_t irr_version =
+                (uint64_t(solver.sweeps()) << 32) | uint64_t(solver.cursor());
+            gl::Buffer* filtered =
+                filter.run(scene, grid, filter_iters, filter_radius,
+                           gather_plane, gather_normal, light_sigma, grad_scale,
+                           irr_version);
+            gather.render(gbuf, scene, grid, cam, gather_radius, gather_plane,
+                          gather_normal, gather_kernel, light_sigma,
+                          grad_scale, show_light, mls_order, gather_debug, filtered);
+        }
+
+        // 3b. The direct term, per pixel, composited onto whatever the
+        //     reconstruction produced. The cache is carrying the residual alone
+        //     when this is on (bf_micro.comp's u_nee_add), so this is an add and
+        //     not a replacement.
+        //
+        //     Its own timer, and outside the pass above: PassTimer wraps a GL
+        //     query object, and a query cannot be begun while another is active.
+        if (cfg.nee && cfg.nee_pixel) {
+            ScopedPass p(t_direct_px);
+            direct_px.render(gbuf, scene, grid, emitters, cuts, cam,
+                             gather.target(),
+                             gbuf.width, gbuf.height, cfg, show_light);
+        } else {
+            t_direct_px.skip();
+        }
+
+        // 4. Display.
+        {
+            ScopedPass p(t_display);
+            DisplayPass::Params dp;
+            dp.view_mode = view_mode;
+            dp.exposure = exposure;
+            dp.irradiance_gain = irradiance_gain;
+            dp.diff_gain = diff_gain;
+            dp.split_x = split_x;
+            dp.gt_index = gt_index;
+            dp.tonemap = tonemap;
+            dp.inv_view_proj = glm::inverse(view_proj);
+            dp.scene_min = sb.mn;
+            dp.scene_extent = glm::max(sb.extent(), glm::vec3(1e-4f));
+            display.render(gbuf, gather.target(), refs, dp);
+        }
+
+        // 5. Optional raw point cloud on top — the check that the
+        //    reconstruction is not hiding something.
+        if (show_points) {
+            ScopedPass p(t_points);
+            points.render(gbuf, scene, view_proj, cam, point_color, point_scale,
+                          irradiance_gain);
+        } else {
+            t_points.skip();
+        }
+
+        // 6. UI.
+        if (env.nogui) {
+            t_imgui.skip();
+        } else {
+            t_imgui.begin();
+            gui.begin_frame();
+            ImGui::SetNextWindowSize(ImVec2(420, 720), ImGuiCond_FirstUseEver);
+            ImGui::Begin("40 — brute-force surfel GI");
+
+            ImGui::Text("%.1f FPS  (%.2f ms)", frame_ms > 0.0 ? 1000.0 / frame_ms : 0.0,
+                        t_frame.disp_cpu());
+
+            if (ImGui::CollapsingHeader("Solve", ImGuiTreeNodeFlags_DefaultOpen)) {
+                int m = int(cfg.method);
+                if (ImGui::Combo("Method", &m, "M1 radiance (no occlusion)\0M2 microbuffer\0")) {
+                    cfg.method = Method(m);
+                    solver.reset(scene);
+                }
+                int msi = cfg.ms == 8 ? 0 : 1;
+                if (ImGui::Combo("Buckets", &msi, "8x8 = 64\0" "16x16 = 256\0")) {
+                    cfg.ms = msi == 0 ? 8u : 16u;
+                    solver.reset(scene);
+                }
+                ImGui::Checkbox("Running", &cfg.running);
+                ImGui::SameLine();
+                if (ImGui::Button("Solve now")) {
+                    const uint32_t n = cfg.max_sweeps ? cfg.max_sweeps : 8u;
+                    solver.reset(scene);
+                    solver.run_sweeps(scene, cfg, n, uint32_t(frame_index));
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Reset")) solver.reset(scene);
+
+                int budget = int(cfg.budget);
+                if (ImGui::SliderInt("Budget / frame", &budget, 64,
+                                     int(std::max(64u, scene.count()))))
+                    cfg.budget = uint32_t(std::max(1, budget));
+                int sweeps = int(cfg.max_sweeps);
+                if (ImGui::SliderInt("Max sweeps (bounces)", &sweeps, 1, 64))
+                    cfg.max_sweeps = uint32_t(std::max(1, sweeps));
+
+                ImGui::Text("sweep %u / %u   cursor %u / %u", solver.sweeps(),
+                            cfg.max_sweeps, solver.cursor(), scene.count());
+                const SolveStats& st = solver.stats();
+                if (st.valid) {
+                    ImGui::Text("mean E %.5f  peak %.4f", st.mean, st.peak);
+                    ImGui::Text("flux %.5f W  delta %.3e (%.4f%%)",
+                                st.flux, st.delta, st.rel_delta * 100.0);
+                    ImGui::Text("nonzero %u / %u", st.nonzero, scene.count());
+                }
+                ImGui::Checkbox("Collect stats (stalls)", &collect_stats);
+            }
+
+            if (ImGui::CollapsingHeader("Transport", ImGuiTreeNodeFlags_DefaultOpen)) {
+                ImGui::SliderFloat("Emissive scale", &cfg.emissive_scale, 0.0f, 8.0f);
+                ImGui::SliderFloat("Sky", &cfg.sky.x, 0.0f, 4.0f);
+                cfg.sky.y = cfg.sky.z = cfg.sky.x;
+                ImGui::SliderFloat("Horizon cos", &cfg.horizon, 0.0f, 0.2f, "%.4f");
+                ImGui::SliderFloat("Plane bias (radii)", &cfg.plane_bias, 0.0f, 4.0f);
+                ImGui::SliderFloat("Disc softening eps", &cfg.soft_eps, 0.0f, 4.0f);
+                ImGui::SliderFloat("Depth tol (radii)", &cfg.depth_tol_radii, 0.0f, 8.0f);
+                ImGui::SliderFloat("Normal tol (cos)", &cfg.normal_tol, -1.0f, 1.0f);
+                ImGui::Checkbox("Two-sided emitters", &cfg.two_sided);
+                ImGui::SameLine();
+                ImGui::Checkbox("No occlusion (gate 5)", &cfg.no_occlusion);
+                ImGui::Combo("Frame rotate", &cfg.rotate,
+                             "None\0Static per surfel\0Per surfel per frame\0");
+            }
+
+            if (ImGui::CollapsingHeader("Direct (NEE)", ImGuiTreeNodeFlags_DefaultOpen)) {
+                ImGui::Checkbox("Split direct out of the microbuffer", &cfg.nee);
+                ImGui::Checkbox("Per pixel (not per surfel)", &cfg.nee_pixel);
+                if (cfg.nee_pixel) {
+                    ImGui::TextDisabled("sweep k == k bounces here; per-surfel needs k+1");
+                }
+                ImGui::Checkbox("Clip discs at mesh edges", &cfg.nee_cuts);
+                ImGui::SliderFloat("Occluder radius scale", &cfg.nee_occ, 1.0f, 4.0f);
+                ImGui::SliderFloat("Slab thickness (radii)", &cfg.nee_thick, 0.0f, 1.0f);
+                ImGui::SliderFloat("Receiver bias (radii)", &cfg.nee_bias, 0.0f, 1.0f);
+                ImGui::SliderFloat("Same-surface cos", &cfg.nee_self_cos, -1.0f, 1.0f);
+                ImGui::SliderFloat("Same-surface tol (radii)", &cfg.nee_self_tol, 0.0f, 4.0f);
+            }
+
+            if (ImGui::CollapsingHeader("View", ImGuiTreeNodeFlags_DefaultOpen)) {
+                int n = 0;
+                const char* const* names = DisplayPass::view_mode_names(n);
+                ImGui::Combo("Mode", &view_mode, names, n);
+                ImGui::Combo("Tonemap", &tonemap, kTonemapNames, 4);
+                ImGui::Combo("Reference", &gt_index, "Direct\0Full GI\0");
+                ImGui::SliderFloat("Exposure", &exposure, 0.05f, 8.0f);
+                ImGui::SliderFloat("Irradiance gain", &irradiance_gain, 0.05f, 20.0f);
+                ImGui::SliderFloat("Diff gain", &diff_gain, 0.5f, 32.0f);
+                ImGui::SliderFloat("Split x", &split_x, 0.0f, 1.0f);
+                {
+                    ImGui::SliderFloat("Light edge stop", &light_sigma, 0.0f, 0.2f,
+                                       "%.4f");
+                    ImGui::SliderFloat("Visibility gradient", &grad_scale, 0.0f, 1.0f);
+                    ImGui::Checkbox("Show light visibility", &show_light);
+                    ImGui::SliderInt("Cache denoise iters", &filter_iters, 0, 24);
+                    ImGui::SliderFloat("Denoise radius (spacings)", &filter_radius, 0.5f, 6.0f);
+                    ImGui::Combo("Interpolation", &mls_order,
+                                 "Shepard (degree 0)\0" "Moving least squares (degree 1)\0");
+                    ImGui::Combo("Gather kernel", &gather_kernel,
+                                 "Schaufler-Jensen (r-d) cone\0" "Wendland C2\0" "Gaussian\0");
+                    ImGui::SliderFloat("Gather radius (spacings)", &gather_radius, 0.1f, 4.0f);
+                    ImGui::SliderFloat("Gather plane tol (spacings)", &gather_plane, 0.1f, 3.0f);
+                    ImGui::SliderFloat("Gather normal tol", &gather_normal, -0.2f, 0.95f);
+                    ImGui::Checkbox("Show fallback pixels", &gather_debug);
+                    ImGui::Text("grid %dx%dx%d  %u entries  %.1f/occupied cell  max %u",
+                                grid.res().x, grid.res().y, grid.res().z, grid.entries(),
+                                grid.mean_per_occupied(), grid.max_per_cell());
+                }
+
+                ImGui::Checkbox("Surfel points", &show_points);
+                if (show_points) {
+                    int cn = 0;
+                    const char* const* cnames = SurfelPointsPass::color_mode_names(cn);
+                    ImGui::Combo("Point colour", &point_color, cnames, cn);
+                    ImGui::SliderFloat("Point scale", &point_scale, 0.25f, 8.0f);
+                }
+                if (ImGui::Button("Reference camera")) {
+                    cam.perspective(kGtFovY, cam.aspect(), cam.near_clip(), cam.far_clip());
+                    cam.look_at(kGtEye, kGtTarget);
+                }
+            }
+
+            if (ImGui::CollapsingHeader("Scene")) {
+                ImGui::Text("surfels     %u (%u emissive)", scene.count(),
+                            scene.emissive_count());
+                ImGui::Text("radius      %.5f", scene.radius());
+                ImGui::Text("spacing     %.5f", scene.spacing());
+                ImGui::Text("area        %.4f", scene.area());
+                ImGui::Text("pairs/sweep %.3g",
+                            double(scene.count()) * double(scene.count()));
+                ImGui::Text("bake        %.2f ms", scene.bake_seconds() * 1000.0);
+                ImGui::Text("eye   %.3f %.3f %.3f", cam.position().x, cam.position().y,
+                            cam.position().z);
+                ImGui::Text("target %.3f %.3f %.3f", cam.target().x, cam.target().y,
+                            cam.target().z);
+                ImGui::Text("fov   %.2f", cam.fov());
+            }
+
+            if (ImGui::CollapsingHeader("Timing", ImGuiTreeNodeFlags_DefaultOpen)) {
+                ImGui::Text("Frame  %6.2f ms", t_frame.disp_cpu());
+                ImGui::Text("Solve  %6.3f ms", solver.timer().disp_gpu());
+                for (PassTimer* t : timers) {
+                    if (!t->gpu()) continue;
+                    ImGui::Text("%-8s %6.3f ms", t->name(), t->disp_gpu());
+                }
+            }
+
+            ImGui::End();
+            gui.render();
+            t_imgui.end();
+        }
+
+        // BEFORE the swap. glfwSwapBuffers leaves the back buffer's contents
+        // undefined, so reading it afterwards returns whatever the driver left
+        // there -- which on this machine is intermittently all-black or
+        // all-white, i.e. a screenshot that silently lies about the render.
+        if (env.shot && !shot_done &&
+            (env.bench > 0 ? frame_index + 1 >= env.bench : window.should_close())) {
+            shot_done = gfx::screenshot(env.shot_path.c_str());
+            gllib::logf(shot_done ? gllib::LogLevel::info : gllib::LogLevel::error,
+                        "%s %s", shot_done ? "wrote" : "FAILED to write",
+                        env.shot_path.c_str());
+        }
+
+        window.swap_buffers();
+
+        for (PassTimer* t : timers) t->readback();
+        solver.timer().readback();
+        // Startup frames (shader compilation, the bake, the driver's clock ramp)
+        // are wildly slower than steady state and would otherwise dominate the
+        // first displayed average, which is the only one a short run shows.
+        if (frame_index < 30) {
+            for (PassTimer* t : timers) t->flush_window();
+            solver.timer().flush_window();
+            window_accum = 0.0;
+        }
+        window_accum += frame_ms;
+        if (window_accum >= 500.0) {
+            for (PassTimer* t : timers) t->flush_window();
+            solver.timer().flush_window();
+            window_accum = 0.0;
+        }
+
+        ++frame_index;
+
+        if (env.bench > 0) {
+            bench_ms.push_back(frame_ms);
+            if (frame_index >= env.bench) break;
+        }
+    }
+
+    if (env.shot && !shot_done)
+        gllib::logf(gllib::LogLevel::warn, "no screenshot written to %s",
+                    env.shot_path.c_str());
+    if (env.bench > 0) {
+        report_bench(std::move(bench_ms));
+        printf("[bench] GPU per pass (avg ms):\n");
+        double total = 0.0;
+        printf("    %-16s %7.3f\n", "Solve", solver.timer().avg_gpu());
+        total += solver.timer().avg_gpu();
+        for (PassTimer* t : timers) {
+            if (!t->gpu()) continue;
+            printf("    %-16s %7.3f\n", t->name(), t->avg_gpu());
+            total += t->avg_gpu();
+        }
+        printf("    %-16s %7.3f\n", "GPU TOTAL", total);
+        printf("[bench] %u surfels, %s, %ux%u buckets, budget %u\n",
+               scene.count(), cfg.method == Method::Micro ? "M2 micro" : "M1 radiance",
+               cfg.ms, cfg.ms, cfg.budget);
+    }
+
+    if (!env.nogui) gui.shutdown();
+    return 0;
+}

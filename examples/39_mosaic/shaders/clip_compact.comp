@@ -1,0 +1,41 @@
+#version 460 core
+layout(local_size_x = 256) in;
+
+// S1 pass 3 — scatter surfel ids into cell order, per cascade:
+//   packed_idx[base[l] + start[cell] + slot] = surfel
+// so a cell's members form a contiguous run and the gather's cell scans are
+// sequential reads.
+//
+// cell_start is relative to each cascade's own scan segment (a single prefix sum
+// is capped at exactly one cascade's 64^3 cells), so cascade_base is what keeps
+// the cascades' ranges disjoint.
+
+#include "clipmap.glsl"
+
+layout(std430, binding = 0) readonly buffer LivePN { vec4 live_pn[]; };
+layout(std430, binding = 1) readonly buffer SurfelSlot { uint surfel_slot[]; };
+layout(std430, binding = 2) readonly buffer CellStart { uint cell_start[]; };
+layout(std430, binding = 3) writeonly buffer PackedIdx { uint packed_idx[]; };
+layout(std430, binding = 5) readonly buffer CascadeBase { uint cascade_base[]; };
+
+uniform vec3  u_origins[3];
+uniform float u_inv_cells[3];
+uniform uint  u_cnt_offs[3];
+uniform uint  u_live_count;
+uniform int   u_cascades;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= u_live_count) return;
+
+    vec3 p = live_pn[2u * i].xyz;
+
+    for (int l = 0; l < u_cascades; ++l) {
+        uint slot = surfel_slot[i * 3u + uint(l)];
+        if (slot == 0xFFFFFFFFu) continue;
+        ivec3 c = clip_cell_coord(p, u_origins[l], u_inv_cells[l]);
+        if (!clip_inside(c)) continue;
+        uint ci = u_cnt_offs[l] + uint(clip_cell_index(c));
+        packed_idx[cascade_base[l] + cell_start[ci] + slot] = i;
+    }
+}

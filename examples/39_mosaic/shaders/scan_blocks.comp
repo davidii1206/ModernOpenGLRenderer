@@ -1,0 +1,29 @@
+#version 460 core
+layout(local_size_x = 1024) in;
+
+// Exclusive prefix sum, pass 2 of 3: scan the block sums in a SINGLE workgroup.
+// This is what caps one scan at 1024 * 256 = 262144 elements. That number is
+// exactly 64^3, the clipmap cascade size, so there is no headroom: a larger
+// cascade needs a multi-level scan here.
+layout(std430, binding = 0) buffer BlockSum { uint bsum[]; };
+
+uniform uint u_nblocks;
+
+shared uint s[1024];
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    s[lid] = (lid < u_nblocks) ? bsum[lid] : 0u;
+    barrier();
+
+    for (uint stride = 1u; stride < 1024u; stride <<= 1u) {
+        uint v = 0u;
+        if (lid >= stride) v = s[lid - stride];
+        barrier();
+        s[lid] += v;
+        barrier();
+    }
+
+    uint excl = (lid == 0u) ? 0u : s[lid - 1u];
+    if (lid < u_nblocks) bsum[lid] = excl;
+}

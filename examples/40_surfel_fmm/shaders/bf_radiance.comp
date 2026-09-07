@@ -1,0 +1,135 @@
+#version 460 core
+layout(local_size_x = 256) in;
+
+// ---------------------------------------------------------------------------
+// M1 -- brute-force all-pairs radiance, no occlusion. Spec section 10 step 1.
+//
+// O(N^2) and deliberately so: this is the reference every accelerated stage gets
+// asserted against, so it has to be unambiguously correct rather than fast.
+//
+// Dispatch: one THREAD per receiver, 256 to a workgroup, with the candidate set
+// streamed through shared memory 256 at a time. Each thread keeps its receiver's
+// whole sum in registers, so there is no cross-lane reduction at all -- which is
+// why this shape beats a workgroup per receiver here. (M2 has to be the other
+// way round, because its microbuffer must live in LDS.)
+// ---------------------------------------------------------------------------
+
+#include "surfel.glsl"
+
+layout(std430, binding = 4) writeonly buffer IrradDst { vec4 irrad_dst[]; };
+layout(std430, binding = 6) readonly  buffer Lout     { vec4 lout[]; };
+
+uniform uint  u_count;
+uniform uint  u_first;        // first receiver of this slice
+uniform uint  u_slice;        // receivers in this slice
+uniform float u_horizon;      // cos(theta) floor on the receiver side
+uniform float u_plane_bias;   // same-surface plane tolerance, in receiver radii
+uniform float u_self_cos;     // and the normal agreement it is paired with
+uniform float u_soft_eps;     // disc softening, in emitter radii squared
+uniform uint  u_two_sided;    // 1 = force every surfel two-sided (diagnostic);
+                              // a material's own flag is honoured regardless
+
+// Candidate tile: 256 * 32 B = 8 KB.
+shared vec4 t_pos_rad[256];
+shared uint t_normal[256];
+shared vec4 t_lout[256];
+
+void main() {
+    const uint lane = gl_LocalInvocationID.x;
+    const uint r    = gl_GlobalInvocationID.x;
+    const bool live = r < u_slice;
+
+    // Slices roll around the set, so a sweep covers every receiver exactly once
+    // however the budget divides them.
+    const uint P = live ? (u_first + r) % u_count : 0u;
+
+    const vec4 prP  = s_pos_rad[P];
+    const vec3 posP = prP.xyz;
+    const vec3 nP   = surfel_normal(P);
+
+    vec3 E = vec3(0.0);
+
+    for (uint base = 0u; base < u_count; base += 256u) {
+        const uint j = base + lane;
+        if (j < u_count) {
+            t_pos_rad[lane] = s_pos_rad[j];
+            t_normal[lane]  = s_normal[j];
+            t_lout[lane]    = lout[j];
+        }
+        barrier();
+
+        // Uniform across the workgroup, so the barriers stay uniform.
+        const uint n = min(256u, u_count - base);
+
+        if (live) {
+            for (uint k = 0u; k < n; ++k) {
+                if (base + k == P) continue;              // self
+
+                const vec4  cpr = t_pos_rad[k];
+                const vec3  dv  = cpr.xyz - posP;
+                const float d2  = dot(dv, dv);
+                if (d2 < 1e-14) continue;
+
+                const vec3 nE = oct_unpack_snorm16(t_normal[k]);
+
+                // Same-surface neighbour, in the sense nee.glsl already uses for
+                // occluders (finding 23): normals AGREE and the centre lies near
+                // the receiver's tangent plane. Both conditions, not just the
+                // second.
+                //
+                // The second alone -- which is what this was, a one-sided slab
+                // at u_plane_bias receiver radii -- is a straight cull of every
+                // emitter near the receiver's plane whatever its orientation.
+                // On a flat surface that is the intent. At a CONCAVE CREASE the
+                // perpendicular plane's near strip lies inside the same slab,
+                // and that strip carries most of the irradiance because its 1/d^2
+                // is the smallest. Gate 13 measures the loss: the surfel row
+                // along the crease came out 68% dark, the next few rows 7-13%,
+                // it did not shrink with density, and it scaled with the bias.
+                // That is the ceiling band findings 30-32 chased through the
+                // reconstruction and the microbuffer and never found, because it
+                // is in neither -- it is here, and M1 has it too.
+                //
+                // Expressed in the RECEIVER's radius (example 37 uses the
+                // emitter's, which only coincides while every radius is equal,
+                // as it is in this bake). bf_micro.comp applies the identical
+                // test -- gate 5 compares the two passes and needs them to agree
+                // exactly here.
+                //
+                // What stops a coplanar neighbour at cosP slightly above zero
+                // from blowing up on 1/d^2 is no longer this cull but the disc
+                // softening below, which is what it was for.
+                if (dot(nE, nP) >= u_self_cos &&
+                    abs(dot(dv, nP)) < u_plane_bias * prP.w) continue;
+
+                const vec3  w    = dv * inversesqrt(d2);
+                const float cosP = dot(nP, w);
+                if (cosP <= u_horizon) continue;
+
+                float cosE = dot(nE, -w);
+                if (u_two_sided != 0u) cosE = abs(cosE);
+                if (cosE <= 0.0) continue;                // back face emits nothing
+
+                // Solid angle, with Christensen's disc softening (Point-Based
+                // Approximate Color Bleeding, 2008 -- the prior art section 11
+                // cites): d^2 -> d^2 + eps*r^2. Section 3.1's cos_E and 1/r^2
+                // are both already inside this, so the ONLY remaining factor is
+                // the receiver cosine.
+                //
+                // A hard min(omega, 2*PI) clamp would do the same job at the
+                // singularity but introduces a derivative discontinuity that
+                // traces a ring on every surface at the distance where it
+                // engages -- example 39's M4b defect 2 in another guise. This
+                // form is smooth, exact in the far field, and bounded at
+                // contact.
+                const float r2e   = cpr.w * cpr.w;
+                const float omega = SGI_PI * r2e * cosE / (d2 + u_soft_eps * r2e);
+
+                E += t_lout[k].rgb * omega * cosP;
+            }
+        }
+        barrier();
+    }
+
+    if (live) irrad_dst[P] = vec4(E, 1.0);
+}

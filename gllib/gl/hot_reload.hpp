@@ -20,6 +20,10 @@ class ShaderFile {
 public:
     ShaderFile() = default;
     ShaderFile(std::string_view path, ShaderType type);
+    // Include dirs must be known before the initial read, or the first
+    // resolve_includes() fails on any #include the file has.
+    ShaderFile(std::string_view path, ShaderType type,
+               std::vector<std::string> include_dirs);
 
     bool valid() const { return !path_.empty(); }
 

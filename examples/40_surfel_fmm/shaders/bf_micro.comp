@@ -1,0 +1,441 @@
+#version 460 core
+layout(local_size_x = 128) in;
+
+// ---------------------------------------------------------------------------
+// M2 -- brute-force microbuffer occlusion. Spec section 10 step 2.
+//
+// One workgroup per receiver; a hemi-octahedral MS x MS microbuffer in shared
+// memory; a 32-bit atomicMin depth resolve; then the near field integrated
+// against per-bucket coverage.
+//
+// Still all-pairs: every surfel is a candidate for every receiver. The 27-cell
+// U-list walk that bounds this to K ~ 91 is step 3, and it will be asserted
+// against what this kernel produces.
+//
+// THE PACKED KEY. Section 4.1 packs depth24 | localIdx8 because the U-list
+// bounds K at 256. Brute force has no bounded candidate list, so the winner's
+// index is global and needs 16 bits:
+//
+//     key = (quantized_depth_16 << 16) | (index & 0xFFFF)
+//
+// capping N at 65536 (asserted on the host). Ties in depth break to the lowest
+// index, so the winner is fully determined by the atomic and is stable across
+// runs -- which example 39's approach is not: it keeps the winner's radiance in
+// LDS beside the key, racing the atomicMin against the stores. 39 can afford
+// that because a temporal filter absorbs the odd wrong texel; a reference
+// cannot.
+//
+// COVERAGE. Section 4.1 takes coverage from the single depth winner,
+// cov = saturate(PI*ar^2/dw), and blends the remainder against the far field.
+// That is self-consistent inside the U-list, where K ~ 91 over 64 buckets means
+// about 1.4 candidates per bucket and each one subtends roughly a whole bucket.
+// It is CATASTROPHICALLY wrong in the brute-force regime: at N = 30k a wall
+// surfel one metre away subtends ~9e-4 sr against a 64-bucket texel's 0.098 sr,
+// so ~110 surfels share a texel, the single winner reports it 1% covered, and
+// with no far field to blend against a closed room comes out ~100x too dark.
+//
+// So coverage ACCUMULATES here, and so does coverage-weighted radiance. Example
+// 39 arrived at summed coverage for the same reason but kept winner-takes-all
+// radiance, which is exact only when everything sharing a texel is the same
+// colour.
+// ---------------------------------------------------------------------------
+
+#include "surfel.glsl"
+#include "micro.glsl"
+#include "pack.glsl"
+
+layout(std430, binding = 4) writeonly buffer IrradDst { vec4 irrad_dst[]; };
+layout(std430, binding = 6) readonly  buffer Lout     { vec4 lout[]; };
+// bucket[2b+0] = (dir.xyz tangent frame, dw), bucket[2b+1] = (wcos, 0, 0, 0)
+layout(std430, binding = 7) readonly  buffer Buckets  { vec4 bucket[]; };
+
+// LIGHT VISIBILITY, one scalar per receiver. The cosine-weighted fraction of the
+// hemisphere covered by EMITTERS that this receiver can actually see:
+//
+//     light = INTEGRAL over the hemisphere of [emitter visible] cos dOmega / PI
+//
+// 1 where the light fills the hemisphere, 0 in umbra, and a smooth ramp across a
+// penumbra. It exists so that anything averaging surfels together can tell
+// whether two neighbours are in the same lighting situation.
+//
+// It has to be this rather than E, and the reason is measured: E carries 7.4x
+// the path tracer's high frequency on a provably smooth surface (finding 15), so
+// a similarity test on E cannot separate a shadow edge from sampling noise. This
+// is pure visibility geometry -- bounded in [0,1], no radiance magnitude, no
+// albedo, no bounce -- so it is stable exactly where E is not, and it does not
+// drift as the solve converges.
+layout(std430, binding = 16) writeonly buffer LightVis { float light_vis[]; };
+// Running maximum of light_vis over the set, as a bit-cast float (valid for
+// non-negatives). The absolute value is scene-dependent -- Cornell's panel
+// subtends about 4 of 256 buckets, so a fully lit floor surfel reads ~0.016, not
+// ~1 -- and a similarity threshold in absolute units would therefore have to be
+// retuned per scene. Normalizing by the observed maximum makes the edge stop's
+// width mean "this fraction of the way from umbra to full light" everywhere.
+// One atomic per receiver; monotone, so no clear is needed between sweeps.
+layout(std430, binding = 17) buffer LightMax { uint light_max[]; };
+// The direct term, computed once per solve by nee_direct.comp. Added here rather
+// than in a separate pass so the irradiance buffer has one writer.
+layout(std430, binding = 20) readonly buffer DirectIn { vec4 direct_e[]; };
+uniform uint u_store_light;
+// With NEE on, light_vis comes from the direct pass's bitmask (64 stratified
+// samples of the emitter, noise-free) instead of this kernel's emissive-coverage
+// by-product, which was built from about 4 buckets and carried the microbuffer's
+// own sampling noise.
+uniform uint u_nee;
+// Whether the direct term is folded into the cached irradiance here. It is when
+// the image reads its direct term from the cache; it is NOT when the image
+// computes it per pixel, because then the cache must hold the residual alone or
+// the pixel pass would double-count it. Either way bf_lout.comp adds it back for
+// the bounce transport, so the solve is identical.
+uniform uint u_nee_add;
+
+uniform uint  u_count;
+uniform uint  u_first;
+uniform uint  u_slice;
+uniform uint  u_ms;              // microbuffer edge: 8 -> 64 buckets, 16 -> 256
+uniform float u_horizon;         // identical to bf_radiance.comp
+uniform float u_plane_bias;      // identical to bf_radiance.comp
+uniform float u_self_cos;        // identical to bf_radiance.comp
+uniform float u_soft_eps;        // identical to bf_radiance.comp
+uniform uint  u_two_sided;       // 1 = force every surfel two-sided (diagnostic)
+uniform float u_depth_scale;     // 65535 / u_max_depth
+uniform float u_depth_tol;       // world units. Doubles as the "same surface as
+                                 // the winner" tolerance for BOTH the depth and
+                                 // the plane test in phase B.
+uniform float u_normal_tol;      // cos of the largest normal disagreement still
+                                 // counted as the winner's own surface
+uniform vec3  u_sky;             // radiance of an uncovered bucket
+uniform uint  u_no_occlusion;    // gate 5: accept every candidate, no cov clamp
+uniform uint  u_rotate;          // 0 = none, 1 = static per surfel, 2 = per frame
+uniform uint  u_frame;
+uniform uint  u_debug_constant;  // gate 3: force every bucket to u_debug_radiance
+uniform float u_debug_radiance;
+
+const uint kEmpty  = 0xFFFFFFFFu;
+const uint kMaxMS2 = 256u;
+const uint kWG     = 128u;
+
+// Q16.16 for both accumulators. Worst case is a texel packed with emitter
+// surfels: L_e = 17, summed coverage ~50, so 17*50*65536 = 5.6e7 against
+// 2^32 = 4.3e9. The x8 emissive gate takes that to 4.5e8, still two orders
+// clear. Quantization is 1.5e-5 against indirect radiances around 0.05.
+const float kFixed = 65536.0;
+
+shared uint lds_key[kMaxMS2];     // depth16 | index16
+shared vec4 lds_plane[kMaxMS2];   // winner's supporting plane, (n.xyz, -dot(n, p))
+// Two coverage accumulators, because a bucket asks two different questions.
+//
+//   lds_cov_any   how much of the bucket is blocked BY ANYTHING -> its opacity
+//   lds_cov_front how much the winner's own surface covers      -> its radiance
+//
+// Using one number for both is what made a closed room read as 3x more open than
+// a ray cast says it is: at a silhouette the front surface covers part of the
+// cone and the surface BEHIND covers the rest, and filtering the rest out to
+// keep the radiance clean threw its opacity away with it.
+shared uint lds_cov_any[kMaxMS2];
+shared uint lds_cov_front[kMaxMS2];
+shared uint lds_rad[kMaxMS2 * 3u];
+// Coverage by EMITTERS alone, for light_vis. Separate from lds_cov_front because
+// the question is "how much of this bucket is light", not "how much is surface".
+shared uint lds_cov_emit[kMaxMS2];
+// Cross-thread reduction of the per-bucket integral, one slot per invocation.
+shared vec3  lds_red[kWG];
+shared float lds_vis[kWG];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint r   = gl_WorkGroupID.x;
+    if (r >= u_slice) return;                 // whole workgroup: barriers stay uniform
+
+    const uint P   = (u_first + r) % u_count;
+    const uint ms  = u_ms;
+    const uint ms2 = ms * ms;
+
+    const vec4 prP  = s_pos_rad[P];
+    const vec3 posP = prP.xyz;
+    const vec3 nP   = surfel_normal(P);
+
+    // See micro.glsl.
+    vec3 T, B;
+    sgi_surfel_frame(P, nP, u_rotate, u_frame, T, B);
+
+    for (uint b = tid; b < ms2; b += kWG) {
+        lds_key[b] = kEmpty;
+        lds_cov_any[b]   = 0u;
+        lds_cov_front[b] = 0u;
+        lds_rad[b * 3u + 0u] = 0u;
+        lds_rad[b * 3u + 1u] = 0u;
+        lds_rad[b * 3u + 2u] = 0u;
+        lds_cov_emit[b] = 0u;
+    }
+    barrier();
+
+    const uint tol_q = uint(max(u_depth_tol, 0.0) * u_depth_scale);
+
+    // === phase A: resolve the depth winner per bucket =======================
+    for (uint j = tid; j < u_count; j += kWG) {
+        if (j == P) continue;
+
+        const vec4  cpr = s_pos_rad[j];
+        const vec3  dv  = cpr.xyz - posP;
+        const float d2  = dot(dv, dv);
+        if (d2 < 1e-14) continue;
+        // Same-surface cull: normals agree AND the centre is near the
+        // receiver's plane. bf_radiance.comp carries the reasoning and
+        // gate 5 requires the two to stay identical.
+        if (dot(surfel_normal(j), nP) >= u_self_cos &&
+            abs(dot(dv, nP)) < u_plane_bias * prP.w) continue;
+
+        const float dist = sqrt(d2);
+        const vec3  w    = dv / dist;
+        const float cosP = dot(nP, w);
+        if (cosP <= u_horizon) continue;
+
+        // Depth is the NEAR SURFACE of the disc, not the centre: using the
+        // centre lets a large surfel lose to a small one it actually occludes
+        // (section 4.1).
+        const float depth = dist - cpr.w;
+        if (depth <= 0.0) continue;                       // interpenetrating
+
+        // Occlusion uses |cos| whichever way the surfel faces. A back-facing
+        // surfel emits nothing but STILL OCCLUDES -- culling it from the depth
+        // test is the single most common source of light leaks (section 4.1).
+        const vec3  nj    = surfel_normal(j);
+        const float r2e   = cpr.w * cpr.w;
+        const float omega = SGI_PI * r2e * abs(dot(nj, -w)) / (d2 + u_soft_eps * r2e);
+        if (omega <= 1e-10) continue;
+
+        const vec3  local = vec3(dot(w, T), dot(w, B), cosP);
+        const ivec2 c     = micro_texel(local, ms);
+        const float dwc   = bucket[(uint(c.y) * ms + uint(c.x)) * 2u].w;
+        const float kr    = max(micro_footprint(omega, dwc), 0.5);
+        const int   pr    = min(int(ceil(kr + 0.5)), int(ms));
+
+        const uint qd  = min(uint(depth * u_depth_scale), 65535u);
+        const uint key = (qd << 16) | (j & 0xFFFFu);
+
+        for (int y = max(0, c.y - pr); y <= min(int(ms) - 1, c.y + pr); ++y)
+            for (int x = max(0, c.x - pr); x <= min(int(ms) - 1, c.x + pr); ++x)
+                if (kr + 0.5 - length(vec2(float(x - c.x), float(y - c.y))) > 0.0)
+                    atomicMin(lds_key[uint(y) * ms + uint(x)], key);
+    }
+    barrier();
+
+    // The winner's SUPPORTING PLANE, not its depth, is what "the same surface"
+    // means. A bucket is a cone of finite width, so the surface it sees spans a
+    // real range of depths -- at 16x16 a plane seen at 60 degrees varies by ~0.09
+    // world units across one bucket, against a tolerance of two surfel radii
+    // (0.016 here). An absolute depth window therefore rejects most of the
+    // winner's OWN neighbours on anything but a face-on surface, and coverage
+    // collapses with it: the coaxial-disc gate came out 2-3x dark, worsening with
+    // separation, which is the signature of an angular effect and not a constant
+    // factor. Coplanar candidates are at plane-distance zero however far apart
+    // they are along the ray, so this test is slope-exact by construction.
+    for (uint b = tid; b < ms2; b += kWG) {
+        const uint key = lds_key[b];
+        if (key == kEmpty) { lds_plane[b] = vec4(0.0); continue; }
+        const uint jw = key & 0xFFFFu;
+        const vec3 pw = s_pos_rad[jw].xyz;
+        const vec3 nw = surfel_normal(jw);
+        lds_plane[b] = vec4(nw, -dot(nw, pw));
+    }
+    barrier();
+
+    // === phase B: accumulate coverage and radiance on the winning surface ====
+    for (uint j = tid; j < u_count; j += kWG) {
+        if (j == P) continue;
+
+        const vec4  cpr = s_pos_rad[j];
+        const vec3  dv  = cpr.xyz - posP;
+        const float d2  = dot(dv, dv);
+        if (d2 < 1e-14) continue;
+        // Same-surface cull: normals agree AND the centre is near the
+        // receiver's plane. bf_radiance.comp carries the reasoning and
+        // gate 5 requires the two to stay identical.
+        if (dot(surfel_normal(j), nP) >= u_self_cos &&
+            abs(dot(dv, nP)) < u_plane_bias * prP.w) continue;
+
+        const float dist = sqrt(d2);
+        const vec3  w    = dv / dist;
+        const float cosP = dot(nP, w);
+        if (cosP <= u_horizon) continue;
+
+        const float depth = dist - cpr.w;
+        if (depth <= 0.0) continue;
+
+        const vec3  nj    = surfel_normal(j);
+        const float cosGeo = abs(dot(nj, -w));
+        const float r2e   = cpr.w * cpr.w;
+        const float omega = SGI_PI * r2e * cosGeo / (d2 + u_soft_eps * r2e);
+        if (omega <= 1e-10) continue;
+
+        // Emitted radiance. A back face contributes zero radiance but its
+        // coverage still stands, which is what makes it an occluder.
+        float cosE = dot(nj, -w);
+        if (u_two_sided != 0u) cosE = abs(cosE);
+        const vec3 Lj = cosE > 0.0 ? lout[j].rgb : vec3(0.0);
+
+        const vec3  local = vec3(dot(w, T), dot(w, B), cosP);
+        const ivec2 c     = micro_texel(local, ms);
+        const float dwc   = bucket[(uint(c.y) * ms + uint(c.x)) * 2u].w;
+        const float kr    = max(micro_footprint(omega, dwc), 0.5);
+        const int   pr    = min(int(ceil(kr + 0.5)), int(ms));
+        const uint  qd    = min(uint(depth * u_depth_scale), 65535u);
+
+        // The normalization sum runs over the UNCLIPPED box so weight that falls
+        // off the square -- which for this map means below the horizon, not
+        // across a fold -- is DROPPED rather than piled onto the rim.
+        float wsum = 0.0;
+        for (int y = c.y - pr; y <= c.y + pr; ++y)
+            for (int x = c.x - pr; x <= c.x + pr; ++x)
+                wsum += clamp(kr + 0.5 - length(vec2(float(x - c.x), float(y - c.y))),
+                              0.0, 1.0);
+        if (wsum <= 1e-6) continue;
+
+        // Flat inside the disc with a one-texel soft rim, normalized to carry
+        // exactly omega. An integer footprint steps 1 -> 9 -> 25 texels at fixed
+        // distances and traces concentric rings on every surface; a peaked
+        // kernel loses whatever the centre texel clamps off while the rim stays
+        // half empty, and a closed room then reads as more open than it is.
+        // Both are example 39's M4b findings.
+        const float scale = omega / (wsum * dwc);
+
+        for (int y = max(0, c.y - pr); y <= min(int(ms) - 1, c.y + pr); ++y) {
+            for (int x = max(0, c.x - pr); x <= min(int(ms) - 1, c.x + pr); ++x) {
+                const float kw = clamp(kr + 0.5 - length(vec2(float(x - c.x), float(y - c.y))),
+                                       0.0, 1.0);
+                if (kw <= 0.0) continue;
+                const uint t = uint(y) * ms + uint(x);
+
+                bool front = true;
+                if (u_no_occlusion == 0u) {
+                    const uint win = lds_key[t];
+                    if (win == kEmpty) continue;
+
+                    // Is this candidate BEHIND the front surface along its own
+                    // ray? That is the only question occlusion actually asks,
+                    // and it is not the same question as "is it on the winner's
+                    // plane".
+                    //
+                    // Testing membership of the winner's surface -- by depth, or
+                    // by its plane -- throws away every OTHER surface in the
+                    // bucket. A bucket is a cone, and in a closed room a cone
+                    // usually straddles more than one surface: in a corner it
+                    // sees two walls, and only the winner's was being counted.
+                    // The rest read as open sky, so the microbuffer reported
+                    // 0.22 openness where a ray cast says 0.062. That bias grows
+                    // with COARSER buckets (0.22 at 8x8 vs 0.16 at 16x16) and is
+                    // almost flat in surfel count, which is what identifies it as
+                    // angular rather than a sampling artifact -- a stochastic
+                    // coverage bias would behave the other way round on both.
+                    // Section 5 names this exact failure and offers the two-layer
+                    // microbuffer as its fix.
+                    //
+                    // So intersect the candidate's ray with the winner's plane
+                    // and compare depths there. This is slope-correct by
+                    // construction, which is what the plane test was reaching
+                    // for, while still admitting a nearer surface that the
+                    // winner's plane says nothing about.
+                    const vec4  pw    = lds_plane[t];
+                    const float ndotw = dot(pw.xyz, w);
+                    float t_plane = 3.4e38;
+                    if (abs(ndotw) > 1e-4) {
+                        const float tp = -(dot(pw.xyz, posP) + pw.w) / ndotw;
+                        if (tp > 0.0) t_plane = tp;   // edge-on or behind: no barrier
+                    }
+
+                    if (depth > t_plane + u_depth_tol) front = false;   // behind it
+
+                    if (front && depth > t_plane - u_depth_tol) {
+                        // Sitting ON the winner's plane -- but coplanar is not
+                        // the same as co-surface. Cornell's vertical box faces
+                        // have planes (z = const) that pass straight through the
+                        // ceiling panel, so panel surfels came out coplanar with
+                        // a box face, were taken for the same surface, and lit
+                        // the floor right up to the box's base with no contact
+                        // shadow. Points genuinely further along one surface
+                        // share its NORMAL; the panel does not.
+                        const float win_depth = float(win >> 16) / u_depth_scale;
+                        if (depth > win_depth + u_depth_tol &&
+                            dot(nj, pw.xyz) < u_normal_tol) front = false;
+                    }
+                }
+
+                // Opacity takes EVERY candidate: anything in the cone blocks
+                // it, whether or not it is the surface whose colour we report.
+                const float cov = scale * kw;
+                const uint  qcov = uint(cov * kFixed + 0.5);
+                atomicAdd(lds_cov_any[t], qcov);
+                if (!front) continue;
+
+                atomicAdd(lds_cov_front[t], uint(cov * kFixed + 0.5));
+                if (surfel_is_emissive(j) && cosE > 0.0)
+                    atomicAdd(lds_cov_emit[t], uint(cov * kFixed + 0.5));
+                atomicAdd(lds_rad[t * 3u + 0u], uint(cov * Lj.r * kFixed + 0.5));
+                atomicAdd(lds_rad[t * 3u + 1u], uint(cov * Lj.g * kFixed + 0.5));
+                atomicAdd(lds_rad[t * 3u + 2u], uint(cov * Lj.b * kFixed + 0.5));
+            }
+        }
+    }
+    barrier();
+
+    // === integrate ==========================================================
+    //
+    // Section 3.1 once more: the emitter cosine and the inverse square are
+    // already inside omega, which is already inside cov. Applying 1/r^2 here as
+    // well double-counts falloff and darkens everything nearby.
+    vec3  sum = vec3(0.0);
+    float vis = 0.0;
+    for (uint b = tid; b < ms2; b += kWG) {
+        const float wcos = bucket[b * 2u + 1u].x;   // INTEGRAL(cos dOmega) over the texel
+        vis += clamp(float(lds_cov_emit[b]) * (1.0 / kFixed), 0.0, 1.0) * wcos;
+        const float dwb  = bucket[b * 2u + 0u].w;
+
+        vec3  L    = vec3(0.0);
+        float fill = 0.0;
+
+        const float cov_any   = float(lds_cov_any[b])   * (1.0 / kFixed);
+        const float cov_front = float(lds_cov_front[b]) * (1.0 / kFixed);
+
+        if (cov_front > 1e-6) {
+            // Radiance from the front surface alone, so a wall behind a wall
+            // never tints it ...
+            L = vec3(float(lds_rad[b * 3u + 0u]), float(lds_rad[b * 3u + 1u]),
+                     float(lds_rad[b * 3u + 2u])) * (1.0 / kFixed) / cov_front;
+            // ... but opacity from everything, so the part of the bucket the
+            // front surface does not cover is not handed to the sky when
+            // something else is standing in it. The remainder is attributed the
+            // front surface's radiance, which is the single-layer approximation:
+            // exact when the two surfaces are lit alike (a corner, a silhouette
+            // against its own wall).
+            fill = u_no_occlusion != 0u ? cov_front : cov_any;
+        }
+
+        if (u_no_occlusion == 0u) fill = clamp(fill, 0.0, 1.0);
+
+        vec3 Lin = mix(u_sky, L, fill);
+        if (u_debug_constant != 0u) Lin = vec3(u_debug_radiance);
+
+        sum += Lin * wcos;
+    }
+
+    // Both reductions ride in one vec3: .xy carry the irradiance's red and green,
+    // .z the visibility, and blue goes round in a second pass. Cheaper than a
+    // second barrier chain and the two are always wanted together.
+    lds_red[tid] = vec3(sum.x, sum.y, sum.z);
+    lds_vis[tid] = vis;
+    barrier();
+    for (uint s = kWG >> 1u; s > 0u; s >>= 1u) {
+        if (tid < s) { lds_red[tid] += lds_red[tid + s]; lds_vis[tid] += lds_vis[tid + s]; }
+        barrier();
+    }
+    if (tid == 0u) {
+        irrad_dst[P] = vec4(lds_red[0] + ((u_nee != 0u && u_nee_add != 0u)
+                                         ? direct_e[P].rgb : vec3(0.0)), 1.0);
+        if (u_store_light != 0u && u_nee == 0u) {
+            const float v = lds_vis[0] * (1.0 / SGI_PI);
+            light_vis[P] = v;
+            atomicMax(light_max[0], floatBitsToUint(max(v, 0.0)));
+        }
+    }
+}

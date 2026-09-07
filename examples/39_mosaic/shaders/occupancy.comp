@@ -1,0 +1,33 @@
+#version 460 core
+layout(local_size_x = 256) in;
+
+// S1 — occupancy clipmap.
+//
+// Coarse binary coverage, one 3D texture per cascade, used ONLY to shadow the
+// far-field cluster contribution and (from M5) as the cone-march visibility
+// field. It deliberately carries no radiance: that is what keeps it small and
+// keeps the leak class of a voxel radiance field out of the pipeline entirely.
+//
+// Written as R8 so glGenerateTextureMipmap produces box-filtered COVERAGE in the
+// mip chain, which is exactly what a cone march wants to sample by cone radius.
+
+layout(std430, binding = 0) readonly buffer LivePN { vec4 live_pn[]; };
+layout(r8, binding = 0) uniform image3D u_occupancy;
+
+uniform vec3  u_origin;
+uniform float u_inv_cell;      // 1 / occupancy cell size
+uniform int   u_res;
+uniform uint  u_live_count;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= u_live_count) return;
+
+    vec4 pr = live_pn[2u * i];
+    ivec3 c = ivec3(floor((pr.xyz - u_origin) * u_inv_cell));
+    if (any(lessThan(c, ivec3(0))) || any(greaterThanEqual(c, ivec3(u_res)))) return;
+
+    // Plain store, not an atomic: the value is a constant, so concurrent writers
+    // all write the same byte and the race is benign.
+    imageStore(u_occupancy, c, vec4(1.0));
+}

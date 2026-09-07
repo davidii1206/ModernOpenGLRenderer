@@ -1040,6 +1040,8 @@ int main() {
     compact_prog.add_stage("shaders/grid_compact.comp", gl::ShaderType::compute);
     gl::HotReloadProgram merge_prog;
     merge_prog.add_stage("shaders/grid_merge.comp", gl::ShaderType::compute);
+    gl::HotReloadProgram coarse_skip_prog;
+    coarse_skip_prog.add_stage("shaders/coarse_skip.comp", gl::ShaderType::compute);
     gl::HotReloadProgram mega_cluster_prog;
     mega_cluster_prog.add_stage("shaders/mega_cluster.comp", gl::ShaderType::compute);
     gl::HotReloadProgram mega_scatter_prog;
@@ -1068,6 +1070,7 @@ int main() {
     scan_finish_prog.poll();
     compact_prog.poll();
     merge_prog.poll();
+    coarse_skip_prog.poll();
     mega_cluster_prog.poll();
     mega_scatter_prog.poll();
     mega_children_prog.poll();
@@ -1088,6 +1091,7 @@ int main() {
     auto scan_finish_cs = scan_finish_prog.take_program();
     auto compact_cs = compact_prog.take_program();
     auto merge_cs = merge_prog.take_program();
+    auto coarse_skip_cs = coarse_skip_prog.take_program();
     auto mega_cluster_cs = mega_cluster_prog.take_program();
     auto mega_scatter_cs = mega_scatter_prog.take_program();
     auto mega_children_cs = mega_children_prog.take_program();
@@ -1098,7 +1102,7 @@ int main() {
     auto prepare_cs = prepare_prog.take_program();
     if (!display || !gbuf || !raytrace || !pc || !boxp ||
         !count_cs || !scan_block_cs || !scan_blocks_cs || !scan_finish_cs || !compact_cs ||
-        !merge_cs || !mega_cluster_cs || !mega_scatter_cs ||
+        !merge_cs || !coarse_skip_cs || !mega_cluster_cs || !mega_scatter_cs ||
         !mega_children_cs || !mega_finalize_cs || !mega_renderlist_cs ||
         !mark_cs || !gather_cs || !prepare_cs)
         return EXIT_FAILURE;
@@ -1169,6 +1173,10 @@ int main() {
     float leaf_radius = 0.0f;     // coarse reference disk radius (kLATTICE_R * base_step)
     float search_radius = 0.0f;   // max per-surfel radius, for grid/traversal bounds
     float total_area = 0.0f;
+    // Declared here (not with the other render params below) so build_grid's
+    // coarse_skip pass can size its AABB reach from it.
+    float radius_scale = 1.5f;    // uniform look; near-miss misses retry at 1.9x
+    if (getenv("SRT_RADIUS")) radius_scale = std::atof(getenv("SRT_RADIUS"));
 
     // Load the initial model
     ExtractedMesh em;
@@ -1290,6 +1298,9 @@ int main() {
     gl::Buffer packed_alb_all(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);
     // Occupancy bitmask: one bit per cell, uint per 32 cells per level.
     gl::Buffer cell_mask_all(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);
+    // Per-L0-cell "finer content nearby" bitmask (coarse_skip.comp): one uint
+    // per coarsest-level cell, bit l set => descend into level l here.
+    gl::Buffer coarse_skip_all(gl::BufferType::shader, gl::BufferUsage::dynamic_draw);
     // Per-bounce ray streams (2 vec4 per ray: px+origin, direction), ping-
     // ponged: the mark kernel writes bounce 0 into A, each trace dispatch
     // appends the next bounce into the other buffer (a bounce's stream is
@@ -1436,6 +1447,7 @@ int main() {
         packed_alb_all.data(nullptr, size_t(packed_total) * sizeof(glm::vec4));
         cell_sc_all.data(nullptr, size_t(cnt_total) * 2 * sizeof(uint32_t));
         cell_mask_all.data(nullptr, size_t(mask_total) * sizeof(uint32_t));
+        coarse_skip_all.data(nullptr, size_t(levels[0].volume) * sizeof(uint32_t));
         surfel_slot_buf.data(nullptr, size_t(N) * sizeof(uint32_t));
         block_sum_buf.data(nullptr, kScanBlocksMax * sizeof(uint32_t));
         // Mega hierarchy: mega slots reuse the packed segment partitioning
@@ -1490,6 +1502,7 @@ int main() {
         surfel_cut_buf.bind_base(6);
         packed_pn_all.bind_base(8);
         packed_alb_all.bind_base(9);
+        coarse_skip_all.bind_base(10);
         cell_mask_all.bind_base(11);
         stream_a_buf.bind_base(12);
         ray_count_buf.bind_base(13);
@@ -1500,7 +1513,9 @@ int main() {
         rdr_cut_all.bind_base(21);          // combined render cut refs
     };
 
-    bool render_mega = false;     // render from merged mega surfels + leftovers
+    bool render_mega = true;      // render from merged mega surfels + leftovers
+                                  // (default on: ~16% faster traversal on the
+                                  // bunny scene; SRT_MEGA=0 forces fine lists)
     float mega_dot = 0.98f;       // merge normal-coherence threshold
                                   // (merged radius cap = level cell size)
     bool mega_ok = true;          // hierarchy built (false => fine-only fallback)
@@ -1640,6 +1655,56 @@ int main() {
         }
         gl::dispatch_compute((cnt_total + kBlockSize - 1) / kBlockSize, 1, 1);
         glMemoryBarrier(GL_ALL_BARRIER_BITS);
+
+        // ---- Coarse-cell "finer content nearby" skip mask (#1) ----
+        // One thread per finer-level cell; occupied cells stamp their bit onto
+        // every L0 cell within traversal reach. reach uses the max possible
+        // radius_scale (2.0, the slider cap; a larger SRT_RADIUS override just
+        // over-marks, never under) plus a 3-cell halo for descend()'s window.
+        coarse_skip_all.clear(GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, &zero);
+        {
+            cell_mask_all.bind_base(0);
+            coarse_skip_all.bind_base(1);
+            coarse_skip_cs->use();
+            auto cloc = [&](const char* n) { return coarse_skip_cs->uniform_location(n); };
+            GLint u;
+            u = cloc("u_l0_min");      if (u >= 0) coarse_skip_cs->uniform3f(u, levels[0].mn.x, levels[0].mn.y, levels[0].mn.z);
+            u = cloc("u_l0_inv_cell"); if (u >= 0) coarse_skip_cs->uniform1f(u, 1.0f / levels[0].cell);
+            GLint r0[3] = {levels[0].res.x, levels[0].res.y, levels[0].res.z};
+            u = cloc("u_l0_res");      if (u >= 0) coarse_skip_cs->uniform3iv(u, r0);
+            const float rs_max = std::max(2.0f, radius_scale);
+            for (int l = 1; l < kGridLevels && !getenv("SRT_SKIPZERO"); ++l) {
+                if (levels[l].count == 0) continue;
+                set_level_uniforms(*coarse_skip_cs, l);
+                u = cloc("u_src_cells"); if (u >= 0) coarse_skip_cs->uniform1ui(u, levels[l].volume);
+                u = cloc("u_bit");       if (u >= 0) coarse_skip_cs->uniform1ui(u, 1u << l);
+                u = cloc("u_reach");     if (u >= 0)
+                    coarse_skip_cs->uniform1f(u, search_radius * rs_max + 3.0f * levels[l].cell);
+                gl::dispatch_compute((levels[l].volume + kBlockSize - 1) / kBlockSize, 1, 1);
+            }
+            glMemoryBarrier(GL_ALL_BARRIER_BITS);
+        }
+        if (getenv("SRT_SKIPDBG")) {
+            glMemoryBarrier(GL_ALL_BARRIER_BITS);
+            std::vector<uint32_t> cs(levels[0].volume, 0u);
+            void* p = coarse_skip_all.map_range(0, cs.size() * 4, GL_MAP_READ_BIT);
+            if (p) { std::memcpy(cs.data(), p, cs.size() * 4); coarse_skip_all.unmap(); }
+            int any = 0, b1 = 0, b2 = 0, b3 = 0;
+            glm::ivec3 lo(9999), hi(-1);
+            for (int z = 0; z < levels[0].res.z; ++z)
+            for (int y = 0; y < levels[0].res.y; ++y)
+            for (int x = 0; x < levels[0].res.x; ++x) {
+                uint32_t v = cs[size_t(x + levels[0].res.x * (y + levels[0].res.y * z))];
+                if (!v) continue;
+                ++any; if (v & 2) ++b1; if (v & 4) ++b2; if (v & 8) ++b3;
+                lo = glm::min(lo, glm::ivec3(x, y, z));
+                hi = glm::max(hi, glm::ivec3(x, y, z));
+            }
+            gllib::logf(gllib::LogLevel::info,
+                "coarse_skip: %d/%zu L0 cells marked (L1=%d L2=%d L3=%d) bbox [%d,%d,%d]-[%d,%d,%d] of [%d,%d,%d]",
+                any, cs.size(), b1, b2, b3, lo.x, lo.y, lo.z, hi.x, hi.y, hi.z,
+                levels[0].res.x, levels[0].res.y, levels[0].res.z);
+        }
 
         // ---- Mega-surfel hierarchy (per level, see the pass comments) ----
         // Guard: the per-mega child-base scan reuses the single-workgroup
@@ -1908,8 +1973,6 @@ int main() {
     const float far_plane = 100.0f;
     int max_bounces = 1;
     if (getenv("SRT_BOUNCES")) max_bounces = std::atoi(getenv("SRT_BOUNCES"));
-    float radius_scale = 1.5f;    // uniform look; near-miss misses retry at 1.9x
-    if (getenv("SRT_RADIUS")) radius_scale = std::atof(getenv("SRT_RADIUS"));
     float light_intensity = 6.0f;
     float ambient = 0.08f;
     glm::vec3 light_pos = mn + glm::vec3(scene_size.x * 0.5f, scene_size.y * 0.95f, scene_size.z * 0.5f);
@@ -1968,6 +2031,18 @@ int main() {
     const char* shot_path = getenv("SRT_SHOT");
     int shot_frame = getenv("SRT_FRAME") ? std::atoi(getenv("SRT_FRAME")) : 5;
     uint64_t frame_counter = 0;
+
+    // Benchmark hook: SRT_BENCH=N runs N frames at full speed, records the
+    // per-frame raytrace GPU time, then prints min / p10 / p50 / p90 over the
+    // steady-state tail (last 60%) and exits. The mobile GPU's boost clock
+    // does not settle for a ~3 s run, so short-run averages swing ~30% on
+    // identical work; a long run at sustained 100% load holds a stable clock,
+    // and the MIN of the tail is the least clock-perturbed sample.
+    bool bench = getenv("SRT_BENCH") != nullptr;
+    int bench_frames = bench ? std::max(200, std::atoi(getenv("SRT_BENCH"))) : 0;
+    if (bench) realtime = true;
+    std::vector<double> bench_ray_ms;
+    if (bench) bench_ray_ms.reserve(size_t(bench_frames));
 
     // Console diagnostics: the same per-pass breakdown + ray-kernel counters
     // the ImGui window shows, printed as lifetime averages. Called every 120
@@ -2212,6 +2287,7 @@ int main() {
         l = loc("u_mega");         if (l >= 0) raytrace->uniform1i(l, render_mega && mega_ok ? 1 : 0);
         l = loc("u_pair");         if (l >= 0) raytrace->uniform1i(l, pair_rays ? 1 : 0);
         l = loc("u_perf");         if (l >= 0) raytrace->uniform1i(l, perf_on ? 1 : 0);
+        l = loc("u_skip_on");      if (l >= 0) raytrace->uniform1i(l, getenv("SRT_NOSKIP") ? 0 : 1);
 
         // Gather kernel uniforms (reconstruction + shading + next-bounce appends).
         gather_cs->use();
@@ -2344,6 +2420,7 @@ int main() {
         if (scan_finish_prog.poll()) scan_finish_cs = scan_finish_prog.take_program();
         if (compact_prog.poll()) compact_cs = compact_prog.take_program();
         if (merge_prog.poll()) merge_cs = merge_prog.take_program();
+        if (coarse_skip_prog.poll()) coarse_skip_cs = coarse_skip_prog.take_program();
         if (mega_cluster_prog.poll()) mega_cluster_cs = mega_cluster_prog.take_program();
         if (mega_scatter_prog.poll()) mega_scatter_cs = mega_scatter_prog.take_program();
         if (mega_children_prog.poll()) mega_children_cs = mega_children_prog.take_program();
@@ -2749,7 +2826,8 @@ int main() {
         t_poll.readback();
         t_input.readback();
         t_gbuf.readback();
-        t_ray.readback();
+        double ray_ms_sample = t_ray.readback();
+        if (bench && frame_counter > 0) bench_ray_ms.push_back(ray_ms_sample);
         t_display.readback();
         t_points.readback();
         t_cells.readback();
@@ -2778,6 +2856,20 @@ int main() {
 
         // Console diagnostics on a cadence (see print_perf above).
         if (frame_counter % 120 == 0 || (perf_on && frame_counter % 5 == 0)) print_perf();
+
+        if (bench && int(bench_ray_ms.size()) >= bench_frames) {
+            std::vector<double> s(bench_ray_ms.begin() + bench_ray_ms.size() * 2 / 5,
+                                  bench_ray_ms.end());   // steady-state tail (last 60%)
+            std::sort(s.begin(), s.end());
+            auto pct = [&](double p) { return s[size_t(p * double(s.size() - 1))]; };
+            double sum = 0.0; for (double v : s) sum += v;
+            printf("BENCH raytrace ms over %zu tail frames (of %d): "
+                   "min %.3f  p10 %.3f  p50 %.3f  p90 %.3f  mean %.3f\n",
+                   s.size(), bench_frames, s.front(), pct(0.10), pct(0.50),
+                   pct(0.90), sum / double(s.size()));
+            print_perf();
+            break;
+        }
 
         window.poll_events();
     }

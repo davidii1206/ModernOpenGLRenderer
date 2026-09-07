@@ -1,0 +1,521 @@
+#version 460 core
+layout(local_size_x = 64) in;
+
+// S5 — micro-render gather, and S6's projection folded into the resolve.
+//
+// One 64-thread workgroup per selected surfel renders a 16x16 hemispherical
+// octahedral micro-buffer of its surroundings, then integrates it into an L1 SH
+// irradiance estimate.
+//
+// THE MICRO-BUFFER LIVES IN SHARED MEMORY. Example 37 put the equivalent atlas
+// in a global image: ~368 MB at full resolution, with every splat a global
+// imageAtomicMin. 256 uints is 1 KB of LDS per workgroup, the atomicMin is an
+// LDS atomic, and the resolve reads it back for free. This single change is what
+// makes per-surfel micro-rendering affordable.
+//
+// Traversal is a SHELL walk over the cascades: the innermost shell reads
+// individual surfels out of the C0 index grid, and each outer shell reads one
+// aggregated cluster per cell from a coarser cascade. The shells are disjoint in
+// world space, so nothing is counted twice and nothing is missed. This depends
+// on S1 inserting each surfel into every cascade containing it, not just the
+// finest.
+
+#include "clipmap.glsl"
+#include "oct.glsl"
+#include "sh.glsl"
+
+layout(std430, binding = 0)  readonly buffer LivePN { vec4 live_pn[]; };
+layout(std430, binding = 1)  readonly buffer LiveRadiance { vec4 live_radiance[]; };
+layout(std430, binding = 2)  readonly buffer LiveSrc { uint live_src[]; };
+layout(std430, binding = 3)  readonly buffer CellSC { uvec2 cell_sc[]; };
+layout(std430, binding = 4)  readonly buffer PackedIdx { uint packed_idx[]; };
+layout(std430, binding = 5)  readonly buffer ClusterPN { vec4 cluster_pn[]; };
+layout(std430, binding = 6)  readonly buffer ClusterRad { vec4 cluster_rad[]; };
+layout(std430, binding = 7)  readonly buffer CellMask { uint cell_mask[]; };
+layout(std430, binding = 8)  readonly buffer Selected { uint selected[]; };
+layout(std430, binding = 9)  buffer ShCache { vec4 sh_cache[]; };
+layout(std430, binding = 10) readonly buffer Cutoff { uint cutoff[]; };
+layout(std430, binding = 11) readonly buffer FarCells { uint far_cells[]; };
+
+uniform vec3  u_origins[3];
+uniform float u_inv_cells[3];
+uniform float u_cells[3];
+uniform uint  u_cnt_offs[3];
+uniform uint  u_mask_offs[3];
+uniform int   u_cascades;
+uniform int   u_shell_radius;      // cells scanned each side, per cascade
+uniform uint  u_max_far_cells;
+uniform int   u_max_individual;
+uniform vec3  u_sky_radiance;
+uniform float u_temporal_min;      // variance-adaptive alpha bounds
+uniform float u_temporal_max;
+uniform uint  u_frame;
+uniform int   u_reset_history;
+// Validation: replaces every gathered texel with a constant radiance, so the
+// reconstruction must come back as exactly that value. Catches projection and
+// solid-angle errors that a plausible-looking image would hide.
+uniform int   u_debug_constant;
+uniform float u_debug_radiance;
+
+const int MS = 16;                 // micro-buffer edge
+const int MS2 = MS * MS;
+
+// Packed depth-index key: 13 bits of quantized depth, 19 bits of payload.
+// Smaller depth wins the atomicMin, which is the depth test.
+shared uint s_micro[MS2];
+// Radiance is written alongside so the resolve does not have to chase the
+// winning index back through global memory.
+shared uint s_rad_r[MS2];
+shared uint s_rad_g[MS2];
+shared uint s_rad_b[MS2];
+// Accumulated coverage per texel, 20.12 fixed point. See splat().
+shared uint s_cov[MS2];
+
+const uint kEmpty = 0xFFFFFFFFu;
+
+uint hash_u32(uint x) {
+    x ^= x >> 16; x *= 0x7feb352du;
+    x ^= x >> 15; x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+// Splats one disk-like emitter (an individual surfel or an aggregated cluster)
+// into the micro-buffer.
+// Solid angle of one micro-buffer texel. The hemi-octahedral map spreads 2*pi
+// steradians over MS^2 texels of (near) equal area.
+const float OMEGA_TEXEL = 6.2831853 / float(MS2);
+
+// `area` is the emitter's geometric area: pi*r^2 for an individual surfel, the
+// aggregate's projected area for a cluster.
+// `excl` is the radius inside which the emitter counts as enclosing the gather
+// point and is skipped. For a surfel that is its own radius; for a cluster it is
+// HALF ITS CELL, not the covering radius.
+void splat(vec3 to, float radius, vec3 normal, float cone_cos, vec3 radiance,
+           float area, float excl, vec3 T, vec3 B, vec3 N, float self_radius) {
+    float d2 = dot(to, to);
+    if (d2 < 1e-12) return;
+    float dist = sqrt(d2);
+
+    // Self-exclusion: skip anything that CONTAINS the gather point, or a coarse
+    // cluster enclosing the shading surfel wins the depth test everywhere and
+    // floods the tile (example 36 line 662).
+    //
+    // Measured against the cell, not the covering radius. A coarse cell's
+    // covering radius is its half-diagonal, 0.87 of a cell, while the shell
+    // hands over to that cascade at (R-0.5) cells of the FINER one -- 0.54 with
+    // R=3 against a 0.74 covering radius. Every coarse cluster in between was
+    // excluded here and never reached by the finer shell either: a hole in the
+    // mid field precisely where a room's opposite wall sits.
+    if (d2 < excl * excl) return;
+
+    vec3 dir = to / dist;
+
+    // Plane bias: skip emitters lying in the gather surfel's own tangent plane.
+    // These are its immediate neighbours on the same surface, at grazing angles
+    // and near-zero height; without the bias they clobber the whole tile at
+    // near-zero depth (example 37, micro_render.comp:92).
+    //
+    // The threshold is the GATHER surfel's radius, not the emitter's. Example 37
+    // could use the emitter's because there every splat was an individual leaf
+    // of comparable size, but here a coarse cluster's covering radius is a large
+    // fraction of the scene -- testing against it rejects essentially every
+    // distant cluster and starves the whole far field.
+    float height = dot(to, N);
+    if (height <= self_radius) return;
+
+    // Normal-cone backface cull that accounts for the HALF-ANGLE, not just the
+    // axis: a cluster whose surfels face many directions must not be culled
+    // because its average normal points away (example 36 lines 670-673).
+    float sin_half = sqrt(max(1.0 - cone_cos * cone_cos, 0.0));
+    if (dot(dir, normal) > sin_half) return;
+
+    // Hemispherical octahedral projection. Unlike the disk/Nusselt mapping used
+    // by examples 36 and 37, this does NOT cancel the cosine term -- the resolve
+    // applies cos(theta) * solid angle explicitly.
+    vec3 local = vec3(dot(dir, T), dot(dir, B), dot(dir, N));
+    if (local.z <= 0.0) return;
+    vec2 e = hemi_oct_encode(local);
+    vec2 uv = e * 0.5 + 0.5;
+
+    ivec2 c = ivec2(uv * float(MS));
+    c = clamp(c, ivec2(0), ivec2(MS - 1));
+
+    // Footprint in texels, so a near emitter covers the solid angle it should
+    // instead of leaving holes the sky would fill.
+    //
+    // Bounded hard: the loop below is O(pr^2) LDS atomics, and an unbounded pr
+    // lets a single close cluster write the entire 16x16 tile. A cluster that
+    // large is the finer cascade's job anyway.
+
+    // COVERAGE, not whole texels. Rasterizing an emitter as N fully-lit texels
+    // quantizes its solid angle to multiples of 2*pi/256: a cluster whose true
+    // angular radius is a third of a texel still lights one entire texel, and
+    // one that grows past half a texel jumps from 1 texel to 9. Sweep a surfel
+    // along a wall and that discontinuity traces the octahedral texel grid
+    // across the surface -- the diagonal chevrons and diamond banding that made
+    // the walls look tiled rather than lit.
+    //
+    // So compute the emitter's ACTUAL solid angle, omega = A * cos / d^2, and
+    // let it weight the texels it lands in. Sub-texel emitters now contribute in
+    // proportion to their size and the estimate is continuous in radius/dist.
+    // cone_cos interpolates the foreshortening: a flat surfel (cone_cos 1) is a
+    // disk and foreshortens fully, a cluster whose normals cover a hemisphere
+    // (cone_cos 0) presents the same area from anywhere.
+    float fore = mix(1.0, abs(dot(dir, normal)), clamp(cone_cos, 0.0, 1.0));
+    float omega = area * fore / d2;
+    if (omega <= 1e-6) return;
+
+    // The FOOTPRINT comes from the solid angle too, not from the covering
+    // radius. A cluster's covering radius is the half-diagonal of its cell, so
+    // for a flat wall patch it overstates the angular extent several times over:
+    // the splat spread across 49 texels while the patch only ever subtended
+    // about seven, coverage came out at 0.15, and 85% of a texel that is solid
+    // wall got filled with sky instead. Inside a closed box that is most of the
+    // hemisphere's energy thrown away, and it is why the first coverage-weighted
+    // build came out far too dark. Sizing the footprint from omega makes the two
+    // agree: cov lands at 1 for anything at least a texel across, and drops
+    // below 1 only for emitters that genuinely are sub-texel.
+    float ang = sqrt(omega / 3.14159265);          // angular radius of a disk of that omega
+    // Footprint radius in texels, kept CONTINUOUS. An integer radius steps the
+    // splat from 1 texel to 9 to 25 as the emitter's angular size grows, and for
+    // a fixed emitter that step traces a circle on every surface at the distance
+    // where it happens: the concentric rings that showed around the Cornell
+    // ceiling panel. The loop bounds still have to be integers, so the smooth
+    // radius lives in the KERNEL instead -- a texel entering the footprint
+    // enters with zero weight and grows in.
+    // The kernel is a DISK WITH A ONE-TEXEL SOFT EDGE, not a tent. Flat inside
+    // matters: per-texel coverage is clamped at 1, so a peaked kernel throws
+    // away whatever the centre texel clamps off while the rim stays half empty,
+    // and a closed room reads as more open than it is. Feathering only the rim
+    // keeps the interior uniform and still lets a texel enter the footprint at
+    // zero weight as the emitter grows.
+    float rt = ang * float(MS) * 0.5;
+    int pr = int(clamp(floor(rt + 0.5), 0.0, 4.0));
+    float kr = max(rt, 0.5);
+
+    uint qd = min(uint(dist * 1024.0 + 0.5), 8191u);
+    uint key = qd << 19;
+
+    // Pass 1: total kernel weight, so the splat can be normalized to carry
+    // exactly omega of solid angle however many texels it lands in.
+    // pr == 0 is the overwhelmingly common case -- everything past a couple of
+    // metres is sub-texel -- and it needs no first pass: the kernel is exactly
+    // 1 on the single texel it lands in.
+    float wsum = 1.0;
+    if (pr > 0) {
+        wsum = 0.0;
+        for (int y = max(0, c.y - pr); y <= min(MS - 1, c.y + pr); ++y)
+            for (int x = max(0, c.x - pr); x <= min(MS - 1, c.x + pr); ++x)
+                wsum += clamp(kr + 0.5 - length(vec2(float(x - c.x), float(y - c.y))), 0.0, 1.0);
+        if (wsum <= 1e-6) return;
+    }
+    float cov_scale = omega / (wsum * OMEGA_TEXEL);
+
+    uint ri = packHalf2x16(vec2(radiance.r, 0.0));
+    uint gi = packHalf2x16(vec2(radiance.g, 0.0));
+    uint bi = packHalf2x16(vec2(radiance.b, 0.0));
+
+    // Coverage ACCUMULATES; radiance is winner-takes-all.
+    //
+    // The two cannot share the depth test. Surfels overlap heavily: at half a
+    // metre a wall's surfels are ~25 to a texel, each covering ~23% of it, and
+    // if the texel's fill came from the single winner of the depth sort the
+    // other 24 would be dropped and 77% of a solid wall would read as open sky.
+    // Summing coverage and clamping at 1 gets that right, while the nearest
+    // emitter still supplies the radiance, which is what a depth test is for.
+    for (int y = max(0, c.y - pr); y <= min(MS - 1, c.y + pr); ++y) {
+        for (int x = max(0, c.x - pr); x <= min(MS - 1, c.x + pr); ++x) {
+            float w = clamp(kr + 0.5 - length(vec2(float(x - c.x), float(y - c.y))), 0.0, 1.0);
+            if (w <= 0.0) continue;
+            float cov = min(cov_scale * w, 1.0);
+            if (cov <= 1e-4) continue;
+
+            int t = y * MS + x;
+            atomicAdd(s_cov[t], uint(cov * 4096.0 + 0.5));
+            uint prev = atomicMin(s_micro[t], key);
+            if (key < prev) {
+                // Racy against another closer splat arriving between the
+                // atomicMin and these stores; the loser is at worst a texel of
+                // slightly wrong radiance in a 256-texel integral, which the
+                // temporal filter absorbs.
+                s_rad_r[t] = ri;
+                s_rad_g[t] = gi;
+                s_rad_b[t] = bi;
+            }
+        }
+    }
+}
+
+void main() {
+    uint slot = gl_WorkGroupID.x;
+    if (slot >= cutoff[1]) return;
+    uint i = selected[slot];
+    uint tid = gl_LocalInvocationID.x;
+
+    vec4 pr = live_pn[2u * i];
+    vec3 P = pr.xyz;
+    float self_radius = pr.w;
+    vec3 N = live_pn[2u * i + 1u].xyz;
+
+    // Tangent frame, ROTATED by a per-surfel, per-frame angle.
+    //
+    // Without the rotation every surfel on a wall shares the same texel grid, so
+    // whatever quantization survives lands in the same place on all of them and
+    // shows up as a coherent pattern locked to the surface -- the octahedral
+    // diamond banding. Decorrelating the frame turns that residue into noise
+    // that the temporal blend and the S6 spatial filter both remove, which is
+    // what they are for.
+    vec3 up = abs(N.y) < 0.999 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    vec3 T0 = normalize(cross(up, N));
+    vec3 B0 = cross(N, T0);
+    float phi = 6.2831853 * float(hash_u32(i * 0x9E3779B9u ^ u_frame * 0x85EBCA6Bu)) *
+                (1.0 / 4294967296.0);
+    float cp = cos(phi), sp = sin(phi);
+    vec3 T = T0 * cp + B0 * sp;
+    vec3 B = B0 * cp - T0 * sp;
+
+    for (uint t = tid; t < uint(MS2); t += 64u) {
+        s_micro[t] = kEmpty;
+        s_rad_r[t] = 0u; s_rad_g[t] = 0u; s_rad_b[t] = 0u;
+        s_cov[t] = 0u;
+    }
+    barrier();
+
+    // --- shell traversal ---------------------------------------------------
+    int R = u_shell_radius;
+    int span = 2 * R + 1;
+    int cells_per_shell = span * span * span;
+
+    // Shell radii are EUCLIDEAN, at every level.
+    //
+    // The cell loop below walks a cell-aligned BOX of (2R+1)^3 cells around the
+    // gather point's own cell, but the next cascade skips everything inside a
+    // SPHERE of radius R*cell. A box is not a sphere: its corners reach
+    // sqrt(3)*R*cell, so cells out there were splatted twice, once as C0 cells
+    // and again as part of a coarse cluster -- and the double-counted region is
+    // a box locked to the gather point's cell, so it jumped a whole cell at a
+    // time as the point moved. That is the rectangular tiling that showed on the
+    // walls at exactly the cascade-0 cell size, and it was in the raw cache
+    // before any filtering touched it.
+    //
+    // Clipping the box to the same sphere the next level excludes makes the
+    // shells actually disjoint. The 0.5 backs the sphere off half a cell,
+    // because the box is centred on the point's CELL and the point itself can
+    // sit half a cell off-centre; without it the sphere would poke out of the
+    // box and leave a gap instead of an overlap.
+    float shell_outer[3];
+    for (int l = 0; l < 3; ++l) shell_outer[l] = (float(R) - 0.5) * u_cells[l];
+
+    // Individual surfels out to this radius, aggregated clusters beyond.
+    float near_radius = shell_outer[0];
+
+    for (int l = 0; l < u_cascades; ++l) {
+        // Inner radius: everything nearer than the previous cascade's reach was
+        // already covered at finer detail, so skip it here.
+        float inner = (l == 0) ? -1.0 : shell_outer[l - 1];
+        ivec3 base = clip_cell_coord(P, u_origins[l], u_inv_cells[l]);
+
+        // The coarsest cascade visits ALL of its non-empty cells rather than a
+        // fixed-radius shell. A shell of R cells reaches only R * cell_size, and
+        // at the coarse end that is still shorter than the scene: with R = 2 a
+        // Cornell floor surfel never reaches the ceiling panel and gathers pure
+        // black. Coarse cells are large, so the non-empty list is only tens of
+        // entries and walking all of it is cheaper than the shell scan it
+        // replaces.
+        bool coarsest = (l == u_cascades - 1);
+        int count = coarsest ? int(min(far_cells[0], u_max_far_cells)) : cells_per_shell;
+
+        for (int k = int(tid); k < count; k += 64) {
+            ivec3 c;
+            if (coarsest) {
+                uint cell_lin = far_cells[1u + uint(k)];
+                c = ivec3(int(cell_lin) % CLIP_RES,
+                          (int(cell_lin) / CLIP_RES) % CLIP_RES,
+                          int(cell_lin) / (CLIP_RES * CLIP_RES));
+            } else {
+                int cx = k % span;
+                int cy = (k / span) % span;
+                int cz = k / (span * span);
+                c = base + ivec3(cx - R, cy - R, cz - R);
+            }
+            if (!clip_inside(c)) continue;
+
+            uint cell = uint(clip_cell_index(c));
+            if ((cell_mask[u_mask_offs[l] + (cell >> 5u)] & (1u << (cell & 31u))) == 0u)
+                continue;
+
+            // Cell centre distance decides which shell owns this cell.
+            vec3 cc = u_origins[l] + (vec3(c) + 0.5) * u_cells[l];
+            float cd = distance(cc, P);
+            if (cd < inner) continue;
+            if (!coarsest && cd > shell_outer[l]) continue;
+
+            // Conservative horizon cull, done on the CELL rather than on the
+            // cluster: if the whole cell lies below the shading surfel's tangent
+            // plane it cannot contribute, and rejecting it here avoids two vec4
+            // loads of cluster data per cell. The half-diagonal keeps it
+            // conservative. This matters because the far-field walk visits every
+            // non-empty cell of the coarsest cascade, so roughly half of them are
+            // behind the surface by construction.
+            float cell_half = 0.8660254 * u_cells[l];
+            if (dot(cc - P, N) < -cell_half) continue;
+
+            uint ci = u_cnt_offs[l] + cell;
+
+            // Near field is decided by DISTANCE, not by cascade index. Tying it
+            // to cascade 0 breaks as soon as a scene needs only one cascade: every
+            // cell would then expand to individual surfels and a single gather
+            // would splat the entire live set.
+            uvec2 sc = cell_sc[ci];
+
+            // Near field is decided by DISTANCE and by DENSITY.
+            //
+            // The micro-buffer resolves 256 directions, so splatting far more
+            // emitters than that into it is pure waste. Sponza packs columns,
+            // arches and curtains into a small volume, so a single C0 cell can
+            // hold thousands of surfels; expanding every near cell individually
+            // cost ~27000 splats per gather and 39 ms. Above the threshold the
+            // cell's own cluster is used instead, which is energy-preserving by
+            // construction (it is the area-weighted aggregate of exactly those
+            // surfels) and costs one splat.
+            if (l == 0 && cd <= near_radius && sc.y <= uint(u_max_individual)) {
+                // Near field: splat individual surfels.
+                for (uint m = 0u; m < sc.y; ++m) {
+                    uint s = packed_idx[sc.x + m];
+                    if (s == i) continue;
+                    vec4 spr = live_pn[2u * s];
+                    vec3 sn = live_pn[2u * s + 1u].xyz;
+                    splat(spr.xyz - P, spr.w, sn, 1.0,
+                          live_radiance[s].rgb, 3.14159265 * spr.w * spr.w,
+                          spr.w, T, B, N, self_radius);
+                }
+            } else {
+                // Mid and far field: one aggregated cluster per cell.
+                vec4 cpn0 = cluster_pn[2u * ci];
+                vec4 cpn1 = cluster_pn[2u * ci + 1u];
+                vec4 crad = cluster_rad[ci];
+                if (crad.w <= 0.0) continue;
+                // Dark clusters cannot change the integral; skipping them early
+                // is most of the far field in a scene lit by a few emitters.
+                if (dot(crad.rgb, vec3(0.2126, 0.7152, 0.0722)) < 1e-5) continue;
+                // crad.w is the cluster's aggregate projected area, which is
+                // what its solid angle has to come from -- the covering radius
+                // cpn0.w is a bound, not a size.
+                splat(cpn0.xyz - P, cpn0.w, cpn1.xyz, cpn1.w,
+                      crad.rgb, crad.w, 0.5 * u_cells[l], T, B, N, self_radius);
+            }
+        }
+    }
+    barrier();
+
+    // --- resolve + SH projection (S6) --------------------------------------
+    //
+    // Each thread integrates its own texels, then the partial sums are reduced
+    // in shared memory. The hemi-octahedral map covers 2*pi steradians with MS^2
+    // texels of equal area, so d_omega is constant.
+    const float d_omega = 6.2831853 / float(MS2);
+
+    vec3 acc[4];
+    acc[0] = vec3(0.0); acc[1] = vec3(0.0); acc[2] = vec3(0.0); acc[3] = vec3(0.0);
+
+    for (uint t = tid; t < uint(MS2); t += 64u) {
+        int x = int(t % uint(MS));
+        int y = int(t / uint(MS));
+        vec2 e = (vec2(float(x), float(y)) + 0.5) / float(MS) * 2.0 - 1.0;
+        vec3 local = hemi_oct_decode(e);
+        vec3 dir = T * local.x + B * local.y + N * local.z;
+
+        vec3 radiance;
+        if (u_debug_constant != 0) {
+            radiance = vec3(u_debug_radiance);
+        } else if (s_micro[t] == kEmpty) {
+            radiance = u_sky_radiance;
+        } else {
+            // A texel the emitters only partly fill is partly sky.
+            float fill = min(float(s_cov[t]) * (1.0 / 4096.0), 1.0);
+            vec3 emit = vec3(unpackHalf2x16(s_rad_r[t]).x,
+                             unpackHalf2x16(s_rad_g[t]).x,
+                             unpackHalf2x16(s_rad_b[t]).x);
+            radiance = mix(u_sky_radiance, emit, fill);
+        }
+
+        // RAW radiance, with no cosine weight.
+        //
+        // The SH pipeline is: project incoming radiance onto the basis, then
+        // reconstruct irradiance by convolving with the cosine lobe, which is
+        // what the A0 = pi / A1 = 2pi/3 constants in sh_eval_irradiance do.
+        // Multiplying by cos(theta) HERE as well applies the cosine twice and
+        // roughly halves the result while skewing the directional term.
+        //
+        // Sanity check for constant radiance L over the hemisphere:
+        //   c0   = L * C0 * 2pi          = 1.772 L
+        //   c1z  = L * C1 * pi           = 1.535 L
+        //   E/pi = c0*C0 + (2/3)*C1*c1z  = 0.5 L + 0.5 L = L   as required.
+        vec3 w = radiance;
+        acc[0] += w * (SH_C0 * d_omega);
+        acc[1] += w * (SH_C1 * dir.y * d_omega);
+        acc[2] += w * (SH_C1 * dir.z * d_omega);
+        acc[3] += w * (SH_C1 * dir.x * d_omega);
+    }
+
+    // The reduction below reuses s_rad_* as scratch, so every thread must be
+    // done READING the micro-buffer before any thread writes over it.
+    barrier();
+
+    // Reduce the 64 partial SH sums. Reuses the radiance scratch: 64 threads x
+    // 4 coefficients x 3 channels = 768 slots, and the arrays hold 256 each.
+    for (int co = 0; co < 4; ++co) {
+        s_rad_r[tid] = floatBitsToUint(acc[co].r);
+        s_rad_g[tid] = floatBitsToUint(acc[co].g);
+        s_rad_b[tid] = floatBitsToUint(acc[co].b);
+        barrier();
+        for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+            if (tid < stride) {
+                s_rad_r[tid] = floatBitsToUint(uintBitsToFloat(s_rad_r[tid]) +
+                                               uintBitsToFloat(s_rad_r[tid + stride]));
+                s_rad_g[tid] = floatBitsToUint(uintBitsToFloat(s_rad_g[tid]) +
+                                               uintBitsToFloat(s_rad_g[tid + stride]));
+                s_rad_b[tid] = floatBitsToUint(uintBitsToFloat(s_rad_b[tid]) +
+                                               uintBitsToFloat(s_rad_b[tid + stride]));
+            }
+            barrier();
+        }
+        if (tid == 0u) {
+            acc[co] = vec3(uintBitsToFloat(s_rad_r[0]),
+                           uintBitsToFloat(s_rad_g[0]),
+                           uintBitsToFloat(s_rad_b[0]));
+        }
+        barrier();
+    }
+
+    if (tid != 0u) return;
+
+    uint src = live_src[i];
+    vec4 v0 = sh_cache[src * SH_STRIDE + 0u];
+    vec4 v1 = sh_cache[src * SH_STRIDE + 1u];
+    vec4 v2 = sh_cache[src * SH_STRIDE + 2u];
+    vec4 v3 = sh_cache[src * SH_STRIDE + 3u];
+
+    float age = v1.w;
+    bool fresh = (u_reset_history != 0) || age < 0.5;
+
+    // Variance-adaptive temporal blend (SVGF style): a surfel whose estimate is
+    // still moving takes a large alpha and converges fast; a settled one takes a
+    // small alpha and stops flickering.
+    float prev_luma = dot(v0.xyz, vec3(0.2126, 0.7152, 0.0722));
+    float new_luma  = dot(acc[0],  vec3(0.2126, 0.7152, 0.0722));
+    float delta = abs(new_luma - prev_luma) / max(abs(prev_luma) + abs(new_luma), 1e-4);
+    float variance = fresh ? 1.0 : mix(v0.w, delta, 0.25);
+    float alpha = fresh ? 1.0 : mix(u_temporal_min, u_temporal_max, clamp(variance, 0.0, 1.0));
+
+    vec3 c0 = mix(v0.xyz, acc[0], alpha);
+    vec3 c1 = mix(v1.xyz, acc[1], alpha);
+    vec3 c2 = mix(v2.xyz, acc[2], alpha);
+    vec3 c3 = mix(v3.xyz, acc[3], alpha);
+
+    sh_cache[src * SH_STRIDE + 0u] = vec4(c0, variance);
+    sh_cache[src * SH_STRIDE + 1u] = vec4(c1, 0.0);      // age resets on update
+    sh_cache[src * SH_STRIDE + 2u] = vec4(c2, v2.w);
+    sh_cache[src * SH_STRIDE + 3u] = vec4(c3, 0.0);
+}

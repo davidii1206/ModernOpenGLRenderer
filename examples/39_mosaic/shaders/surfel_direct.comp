@@ -1,0 +1,133 @@
+#version 460 core
+layout(local_size_x = 256) in;
+
+// S2 — direct lighting on surfels. Every live surfel, every frame.
+//
+// This is what decouples light-response latency from convergence rate: the
+// direct term is exact and recomputed per frame, so flipping a light shows up in
+// the first bounce on the very next frame. Only the multi-bounce tail is
+// amortized, and that is the part the eye forgives.
+//
+// Writes OUTGOING radiance = emitted + albedo * (direct + last frame's cached
+// irradiance). Feeding last frame's irradiance back in is where multi-bounce
+// comes from: one additional bounce per frame.
+
+#include "clipmap.glsl"
+#include "sh.glsl"
+
+// Occupancy cone march, for area-light visibility. Declared before the include
+// because visibility.glsl reads these.
+const int OCC_RES = 128;
+layout(binding = 1) uniform sampler3D u_occupancy[3];
+uniform vec3  u_occ_origins[3];
+uniform float u_occ_inv_cells[3];
+uniform int   u_occ_cascades;
+uniform int   u_occ_mips;
+#include "visibility.glsl"
+#include "ltc.glsl"
+
+layout(std430, binding = 0) readonly buffer LivePN { vec4 live_pn[]; };
+layout(std430, binding = 1) readonly buffer LiveAlb { vec4 live_alb[]; };
+layout(std430, binding = 2) readonly buffer LiveEmissive { vec4 live_emissive[]; };
+layout(std430, binding = 3) readonly buffer LiveSrc { uint live_src[]; };
+layout(std430, binding = 4) readonly buffer ShCache { vec4 sh_cache[]; };
+layout(std430, binding = 5) writeonly buffer LiveRadiance { vec4 live_radiance[]; };
+layout(std430, binding = 6) readonly buffer Emitters { Emitter emitters[]; };
+// One byte per source surfel, packed four to a word: 1 when an emitter proxy
+// already accounts for this surfel's emission.
+layout(std430, binding = 7) readonly buffer Proxied { uint proxied[]; };
+
+layout(binding = 0) uniform sampler2DShadow u_sun_shadow;
+
+uniform uint  u_live_count;
+uniform vec3  u_sun_dir;         // points TOWARD the sun
+uniform vec3  u_sun_radiance;
+uniform mat4  u_sun_view_proj;
+uniform float u_shadow_texel;
+uniform float u_bounce_gain;
+// gfx::Model does not read KHR_materials_emissive_strength, which is exactly
+// the extension CornellBoxOriginal.glb uses to make its ceiling panel a light
+// rather than a faintly glowing surface. Applying the boost HERE rather than at
+// bake time keeps it a runtime slider instead of a cache invalidation.
+uniform float u_emissive_boost;
+uniform int   u_have_sun;
+uniform uint  u_emitter_count;
+// The cache deliberately gets the CHEAP end of the visibility ladder: a
+// hemisphere integral is a low-pass filter, so penumbra accuracy inside the
+// bounce is wasted work. Six steps here against the pixel path's sixteen.
+uniform int   u_emitter_steps;
+
+// Energy control (spec section 8). The feedback loop outgoing -> irradiance ->
+// outgoing is a geometric series in albedo; without a clamp a scene with
+// near-white walls and a bright source diverges over a few seconds.
+const float kMaxAlbedo = 0.9;
+
+float sun_visibility(vec3 p, vec3 n) {
+    if (u_have_sun == 0) return 0.0;
+    vec4 c = u_sun_view_proj * vec4(p + n * u_shadow_texel * 2.0, 1.0);
+    vec3 uv = c.xyz / c.w * 0.5 + 0.5;
+    if (any(lessThan(uv.xy, vec2(0.0))) || any(greaterThan(uv.xy, vec2(1.0))) || uv.z > 1.0)
+        return 1.0;   // outside the map: treat as lit rather than as shadowed
+    // Deliberately a single tap. The cache integrates over a hemisphere, which
+    // is a low-pass filter: a hard shadow boundary in the bounce contributes
+    // nearly the same irradiance as a soft one, so penumbra accuracy here is
+    // wasted work. The pixel path gets the full PCSS ladder in M5.
+    return texture(u_sun_shadow, uv);
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= u_live_count) return;
+
+    vec3 p = live_pn[2u * i].xyz;
+    vec3 n = live_pn[2u * i + 1u].xyz;
+    vec3 albedo = min(live_alb[i].rgb, vec3(kMaxAlbedo));
+    vec3 emissive = live_emissive[i].rgb * u_emissive_boost;
+
+    vec3 direct = vec3(0.0);
+    if (u_have_sun != 0) {
+        float ndl = max(dot(n, u_sun_dir), 0.0);
+        if (ndl > 0.0) direct += u_sun_radiance * ndl * sun_visibility(p, n);
+    }
+
+    // Analytic area lights. Exact for a diffuse receiver, so the emitter itself
+    // contributes no noise and no banding -- only its visibility does, and that
+    // is a cone march through a box-filtered coverage field, which is smooth by
+    // construction.
+    for (uint k = 0u; k < u_emitter_count; ++k) {
+        Emitter e = emitters[k];
+        // The boost applies to proxies too, or the emissive slider would scale
+        // only the light that still goes through the gather and the energy gate
+        // (8x emissive -> 8x irradiance) would stop holding.
+        vec3 contrib = emitter_irradiance(p, n, e) * u_emissive_boost;
+        if (dot(contrib, vec3(1.0)) <= 1e-6) continue;
+
+        vec3 to = emitter_center(e) - p;
+        float d = length(to);
+        if (d < 1e-6) continue;
+        // Cone half-angle from the emitter's own size, so a large nearby panel
+        // marches a wide cone and casts the soft shadow it should.
+        float spread = clamp(sqrt(emitter_area(e)) * 0.5 / d, 0.02, 1.0);
+        contrib *= cone_visibility(p, n, to / d, d, spread, u_emitter_steps);
+        direct += contrib;
+    }
+
+    // Bounce: last frame's cached irradiance for this SOURCE surfel.
+    uint src = live_src[i];
+    SH1 sh = sh_load(sh_cache[src * SH_STRIDE + 0u], sh_cache[src * SH_STRIDE + 1u],
+                     sh_cache[src * SH_STRIDE + 2u], sh_cache[src * SH_STRIDE + 3u]);
+    vec3 bounce = sh_eval_irradiance(sh, n) * u_bounce_gain;
+
+    // Emission that a proxy already represents is REMOVED here, not added.
+    //
+    // The gather integrates whatever it finds in live_radiance, so leaving the
+    // emissive term in would count the Cornell panel twice: once analytically
+    // through the rectangle above and once again as splatted surfels. Dropping
+    // it partitions the light cleanly -- proxied sources go through the analytic
+    // path, everything else still goes through the gather. The surfels stay in
+    // the micro-buffer as OCCLUDERS either way, just with no emission.
+    uint pw = proxied[src >> 2u];
+    if (((pw >> (8u * (src & 3u))) & 0xFFu) != 0u) emissive = vec3(0.0);
+
+    live_radiance[i] = vec4(emissive + albedo * (direct + bounce), 0.0);
+}

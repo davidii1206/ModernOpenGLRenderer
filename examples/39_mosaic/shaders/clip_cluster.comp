@@ -1,0 +1,137 @@
+#version 460 core
+layout(local_size_x = 64) in;
+
+// S1 pass 5 — aggregate each non-empty cell's surfels into ONE cluster.
+//
+// A WORKGROUP per cell, not a thread per cell. One thread per cell looks
+// appealing because most cells are small, but the distribution has a long tail:
+// a coarse cascade's cell can hold tens of thousands of surfels, and that one
+// thread then stalls its entire workgroup while 63 lanes idle. Measured at 26 ms
+// on Sponza; strided loops with a shared-memory reduction make it a fraction of
+// that and the cost stops depending on how the surfels happen to clump.
+//
+// A cluster carries what the micro-render gather needs to splat it as an
+// oriented disk and to decide whether it can be seen at all:
+//   - an area-weighted centre and a covering radius,
+//   - a normal CONE (axis + half-angle), not just an average normal: an average
+//     cannot express "these surfels face everywhere", so it cannot support a
+//     conservative backface cull,
+//   - total projected area, which the far-field term needs,
+//   - outgoing radiance from S2 (emitted + direct + last frame's bounce).
+//
+// (`centroid` is a reserved GLSL interpolation qualifier, hence cluster_center.)
+
+#include "clipmap.glsl"
+
+layout(std430, binding = 0) readonly buffer LivePN { vec4 live_pn[]; };
+layout(std430, binding = 2) readonly buffer LiveRadiance { vec4 live_radiance[]; };
+layout(std430, binding = 3) readonly buffer CellSC { uvec2 cell_sc[]; };
+layout(std430, binding = 4) readonly buffer PackedIdx { uint packed_idx[]; };
+layout(std430, binding = 5) writeonly buffer ClusterPN { vec4 cluster_pn[]; };
+layout(std430, binding = 6) writeonly buffer ClusterRad { vec4 cluster_rad[]; };
+layout(std430, binding = 8) buffer Stats { uint stats[]; };
+layout(std430, binding = 9) readonly buffer CellList { uint cell_list[]; };
+
+uniform uint u_cnt_offs[3];
+uniform uint u_max_cells;
+
+shared vec3  s_center[64];
+shared vec3  s_nrm[64];
+shared vec3  s_rad[64];
+shared float s_area[64];
+shared vec3  s_axis;
+shared vec3  s_center_final;
+shared vec3  s_radiance_final;
+shared float s_area_final;
+
+void main() {
+    uint entry = gl_WorkGroupID.x;
+    if (entry >= min(cell_list[0], u_max_cells)) return;
+
+    // (`packed` is a reserved GLSL keyword, hence the name.)
+    uint entry_packed = cell_list[1u + entry];
+    uint l = entry_packed >> 26u;
+    uint cell = entry_packed & 0x03FFFFFFu;
+    uint c = u_cnt_offs[l] + cell;
+    uint tid = gl_LocalInvocationID.x;
+
+    if (tid == 0u) atomicAdd(stats[l], 1u);
+
+    uvec2 sc = cell_sc[c];
+    uint count = sc.y;
+
+    // Pass A: area-weighted centre, summed normal, radiance, total area.
+    vec3 center = vec3(0.0), nsum = vec3(0.0), rad = vec3(0.0);
+    float area = 0.0;
+    for (uint k = tid; k < count; k += 64u) {
+        uint s = packed_idx[sc.x + k];
+        vec4 pr = live_pn[2u * s];
+        vec3 n  = live_pn[2u * s + 1u].xyz;
+        float a = 3.14159265 * pr.w * pr.w;
+        center += pr.xyz * a;
+        nsum   += n * a;
+        rad    += live_radiance[s].rgb * a;
+        area   += a;
+    }
+    s_center[tid] = center; s_nrm[tid] = nsum; s_rad[tid] = rad; s_area[tid] = area;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            s_center[tid] += s_center[tid + stride];
+            s_nrm[tid]    += s_nrm[tid + stride];
+            s_rad[tid]    += s_rad[tid + stride];
+            s_area[tid]   += s_area[tid + stride];
+        }
+        barrier();
+    }
+
+    if (tid == 0u) {
+        float a = s_area[0];
+        if (a <= 0.0) {
+            cluster_pn[2u * c]      = vec4(0.0);
+            cluster_pn[2u * c + 1u] = vec4(0.0, 1.0, 0.0, 1.0);
+            cluster_rad[c]          = vec4(0.0);
+            s_center_final = vec3(0.0);
+            s_axis = vec3(0.0, 1.0, 0.0);
+        } else {
+            s_center_final = s_center[0] / a;
+            s_axis = length(s_nrm[0]) > 1e-12 ? normalize(s_nrm[0]) : vec3(0.0, 1.0, 0.0);
+        }
+        // Stash the results pass B must not clobber: the reduction scratch is
+        // reused below for the cover/cone reduction.
+        s_radiance_final = (a > 0.0) ? s_rad[0] / a : vec3(0.0);
+        s_area_final = a;
+    }
+    barrier();
+    if (s_area_final <= 0.0) return;
+
+    // Pass B: covering radius and cone half-angle, both of which need pass A's
+    // centre and axis.
+    vec3 center_f = s_center_final;
+    vec3 axis = s_axis;
+    float cover = 0.0;
+    float min_dot = 1.0;
+    for (uint k = tid; k < count; k += 64u) {
+        uint s = packed_idx[sc.x + k];
+        vec4 pr = live_pn[2u * s];
+        vec3 n  = live_pn[2u * s + 1u].xyz;
+        cover = max(cover, distance(pr.xyz, center_f) + pr.w);
+        min_dot = min(min_dot, dot(n, axis));
+    }
+    s_area[tid] = cover;
+    s_center[tid].x = min_dot;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            s_area[tid] = max(s_area[tid], s_area[tid + stride]);
+            s_center[tid].x = min(s_center[tid].x, s_center[tid + stride].x);
+        }
+        barrier();
+    }
+
+    if (tid == 0u) {
+        cluster_pn[2u * c]      = vec4(center_f, s_area[0]);      // s_area now holds cover
+        cluster_pn[2u * c + 1u] = vec4(axis, s_center[0].x);      // cos(half-angle)
+        cluster_rad[c]          = vec4(s_radiance_final, s_area_final);
+    }
+}

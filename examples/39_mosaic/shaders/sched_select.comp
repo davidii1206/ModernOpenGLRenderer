@@ -1,0 +1,61 @@
+#version 460 core
+layout(local_size_x = 256) in;
+
+// S3c — compact the selected surfels into a dense list.
+//
+// Fairness inside the cutoff bucket is the whole point of this shader.
+//
+// An earlier version simply took the first `budget` surfels at or above the
+// cutoff via atomicAdd. Atomic order correlates with thread index, so whenever
+// the cutoff bucket was oversubscribed the LOW live indices won every frame and
+// the high ones were never updated at all. That is not a subtle bias: the
+// dynamic instances are appended last by S0, so the three moving bunnies sat at
+// the top of the live range and their cache stayed at zero forever, rendering as
+// solid black cut-outs no matter how long the scene ran.
+//
+// Buckets strictly above the cutoff are taken unconditionally (fewer than the
+// budget by construction). The cutoff bucket is then subsampled uniformly with a
+// per-surfel, per-frame hash, so every surfel in it has the same chance and the
+// choice is re-rolled each frame.
+//
+// The list is consumed by an INDIRECT dispatch, so the CPU never reads the count
+// back and never stalls waiting for it.
+
+layout(std430, binding = 0) readonly buffer Bucket { uint bucket[]; };
+layout(std430, binding = 1) buffer Cutoff { uint cutoff[]; };
+layout(std430, binding = 2) writeonly buffer Selected { uint selected[]; };
+
+uniform uint u_live_count;
+uniform uint u_budget;
+uniform uint u_frame;
+
+uint hash_u32(uint x) {
+    x ^= x >> 16; x *= 0x7feb352du;
+    x ^= x >> 15; x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= u_live_count) return;
+
+    uint b = bucket[i];
+    uint cut = cutoff[0];
+    if (b < cut) return;
+
+    if (b == cut) {
+        uint above = cutoff[2];
+        uint need = (u_budget > above) ? (u_budget - above) : 0u;
+        uint in_bin = cutoff[3];
+        if (need < in_bin) {
+            // Uniform subsample of the oversubscribed bucket.
+            uint r = hash_u32(i * 0x9E3779B9u ^ hash_u32(u_frame));
+            if ((r % in_bin) >= need) return;
+        }
+    }
+
+    uint slot = atomicAdd(cutoff[1], 1u);
+    if (slot >= u_budget) return;
+    selected[slot] = i;
+}

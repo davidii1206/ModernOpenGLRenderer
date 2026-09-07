@@ -28,6 +28,8 @@
 #include "gpu_timer.hpp"
 #include "screenshot.hpp"
 #include "imgui_overlay.hpp"
+#ifdef GLLIB_HAS_FSR2
 #include "fsr2.hpp"
+#endif
 #include "skeleton.hpp"
 #include "animation.hpp"

@@ -1,0 +1,116 @@
+#version 460 core
+layout(local_size_x = 256) in;
+
+// S6b — spatial filter over same-cell neighbours.
+//
+// Each surfel's estimate comes from its own 16x16 micro-buffer, so neighbouring
+// surfels integrate slightly different sets of emitters and land on slightly
+// different answers. Alone that reads as blotchy mottling across what should be
+// a smooth gradient. Averaging over neighbours on the SAME SURFACE removes it.
+//
+// "Same surface" is the whole difficulty, and it is enforced the same way the
+// screen gather does it: reject on normal agreement and on signed plane
+// distance. Blending across a corner or between two sides of a thin wall is
+// exactly the leak this technique is supposed to be free of, so the rejects are
+// not an optimisation, they are the correctness condition.
+//
+// Reads the raw cache and writes a separate filtered one. Filtering in place
+// would feed the blur back into the temporal estimate and compound it every
+// frame until the whole cache was flat.
+
+#include "clipmap.glsl"
+#include "sh.glsl"
+
+layout(std430, binding = 0) readonly buffer LivePN { vec4 live_pn[]; };
+layout(std430, binding = 1) readonly buffer LiveSrc { uint live_src[]; };
+layout(std430, binding = 2) readonly buffer ShRaw { vec4 sh_raw[]; };
+layout(std430, binding = 3) writeonly buffer ShFiltered { vec4 sh_filtered[]; };
+layout(std430, binding = 4) readonly buffer CellSC { uvec2 cell_sc[]; };
+layout(std430, binding = 5) readonly buffer PackedIdx { uint packed_idx[]; };
+
+uniform vec3  u_origin;        // cascade 0
+uniform float u_inv_cell;
+uniform uint  u_cnt_off;
+uniform uint  u_live_count;
+uniform float u_strength;      // 0 = passthrough, 1 = full neighbour average
+
+// Bounded so the pass stays bandwidth-predictable: a cell can hold thousands of
+// surfels and the estimate does not improve past a handful of neighbours.
+const uint kMaxNeighbours = 8u;
+// Ceiling on cell members inspected, so a dense cell cannot stall the wavefront.
+const uint kMaxScan = 128u;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= u_live_count) return;
+
+    uint src = live_src[i];
+    vec4 v0 = sh_raw[src * SH_STRIDE + 0u];
+    vec4 v1 = sh_raw[src * SH_STRIDE + 1u];
+    vec4 v2 = sh_raw[src * SH_STRIDE + 2u];
+    vec4 v3 = sh_raw[src * SH_STRIDE + 3u];
+
+    vec4 pr = live_pn[2u * i];
+    vec3 P = pr.xyz;
+    vec3 N = live_pn[2u * i + 1u].xyz;
+
+    ivec3 c = clip_cell_coord(P, u_origin, u_inv_cell);
+    if (u_strength <= 0.0 || !clip_inside(c)) {
+        sh_filtered[src * SH_STRIDE + 0u] = v0;
+        sh_filtered[src * SH_STRIDE + 1u] = v1;
+        sh_filtered[src * SH_STRIDE + 2u] = v2;
+        sh_filtered[src * SH_STRIDE + 3u] = v3;
+        return;
+    }
+
+    uvec2 sc = cell_sc[u_cnt_off + uint(clip_cell_index(c))];
+
+    vec3 a0 = v0.xyz, a1 = v1.xyz, a2 = v2.xyz, a3 = v3.xyz;
+    float wsum = 1.0;
+
+    // NEAR neighbours, found by walking the cell in order -- not by striding
+    // across it. A stride picks the same handful of members for every surfel in
+    // the cell, so the whole cell converges on one value and the cache turns
+    // into flat cell-sized blocks; that was visible as a chequerboard at exactly
+    // the cascade-0 cell size. Walking in order and rejecting on DISTANCE makes
+    // this an actual local blur, with each surfel averaging its own
+    // neighbourhood.
+    const float kRadii = 4.0;                         // blur radius, in surfel radii
+    uint taken = 0u;
+    for (uint k = 0u; k < sc.y && k < kMaxScan && taken < kMaxNeighbours; ++k) {
+        uint s = packed_idx[sc.x + k];
+        if (s == i) continue;
+
+        vec4 npr = live_pn[2u * s];
+        vec3 nn  = live_pn[2u * s + 1u].xyz;
+
+        float nd = dot(N, nn);
+        if (nd < 0.9) continue;                       // different surface orientation
+
+        vec3 d = npr.xyz - P;
+        float plane = abs(dot(d, N));
+        float reach = max(pr.w, npr.w) * 2.0;
+        if (plane > reach) continue;                  // parallel surface, e.g. the far
+                                                      // side of a thin wall
+
+        float radius = max(pr.w, npr.w) * kRadii;
+        float dist = length(d);
+        if (dist > radius) continue;
+
+        float w = nd * (1.0 - plane / reach) * (1.0 - dist / radius);
+        if (w <= 1e-4) continue;
+        uint nsrc = live_src[s];
+        a0 += sh_raw[nsrc * SH_STRIDE + 0u].xyz * w;
+        a1 += sh_raw[nsrc * SH_STRIDE + 1u].xyz * w;
+        a2 += sh_raw[nsrc * SH_STRIDE + 2u].xyz * w;
+        a3 += sh_raw[nsrc * SH_STRIDE + 3u].xyz * w;
+        wsum += w;
+        ++taken;
+    }
+
+    float inv = 1.0 / wsum;
+    sh_filtered[src * SH_STRIDE + 0u] = vec4(mix(v0.xyz, a0 * inv, u_strength), v0.w);
+    sh_filtered[src * SH_STRIDE + 1u] = vec4(mix(v1.xyz, a1 * inv, u_strength), v1.w);
+    sh_filtered[src * SH_STRIDE + 2u] = vec4(mix(v2.xyz, a2 * inv, u_strength), v2.w);
+    sh_filtered[src * SH_STRIDE + 3u] = vec4(mix(v3.xyz, a3 * inv, u_strength), v3.w);
+}

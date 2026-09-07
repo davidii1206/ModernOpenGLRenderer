@@ -55,6 +55,13 @@ layout(std430, binding = 9) readonly buffer PackedAlb { vec4 packed_alb[]; }; //
 // skips empty cells in the 27-cell windows and the 5x5x5 gather.
 layout(std430, binding = 11) readonly buffer CellMask { uint cell_mask[]; };
 
+// Per-L0-cell "finer content nearby" bitmask (built by coarse_skip.comp):
+// bit l set => level l has occupied cells within traversal reach of this
+// coarse cell. Checked before descend() so coarse steps over empty regions
+// skip the finer-level DDA setup entirely. Conservative: a set bit may still
+// find nothing, but a clear bit provably means nothing to descend into.
+layout(std430, binding = 10) readonly buffer CoarseSkip { uint coarse_skip[]; };
+
 // Mega-surfel hierarchy (u_mega): the per-cell COMBINED RENDER LIST as
 // contiguous SoA — merged mega records first, then leftover fine surfels
 // (border rows) — materialized by mega_renderlist.comp. Same direct-load
@@ -93,6 +100,7 @@ uniform uint  u_l_mask_off[kLevels];
 uniform uint  u_l_num[kLevels];
 uniform float u_l_max_r[kLevels];   // max stored surfel radius in this level
 uniform int   u_levels;
+uniform int   u_skip_on;            // 1 = honor coarse_skip; 0 = always descend (A/B)
 
 
 uniform int u_max_bounces;
@@ -650,8 +658,10 @@ float trace_best(vec3 o, vec3 d, float t_near, float t_far, float r_mul) {
         float relax_near = max(tmin, t_cur - pad);
         scan_neighborhood(0, ic, o, d, t_far, relax_near, r_mul, best_t, found);
         float t_exit = min(min(tmaxv.x, tmaxv.y), min(tmaxv.z, tmax));
+        uint skm = (u_skip_on != 0) ? coarse_skip[l_cell_index(0, ic)] : 0xFFFFFFFFu;
         for (int l = 1; l < u_levels; ++l)
-            descend(l, o, d, t_cur, t_exit, t_far, r_mul, ta_in[l], ta_out[l], best_t, found);
+            if ((skm & (1u << uint(l))) != 0u)
+                descend(l, o, d, t_cur, t_exit, t_far, r_mul, ta_in[l], ta_out[l], best_t, found);
     }
     for (int iter = 0; iter < 512; ++iter) {
         if (found && t_cur > best_t + pad) break;
@@ -670,8 +680,10 @@ float trace_best(vec3 o, vec3 d, float t_near, float t_far, float r_mul) {
         float relax_near = max(tmin, t_cur - pad);
         scan_slab(0, ic, axis, o, d, t_far, relax_near, r_mul, best_t, found);
         float t_exit = min(min(tmaxv.x, tmaxv.y), min(tmaxv.z, tmax));
+        uint skm = (u_skip_on != 0) ? coarse_skip[l_cell_index(0, ic)] : 0xFFFFFFFFu;
         for (int l = 1; l < u_levels; ++l)
-            descend(l, o, d, t_cur, t_exit, t_far, r_mul, ta_in[l], ta_out[l], best_t, found);
+            if ((skm & (1u << uint(l))) != 0u)
+                descend(l, o, d, t_cur, t_exit, t_far, r_mul, ta_in[l], ta_out[l], best_t, found);
     }
 
     if (!found) { PERF_CYC(7, trav0); return -1.0; }

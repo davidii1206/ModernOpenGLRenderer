@@ -1,0 +1,32 @@
+#version 460 core
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+// Occupancy mip chain, one level per dispatch.
+//
+// This replaces glGenerateTextureMipmap, which costs ~2.6 ms per 128^3 R8
+// volume on this driver (7.9 ms for the three cascades) and dominated the whole
+// frame. A 2x2x2 box downsample in compute does the same work in microseconds.
+//
+// The filter is the MEAN, not the max: the value is a coverage fraction, and a
+// cone march accumulating (1 - alpha) needs a half-covered coarse cell to read
+// as half-occluding. Taking the max would drive every coarse level to fully
+// opaque and over-occlude the far field.
+
+layout(r8, binding = 0) uniform readonly  image3D u_src;
+layout(r8, binding = 1) uniform writeonly image3D u_dst;
+
+uniform int u_dst_res;
+
+void main() {
+    ivec3 d = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(d, ivec3(u_dst_res)))) return;
+
+    ivec3 s = d * 2;
+    float sum = 0.0;
+    for (int z = 0; z < 2; ++z)
+    for (int y = 0; y < 2; ++y)
+    for (int x = 0; x < 2; ++x)
+        sum += imageLoad(u_src, s + ivec3(x, y, z)).r;
+
+    imageStore(u_dst, d, vec4(sum * 0.125));
+}

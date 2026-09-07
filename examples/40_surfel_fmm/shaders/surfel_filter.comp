@@ -1,0 +1,143 @@
+#version 460 core
+layout(local_size_x = 128) in;
+
+// ---------------------------------------------------------------------------
+// Object-space denoise of the irradiance cache. DISPLAY ONLY.
+//
+// Measured on a floor patch the path tracer resolves as smooth (its own local sd
+// 0.81), the raw per-surfel irradiance carries 7.4x that much high-frequency
+// content. That is finding 4's sampling floor -- err ~ 7.3/sqrt(N) per receiver
+// -- and it is what reads as "you can make out the surfel positions". It lives
+// in the CACHE, not in the reconstruction: a nearest-surfel gather shows 7.4x,
+// a wide reconstruction kernel shows 2.6x, and the difference between them is
+// how much of it each one averages away.
+//
+// So a blurry reconstruction was doing two jobs at once, denoising and
+// reconstructing,
+// and tying them together is why sharpening one made the other worse. Splitting
+// them: this pass removes the noise HERE, in object space, and the gather is then
+// free to reconstruct as sharply as the cache can justify.
+//
+// Object space rather than screen space matters for two reasons. The filter
+// width is in surfel spacings, so it does not change with resolution or camera
+// distance -- a screen-space blur denoises a distant wall far harder than a near
+// one. And it rejects across surface boundaries EXACTLY, by the neighbour's own
+// normal and tangent-plane distance, rather than by whatever survives projection.
+//
+// It never touches b_irrad: the solve keeps iterating on the unfiltered values,
+// so transport, convergence and every gate are unchanged by construction.
+// ---------------------------------------------------------------------------
+
+#include "surfel.glsl"
+
+layout(std430, binding = 4)  readonly  buffer IrradIn  { vec4 irrad[]; };
+layout(std430, binding = 8)  readonly  buffer CellSC   { uvec2 cell_sc[]; };
+layout(std430, binding = 9)  readonly  buffer CellIt   { uint  cell_item[]; };
+layout(std430, binding = 10) readonly  buffer CellPR   { vec4  cell_pr[]; };
+layout(std430, binding = 11) writeonly buffer IrradOut { vec4 irrad_out[]; };
+layout(std430, binding = 16) readonly  buffer LightVis { float light_vis[]; };
+layout(std430, binding = 17) readonly  buffer LightMax { uint  light_max[]; };
+layout(std430, binding = 18) readonly  buffer LightGrd { vec4  light_grad[]; };
+
+uniform uint  u_count;
+uniform vec3  u_grid_min;
+uniform ivec3 u_grid_res;
+uniform float u_inv_cell;
+uniform float u_radius;       // filter radius, world units
+uniform float u_plane_tol;    // world units
+uniform float u_normal_tol;
+// Width of the light-visibility similarity term, in units of visibility.
+uniform float u_light_sigma;
+// How far to trust the local linear model of visibility, 0..1. 0 is the
+// isotropic edge stop (shadow-safe, penumbra stays noisy); 1 is the full
+// gradient (penumbra denoised, some leak into the umbra). See finding 20.
+uniform float u_grad_scale;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= u_count) return;
+
+    const vec4 pr = s_pos_rad[i];
+    const vec3  p  = pr.xyz;
+    const vec3  n  = surfel_normal(i);
+    // Normalized so u_light_sigma reads as a fraction of the umbra-to-full-light
+    // range rather than in scene-dependent absolute units.
+    const float lnorm = 1.0 / max(uintBitsToFloat(light_max[0]), 1e-8);
+    const float vi = light_vis[i] * lnorm;
+    // Local linear model of visibility. Along a penumbra ramp this predicts the
+    // neighbour's visibility, so the residual below is ~0 and the ramp gets
+    // denoised at full strength instead of being frozen by the edge stop.
+    const vec4  gi = light_grad[i];
+
+    // Self is always in the sum, so a surfel with no accepted neighbour keeps
+    // its own value rather than going black.
+    vec3  acc  = irrad[i].rgb;
+    float wsum = 1.0;
+
+    const vec3  g  = (p - u_grid_min) * u_inv_cell;
+    const ivec3 hc = clamp(ivec3(floor(g)), ivec3(0), u_grid_res - 1);
+    const float r2max = u_radius * u_radius;
+    const float inv_sigma2 = 1.0 / max(0.5 * r2max, 1e-12);
+
+    for (int dz = -1; dz <= 1; ++dz) {
+        const int cz = hc.z + dz;
+        if (cz < 0 || cz >= u_grid_res.z) continue;
+        for (int dy = -1; dy <= 1; ++dy) {
+            const int cy = hc.y + dy;
+            if (cy < 0 || cy >= u_grid_res.y) continue;
+            for (int dx = -1; dx <= 1; ++dx) {
+                const int cx = hc.x + dx;
+                if (cx < 0 || cx >= u_grid_res.x) continue;
+
+                const uint  ci = uint(cx) + uint(u_grid_res.x) *
+                                 (uint(cy) + uint(u_grid_res.y) * uint(cz));
+                const uvec2 sc = cell_sc[ci];
+
+                for (uint k = 0; k < sc.y; ++k) {
+                    const uint e = sc.x + k;
+                    const uint j = cell_item[e];
+                    if (j == i) continue;
+
+                    const vec3  dv = cell_pr[e].xyz - p;
+                    const float r2 = dot(dv, dv);
+                    if (r2 >= r2max) continue;
+
+                    const vec3  nj = surfel_normal(j);
+                    const float nd = dot(n, nj);
+                    if (nd <= u_normal_tol) continue;
+                    // Tangent-plane distance against the RECEIVER's plane: a
+                    // neighbour on a parallel surface a small step away (the
+                    // two faces of a thin box) must not average into this one.
+                    if (abs(dot(dv, n)) > u_plane_tol) continue;
+
+                    // THE EDGE STOP. Without it this filter averages a surfel
+                    // in umbra with one in full light -- they are coplanar and
+                    // share a normal, so every geometric test above passes -- and
+                    // light diffuses into the shadow. At several iterations over
+                    // a few spacings that reads as light bending around corners.
+                    //
+                    // Keyed on emitter VISIBILITY and not on E. E carries 7.4x
+                    // the path tracer's high frequency on a provably flat surface
+                    // (finding 15), so a similarity test on E would read sampling
+                    // noise as a shadow edge and preserve exactly what this
+                    // filter exists to remove. Visibility is bounded in [0,1],
+                    // has no radiance magnitude, no albedo and no bounce in it,
+                    // and it changes only where the shadowing changes.
+                    float lw = 1.0;
+                    if (u_light_sigma > 0.0) {
+                        const float pred = vi + dot(gi.xyz, dv) * gi.w * u_grad_scale;
+                        const float ld = abs(light_vis[j] * lnorm - pred) / u_light_sigma;
+                        lw = exp(-ld * ld);
+                        if (lw <= 1e-3) continue;
+                    }
+
+                    const float w = exp(-r2 * inv_sigma2) * nd * lw;
+                    acc  += irrad[j].rgb * w;
+                    wsum += w;
+                }
+            }
+        }
+    }
+
+    irrad_out[i] = vec4(acc / wsum, 1.0);
+}

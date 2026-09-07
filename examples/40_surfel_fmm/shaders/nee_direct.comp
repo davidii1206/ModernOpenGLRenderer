@@ -1,0 +1,43 @@
+#version 460 core
+layout(local_size_x = 64) in;
+
+// ---------------------------------------------------------------------------
+// The direct term, one thread per SURFEL.
+//
+// The microbuffer keeps the residual (every emitter here contributes zero
+// radiance there, though its surfels still occlude), and this pass computes the
+// direct contribution of each proxied emitter explicitly, with its own
+// visibility query. A hard partition of the emitter set, so no MIS weights.
+//
+// This is the version the BOUNCE TRANSPORT reads: bf_lout.comp adds it to the
+// cached irradiance when forming outgoing radiance, so the second bounce sees
+// the direct light whether or not the image is taking its direct term from here
+// or from the per-pixel pass. The estimator itself is in common/nee.glsl, shared
+// with nee_pixel.comp.
+// ---------------------------------------------------------------------------
+
+#include "nee.glsl"
+
+layout(std430, binding = 16) writeonly buffer LightVis { float light_vis[]; };
+// light_vis is normalized downstream by its running maximum (the absolute value
+// is scene-dependent), so the pass that produces it has to maintain that maximum.
+layout(std430, binding = 17) buffer LightMax { uint light_max[]; };
+layout(std430, binding = 20) buffer DirectOut { vec4 direct_e[]; };
+
+uniform uint u_count;
+
+void main() {
+    const uint P = gl_GlobalInvocationID.x;
+    if (P >= u_count) return;
+
+    const vec4 pr = s_pos_rad[P];
+    const vec3 nP = surfel_normal(P);
+
+    vec3  E;
+    float vis;
+    sgi_nee_direct(pr.xyz, nP, pr.w, P, E, vis);
+
+    direct_e[P]  = vec4(E, 1.0);
+    light_vis[P] = vis;
+    atomicMax(light_max[0], floatBitsToUint(max(vis, 0.0)));
+}

@@ -88,7 +88,6 @@ struct Hit {
     vec3 pos;
     vec3 nrm;
     vec3 alb;
-    float t;
     bool is_mirror;
 };
 
@@ -122,10 +121,13 @@ bool reconstruct(vec3 o, vec3 d, float t_near, float t_far, float best_t, out Hi
     float acc_t = 0.0;
     float wsum = 0.0;
     bool mirror = false;
-    Hit nearest;
-    nearest.t = 1e30;
-    nearest.nrm = vec3(0.0, 1.0, 0.0);
-    nearest.alb = vec3(0.8);
+    // Nearest-surfel fallback for the (rare) case where traversal reported a
+    // hit but no surfel clears every blend gate. Keep only the running t and
+    // the packed index live across the gather loop; re-load nrm/alb from the
+    // winner in the fallback branch — this kernel is occupancy-capped, so
+    // shrinking loop-carried state matters more than the one extra load.
+    float nearest_t = 1e30;
+    uint  nearest_pi = 0u;
 
     for (int l = 0; l < u_levels; ++l) {
         if (u_l_num[l] == 0u) continue;
@@ -184,11 +186,7 @@ bool reconstruct(vec3 o, vec3 d, float t_near, float t_far, float best_t, out Hi
                 wsum += wgt;
                 mirror = mirror || packed_alb[pi].w > 0.5;
 
-                if (t_i < nearest.t) {
-                    nearest.t = t_i;
-                    nearest.nrm = n;
-                    nearest.alb = packed_alb[pi].rgb;
-                }
+                if (t_i < nearest_t) { nearest_t = t_i; nearest_pi = pi; }
             }
         }
     }
@@ -197,12 +195,15 @@ bool reconstruct(vec3 o, vec3 d, float t_near, float t_far, float best_t, out Hi
         hit.pos = o + d * (acc_t / wsum);
         hit.nrm = normalize(acc_nrm / wsum);
         hit.alb = acc_alb / wsum;
+    } else if (nearest_t < 1e30) {
+        hit.pos = hit_pos;
+        hit.nrm = packed_pn[2u * nearest_pi + 1u].xyz;
+        hit.alb = packed_alb[nearest_pi].rgb;
     } else {
         hit.pos = hit_pos;
-        hit.nrm = nearest.nrm;
-        hit.alb = nearest.alb;
+        hit.nrm = vec3(0.0, 1.0, 0.0);
+        hit.alb = vec3(0.8);
     }
-    hit.t = best_t;
     hit.is_mirror = mirror;
 
     // Flip normal toward the ray origin (paper §5).

@@ -1,0 +1,39 @@
+#version 460 core
+layout(local_size_x = 256) in;
+
+// S1 pass 4b — compact the non-empty cells of every active cascade into one
+// list, so the cluster pass can be dispatched over cells that actually have
+// contents instead of over all 262144 per cascade.
+//
+// Also emits the coarsest cascade's cells separately: the gather walks that list
+// in full for its far field.
+
+#include "clipmap.glsl"
+
+layout(std430, binding = 0) readonly buffer CellMask { uint cell_mask[]; };
+layout(std430, binding = 1) buffer CellList { uint cell_list[]; };   // [0] = count
+layout(std430, binding = 2) buffer FarCells { uint far_cells[]; };   // [0] = count
+
+uniform uint u_mask_offs[3];
+uniform int  u_cascades;
+uniform int  u_coarsest;
+uniform uint u_max_cells;
+uniform uint u_max_far;
+
+void main() {
+    uint cell = gl_GlobalInvocationID.x;
+    if (cell >= uint(CLIP_CELLS)) return;
+
+    for (int l = 0; l < u_cascades; ++l) {
+        if ((cell_mask[u_mask_offs[l] + (cell >> 5u)] & (1u << (cell & 31u))) == 0u) continue;
+
+        uint slot = atomicAdd(cell_list[0], 1u);
+        // Cascade in the top bits: 64^3 needs 18 bits, leaving plenty.
+        if (slot < u_max_cells) cell_list[1u + slot] = (uint(l) << 26u) | cell;
+
+        if (l == u_coarsest) {
+            uint fslot = atomicAdd(far_cells[0], 1u);
+            if (fslot < u_max_far) far_cells[1u + fslot] = cell;
+        }
+    }
+}

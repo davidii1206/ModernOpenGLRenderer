@@ -1,0 +1,16 @@
+#version 460 core
+layout(local_size_x = 1) in;
+
+// One workgroup per non-empty cell, dispatched indirectly so the count never
+// has to come back to the CPU.
+
+layout(std430, binding = 0) readonly buffer CellList { uint cell_list[]; };
+layout(std430, binding = 1) writeonly buffer Cmd { uint cmd[]; };
+
+uniform uint u_max_cells;
+
+void main() {
+    cmd[0] = min(cell_list[0], u_max_cells);
+    cmd[1] = 1u;
+    cmd[2] = 1u;
+}

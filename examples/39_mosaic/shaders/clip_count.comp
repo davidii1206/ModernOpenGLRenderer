@@ -1,0 +1,52 @@
+#version 460 core
+layout(local_size_x = 256) in;
+
+// S1 pass 1 — per-cell surfel counts, per-surfel slots, and the occupancy
+// bitmask, for every cascade at once.
+//
+// A surfel is inserted into EVERY cascade whose box contains it, not only the
+// finest. That is what makes the S5 shell traversal correct: the gather walks
+// cells within a small cell-radius of the shading surfel at each level, taking
+// the near shell from C0, the next from C1 and so on. If a surfel lived only in
+// its finest cascade, C1's cells near the camera would be empty — every surfel
+// there would have been claimed by C0 — and any neighbour further away than
+// C0's few-cell reach but nearer than C1's box boundary would be gathered by
+// nothing at all. Inserting into all containing cascades costs 3x the index
+// memory (a few MB) and removes that hole entirely.
+//
+// The occupancy bit is set by whichever thread observes the 0 -> 1 transition of
+// the cell counter, so it is free on top of the atomicAdd already being made.
+
+#include "clipmap.glsl"
+
+layout(std430, binding = 0) readonly buffer LivePN { vec4 live_pn[]; };
+layout(std430, binding = 1) buffer CellCount { uint cell_count[]; };
+layout(std430, binding = 2) buffer SurfelSlot { uint surfel_slot[]; };
+layout(std430, binding = 3) buffer CellMask { uint cell_mask[]; };
+
+uniform vec3  u_origins[3];
+uniform float u_inv_cells[3];
+uniform uint  u_cnt_offs[3];
+uniform uint  u_mask_offs[3];
+uniform uint  u_live_count;
+uniform int   u_cascades;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= u_live_count) return;
+
+    vec3 p = live_pn[2u * i].xyz;
+
+    for (int l = 0; l < u_cascades; ++l) {
+        ivec3 c = clip_cell_coord(p, u_origins[l], u_inv_cells[l]);
+        if (!clip_inside(c)) {
+            surfel_slot[i * 3u + uint(l)] = 0xFFFFFFFFu;   // not in this cascade
+            continue;
+        }
+        uint cell = uint(clip_cell_index(c));
+        uint prev = atomicAdd(cell_count[u_cnt_offs[l] + cell], 1u);
+        if (prev == 0u)
+            atomicOr(cell_mask[u_mask_offs[l] + (cell >> 5u)], 1u << (cell & 31u));
+        surfel_slot[i * 3u + uint(l)] = prev;
+    }
+}

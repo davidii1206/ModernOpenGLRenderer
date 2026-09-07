@@ -28,6 +28,13 @@ ShaderFile::ShaderFile(std::string_view path, ShaderType type)
     poll(); // initial read
 }
 
+ShaderFile::ShaderFile(std::string_view path, ShaderType type,
+                       std::vector<std::string> include_dirs)
+    : path_(path), type_(type), include_dirs_(std::move(include_dirs))
+{
+    poll(); // initial read, with includes already resolvable
+}
+
 void ShaderFile::add_include_dir(std::string_view dir) {
     include_dirs_.emplace_back(dir);
 }
@@ -53,7 +60,10 @@ bool ShaderFile::poll() {
 // --- HotReloadProgram ---
 
 void HotReloadProgram::add_stage(std::string_view path, ShaderType type) {
-    stages_.emplace_back(path, type);
+    // Stages added after add_include_dir() must inherit the include dirs too,
+    // otherwise the order of the two calls silently changes whether #include
+    // resolves.
+    stages_.emplace_back(path, type, include_dirs_);
 }
 
 void HotReloadProgram::add_include_dir(std::string_view dir) {

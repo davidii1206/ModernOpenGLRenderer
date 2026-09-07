@@ -1,0 +1,16 @@
+#version 460 core
+layout(local_size_x = 256) in;
+
+// Exclusive prefix sum, pass 3 of 3: add each block's offset to the
+// block-local prefix, yielding the global exclusive scan.
+layout(std430, binding = 0) buffer Starts { uint starts[]; };
+layout(std430, binding = 1) readonly buffer BlockSum { uint bsum[]; };
+
+uniform uint u_n;
+uniform uint u_off;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint bid = gl_WorkGroupID.x;
+    if (gid < u_n) starts[u_off + gid] += bsum[bid];
+}

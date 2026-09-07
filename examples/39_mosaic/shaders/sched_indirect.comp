@@ -1,0 +1,18 @@
+#version 460 core
+layout(local_size_x = 1) in;
+
+// S3d — turn the selected count into a dispatch command on the GPU.
+//
+// One workgroup per selected surfel. Keeping this on the device is what avoids
+// a readback bubble between the scheduler and the gather.
+
+layout(std430, binding = 0) readonly buffer Cutoff { uint cutoff[]; };
+layout(std430, binding = 1) writeonly buffer Cmd { uint cmd[]; };
+
+uniform uint u_budget;
+
+void main() {
+    cmd[0] = min(cutoff[1], u_budget);
+    cmd[1] = 1u;
+    cmd[2] = 1u;
+}

@@ -412,9 +412,30 @@ bool Model::load_gltf(const std::string& path) {
             const auto& gltf_tex = mdl.textures[mat.emissiveTexture.index];
             info.emissive_tex = gltf_tex.source;
         }
-        info.emissive_factor[0] = static_cast<float>(mat.emissiveFactor[0]);
-        info.emissive_factor[1] = static_cast<float>(mat.emissiveFactor[1]);
-        info.emissive_factor[2] = static_cast<float>(mat.emissiveFactor[2]);
+        // KHR_materials_emissive_strength.
+        //
+        // glTF clamps emissiveFactor to [0,1], so any emitter brighter than one
+        // carries its real intensity in this extension's multiplier. Ignoring it
+        // silently caps every light in the scene at 1: CornellBoxOriginal.glb
+        // authors its ceiling panel at strength 17, which is why it renders
+        // ~17x too dim compared with Blender.
+        float emissive_strength = 1.0f;
+        {
+            const auto it = mat.extensions.find("KHR_materials_emissive_strength");
+            if (it != mat.extensions.end() && it->second.Has("emissiveStrength")) {
+                const auto& v = it->second.Get("emissiveStrength");
+                if (v.IsNumber())
+                    emissive_strength = static_cast<float>(v.GetNumberAsDouble());
+            }
+        }
+        info.emissive_strength = emissive_strength;
+        info.emissive_factor[0] = static_cast<float>(mat.emissiveFactor[0]) * emissive_strength;
+        info.emissive_factor[1] = static_cast<float>(mat.emissiveFactor[1]) * emissive_strength;
+        info.emissive_factor[2] = static_cast<float>(mat.emissiveFactor[2]) * emissive_strength;
+        if (emissive_strength != 1.0f)
+            gllib::logf(gllib::LogLevel::debug,
+                        "  material %zu '%s': emissive strength %.3f",
+                        i, mat.name.c_str(), emissive_strength);
 
         // Alpha mode
         if (mat.alphaMode == "MASK") {

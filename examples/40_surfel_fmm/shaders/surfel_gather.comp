@@ -1,0 +1,298 @@
+#version 460 core
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// ---------------------------------------------------------------------------
+// Tier 1: surfel irradiance -> screen, as a GATHER.
+//
+// One thread per pixel. Reconstruct the pixel's world position and normal from
+// the G-buffer, collect the surfels around it from the uniform grid, and
+// interpolate their irradiance with Schaufler & Jensen's equation (1),
+//
+//     attrib = SUM attrib_i * (r - d_i) / SUM (r - d_i)
+//
+// where d_i is measured IN the surfel's own tangent plane, not orthogonal to
+// anything -- which is what makes the weight fall off across the disc rather
+// than along the view ray.
+//
+// WHY THIS CAN BE SHARPER THAN THE SPLAT. The scatter's support must span at
+// least one surfel spacing everywhere or pixels between surfels collect no
+// weight at all (finding 5), so its kernel width is set by its coverage
+// obligation and not by how sharp the cache can justify being -- finding 12
+// measured the result at twice the surfel spacing. A gather has a nearest-surfel
+// fallback, so coverage is guaranteed no matter how tight the radius is, and
+// u_radius is then free to shrink toward the actual nearest-neighbour limit.
+//
+// What it cannot do is beat the spacing. The irradiance is still cached per
+// surfel; this changes how faithfully pixels read it back, not what is in it.
+// ---------------------------------------------------------------------------
+
+#include "surfel.glsl"
+#include "gbuffer.glsl"
+#include "micro.glsl"   // sgi_onb: the tangent frame the degree-1 fit is expressed in
+
+layout(std430, binding = 4)  readonly buffer IrradIn { vec4 irrad[]; };
+layout(std430, binding = 8)  readonly buffer CellSC  { uvec2 cell_sc[]; };
+layout(std430, binding = 9)  readonly buffer CellIt  { uint  cell_item[]; };
+// Cell-sorted copy of pos+radius: the scan is then a strictly sequential read
+// instead of an indirection through cell_item into the SoA. Example 38's
+// packed_pn, and its comments record it as one of that example's larger wins.
+layout(std430, binding = 10) readonly buffer CellPR  { vec4  cell_pr[]; };
+layout(std430, binding = 16) readonly buffer LightVis { float light_vis[]; };
+layout(std430, binding = 17) readonly buffer LightMax { uint  light_max[]; };
+layout(std430, binding = 18) readonly buffer LightGrd { vec4  light_grad[]; };
+
+layout(binding = 0, rgba32f) uniform writeonly image2D u_out;
+
+layout(binding = 1) uniform sampler2D u_gnormal;
+layout(binding = 3) uniform sampler2D u_gdepth;
+
+uniform mat4  u_inv_view_proj;
+uniform ivec2 u_viewport;
+uniform vec3  u_grid_min;
+uniform ivec3 u_grid_res;
+uniform float u_inv_cell;
+uniform float u_radius;       // gather radius, world units
+uniform float u_plane_tol;    // max tangent-plane distance, world units
+uniform float u_normal_tol;   // min dot(n_pixel, n_surfel)
+uniform uint  u_kernel;       // 0 = Schaufler-Jensen (r-d), 1 = Wendland C2, 2 = Gaussian
+uniform float u_light_sigma;  // light-visibility similarity width; <= 0 = off
+uniform float u_grad_scale;   // trust in the local linear model, 0..1
+uniform uint  u_show_light;   // 1 = output the interpolated visibility instead of E
+uniform uint  u_mls;          // 0 = Shepard (degree 0), 1 = degree-1 moving least squares
+
+// DEGREE-0 vs DEGREE-1.
+//
+// SUM E_i w_i / SUM w_i is Shepard interpolation, i.e. degree-0 moving least
+// squares, and its signature artifact is a FLAT SPOT AT EVERY DATA POINT: the
+// reconstruction is stationary at each sample, so the field comes out as
+// plateaus with transitions between them, and it provably cannot reproduce a
+// linear ramp -- which is the one thing a penumbra locally is. "Each blob has
+// the same colour inside of it" and "the penumbra has no clean gradient" are the
+// same defect.
+//
+// Degree 1 fits a + b*x + c*y to the neighbours and evaluates it at the query
+// point. Because the query point is the origin of the offsets, only `a` is
+// needed -- one Cramer numerator, no full solve, and no per-surfel gradient
+// stored anywhere. The 3x3 matrix depends only on positions, so it is built once
+// and shared across R, G and B.
+
+uniform uint  u_debug;        // 1 = write fallback flag into .a instead of 1.0
+
+// --- the interpolation kernel -----------------------------------------------
+//
+// This is what decides whether individual surfels are visible, and the paper's
+// own weight is the worst of the three for that.
+//
+// Schaufler & Jensen equation (1) is w = r - d: a CONE. It peaks at the surfel
+// with a kink at the apex and reaches zero at r with another kink, so a field of
+// them reconstructs as a field of little bumps -- one visible bump per surfel,
+// which is exactly the artifact. It is kept because it is the paper's and this
+// example is a reference, not because it is a good reconstruction filter.
+//
+// Wendland C2, w = (1-q)^4 * (4q+1), is the standard compact-support smoothing
+// kernel from SPH. It is flat-topped at q = 0, and at q = 1 its value, slope AND
+// curvature are all zero -- so a surfel enters and leaves the sum with no
+// discontinuity in the result or in its first two derivatives, and the surface
+// it reconstructs has no bump at each sample.
+float gather_kernel(float q) {          // q = d / radius, in [0, 1]
+    if (u_kernel == 0u) return 1.0 - q;                       // cone (paper)
+    if (u_kernel == 2u) return exp(-4.5 * q * q) - 0.011109;  // Gaussian, zeroed at q=1
+    const float t = 1.0 - q;
+    return t * t * t * t * (4.0 * q + 1.0);                   // Wendland C2
+}
+
+// Smooth falloff in [0,1] for a normalized violation t; zero value and slope at
+// t = 1. Used for the plane and normal terms so a surfel never leaves the sum
+// carrying weight, which a hard reject lets it do.
+float smooth_gate(float t) {
+    const float u = clamp(1.0 - t * t, 0.0, 1.0);
+    return u * u;
+}
+
+void main() {
+    const ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= u_viewport.x || px.y >= u_viewport.y) return;
+
+    const vec2  uv = (vec2(px) + 0.5) / vec2(u_viewport);
+    const float d  = texelFetch(u_gdepth, px, 0).r;
+    if (d >= 1.0) { imageStore(u_out, px, vec4(0.0)); return; }
+
+    const vec3 n = normalize(texelFetch(u_gnormal, px, 0).xyz);
+    const vec3 p = world_from_depth(d, uv, u_inv_view_proj);
+
+    const vec3  g  = (p - u_grid_min) * u_inv_cell;
+    const ivec3 hc = clamp(ivec3(floor(g)), ivec3(0), u_grid_res - 1);
+
+    vec3  acc  = vec3(0.0);
+    float lacc = 0.0;
+    float wsum = 0.0;
+    // Degree-1 moments. Offsets are expressed in the pixel's tangent frame and
+    // normalized by the radius so the matrix stays O(1) and the determinant test
+    // below is scale-free.
+    vec3 Tp, Bp;
+    sgi_onb(n, Tp, Bp);
+    float Sx = 0.0, Sy = 0.0, Sxx = 0.0, Sxy = 0.0, Syy = 0.0;
+    vec3  Se = vec3(0.0), Sxe = vec3(0.0), Sye = vec3(0.0);
+    vec3  emin = vec3(1e30), emax = vec3(-1e30);
+    float best = 3.4e38;
+    uint  best_i = 0xFFFFFFFFu;
+
+    const float r2max = u_radius * u_radius;
+
+    // The pixel's own reference visibility, taken from the nearest
+    // plane-consistent surfel. The blend is then anchored to the lighting
+    // situation the pixel is actually in, rather than to whichever neighbour
+    // happens to be scanned first.
+    const float lnorm = 1.0 / max(uintBitsToFloat(light_max[0]), 1e-8);
+    // The pixel's own visibility AND its local linear model, both taken from the
+    // nearest plane-consistent surfel and evaluated at the pixel.
+    float vis_p = 0.0;
+    vec4  grad_p = vec4(0.0);
+    {
+        float bd = 3.4e38;
+        for (int dz = -1; dz <= 1; ++dz) {
+            const int cz = hc.z + dz;
+            if (cz < 0 || cz >= u_grid_res.z) continue;
+            for (int dy = -1; dy <= 1; ++dy) {
+                const int cy = hc.y + dy;
+                if (cy < 0 || cy >= u_grid_res.y) continue;
+                for (int dx = -1; dx <= 1; ++dx) {
+                    const int cx = hc.x + dx;
+                    if (cx < 0 || cx >= u_grid_res.x) continue;
+                    const uint ci = uint(cx) + uint(u_grid_res.x) *
+                                    (uint(cy) + uint(u_grid_res.y) * uint(cz));
+                    const uvec2 sc = cell_sc[ci];
+                    for (uint k = 0; k < sc.y; ++k) {
+                        const uint e = sc.x + k;
+                        const vec3 dv = p - cell_pr[e].xyz;
+                        const float r2 = dot(dv, dv);
+                        if (r2 >= bd) continue;
+                        const uint j = cell_item[e];
+                        const vec3 nj = surfel_normal(j);
+                        if (dot(n, nj) <= u_normal_tol) continue;
+                        if (abs(dot(dv, nj)) >= u_plane_tol) continue;
+                        bd = r2;
+                        vis_p = light_vis[j] * lnorm
+                              + dot(light_grad[j].xyz, dv) * light_grad[j].w * u_grad_scale;
+                        grad_p = light_grad[j];
+                    }
+                }
+            }
+        }
+    }
+
+    // A 3x3x3 window. Fat insertion means a cell already lists every disc whose
+    // sphere reaches it, so with a cell of about one spacing this covers every
+    // surfel within u_radius as long as u_radius stays under about one cell.
+    for (int dz = -1; dz <= 1; ++dz) {
+        const int cz = hc.z + dz;
+        if (cz < 0 || cz >= u_grid_res.z) continue;
+        for (int dy = -1; dy <= 1; ++dy) {
+            const int cy = hc.y + dy;
+            if (cy < 0 || cy >= u_grid_res.y) continue;
+            for (int dx = -1; dx <= 1; ++dx) {
+                const int cx = hc.x + dx;
+                if (cx < 0 || cx >= u_grid_res.x) continue;
+
+                const uint  ci = uint(cx) + uint(u_grid_res.x) *
+                                 (uint(cy) + uint(u_grid_res.y) * uint(cz));
+                const uvec2 sc = cell_sc[ci];
+
+                for (uint k = 0; k < sc.y; ++k) {
+                    const uint  e  = sc.x + k;
+                    const vec4  pr = cell_pr[e];
+                    const vec3  dv = p - pr.xyz;
+
+                    // Cheapest rejection first: radial distance, from data we
+                    // have already loaded. The normal costs an unpack.
+                    const float r2 = dot(dv, dv);
+                    if (r2 >= r2max && r2 >= best) continue;
+
+                    const uint j  = cell_item[e];
+                    const vec3 nj = surfel_normal(j);
+
+                    // Both gates are leak conditions -- blending a floor surfel
+                    // onto the wall it meets is exactly what an object-space
+                    // cache is supposed to be free of -- but a HARD reject makes
+                    // a surfel drop out of the sum while still carrying weight,
+                    // and that discontinuity is visible as cell structure. Reject
+                    // at the bound, and fade smoothly up to it.
+                    const float nd = dot(n, nj);
+                    if (nd <= u_normal_tol) continue;
+                    const float pl = abs(dot(dv, nj));
+                    if (pl >= u_plane_tol) continue;
+
+                    // Nearest plane-consistent surfel, whatever its distance:
+                    // this is what discharges the coverage obligation, and so
+                    // what lets u_radius be small.
+                    if (r2 < best) { best = r2; best_i = j; }
+                    if (r2 >= r2max) continue;
+
+                    float w = gather_kernel(sqrt(r2) / u_radius)
+                            * smooth_gate(pl / u_plane_tol)
+                            * smooth_gate((1.0 - nd) / max(1.0 - u_normal_tol, 1e-4));
+                    // The same edge stop the cache denoise uses, applied to the
+                    // pixel blend: without it the interpolation itself carries
+                    // light across a shadow boundary, however clean the cache is.
+                    if (u_light_sigma > 0.0) {
+                        // Predict this candidate's visibility from the pixel's
+                        // own linear model; penalize only what the model cannot
+                        // explain, so a smooth ramp does not suppress the blend.
+                        const float pred = vis_p - dot(grad_p.xyz, dv) * grad_p.w * u_grad_scale;
+                        const float ld = abs(light_vis[j] * lnorm - pred) / u_light_sigma;
+                        w *= exp(-ld * ld);
+                    }
+                    if (w <= 1e-6) continue;
+                    const vec3 Ej = irrad[j].rgb;
+                    acc  += Ej * w;
+                    lacc += light_vis[j] * w;
+                    wsum += w;
+
+                    if (u_mls != 0u) {
+                        // dv points surfel -> pixel, so the surfel's offset FROM
+                        // the pixel is -dv.
+                        const vec2 q = vec2(dot(-dv, Tp), dot(-dv, Bp)) / u_radius;
+                        Sx  += w * q.x;      Sy  += w * q.y;
+                        Sxx += w * q.x * q.x; Sxy += w * q.x * q.y; Syy += w * q.y * q.y;
+                        Se  += w * Ej;
+                        Sxe += w * q.x * Ej;  Sye += w * q.y * Ej;
+                        emin = min(emin, Ej); emax = max(emax, Ej);
+                    }
+                }
+            }
+        }
+    }
+
+    vec3  E   = vec3(0.0);
+    float fbk = 0.0;
+    if (wsum > 1e-8)            E = acc / wsum;
+    else if (best_i != 0xFFFFFFFFu) { E = irrad[best_i].rgb; fbk = 1.0; }
+
+    if (u_mls != 0u && wsum > 1e-8) {
+        // Cramer for the constant term of a + b*x + c*y, evaluated at (0,0).
+        const float det = wsum * (Sxx * Syy - Sxy * Sxy)
+                        - Sx   * (Sx  * Syy - Sxy * Sy)
+                        + Sy   * (Sx  * Sxy - Sxx * Sy);
+        // Ill-conditioned means too few neighbours, or collinear ones -- which is
+        // the case at a silhouette and on thin geometry. Fall back to Shepard
+        // rather than to an extrapolated guess.
+        const float sc = max(wsum + Sxx + Syy, 1e-20);
+        if (abs(det) > 1e-5 * sc * sc * sc) {
+            const vec3 num = Se  * (Sxx * Syy - Sxy * Sxy)
+                           - Sx  * (Sxe * Syy - Sxy * Sye)
+                           + Sy  * (Sxe * Sxy - Sxx * Sye);
+            // A linear fit EXTRAPOLATES, and near a shadow boundary it will
+            // overshoot into a bright halo or negative light. Clamping to the
+            // range of the contributing samples is a correctness condition, not
+            // polish: without it the umbra leak comes straight back.
+            E = clamp(num / det, emin, emax);
+        }
+    }
+
+    if (u_show_light != 0u) {
+        const float v = wsum > 1e-8 ? lacc * lnorm / wsum : vis_p;
+        imageStore(u_out, px, vec4(vec3(v), 1.0));
+        return;
+    }
+    imageStore(u_out, px, vec4(E, u_debug != 0u ? fbk : 1.0));
+}

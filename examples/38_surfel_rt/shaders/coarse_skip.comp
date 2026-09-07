@@ -1,0 +1,61 @@
+#version 460 core
+layout(local_size_x = 256) in;
+
+// Grid build, extra pass (#1): per-coarse-cell "is there finer content near
+// here?" bitmask. One thread per SOURCE-level cell; for every occupied one,
+// inflate its world AABB by the traversal reach and set bit u_bit on every
+// L0 cell it overlaps. trace_best then checks coarse_skip[l0_cell] before
+// paying descend()'s per-coarse-step DDA setup for a finer level — the bunny
+// occupies one corner of the box, so most coarse cells a ray crosses have
+// nothing finer and skip all 3 descents.
+//
+// CONSERVATIVE by construction: over-marking only costs a wasted descend that
+// finds nothing; under-marking would drop finer surfels (mirror holes). The
+// reach (u_reach = search_r + 3*cell_src, CPU-side) covers descend()'s pad
+// plus its 3x3x3 entry window and per-step slabs.
+
+layout(std430, binding = 0) readonly buffer CellMask   { uint cell_mask[]; };
+layout(std430, binding = 1)          buffer CoarseSkip { uint coarse_skip[]; };
+
+// Source (finer) level — set via set_level_uniforms(), then u_src_cells.
+uniform vec3  u_grid_min;
+uniform float u_inv_cell;
+uniform ivec3 u_grid_res;
+uniform uint  u_src_cells;  // this level's cell volume (res.x*res.y*res.z)
+uniform uint  u_mask_off;   // cell_mask word offset for this level
+
+// Coarsest level (L0) target grid.
+uniform vec3  u_l0_min;
+uniform float u_l0_inv_cell;
+uniform ivec3 u_l0_res;
+
+uniform uint  u_bit;       // 1u << source_level
+uniform float u_reach;     // AABB inflation (world units)
+
+void main() {
+    uint ci = gl_GlobalInvocationID.x;
+    if (ci >= u_src_cells) return;
+
+    // This source cell occupied?
+    if ((cell_mask[u_mask_off + (ci >> 5)] & (1u << (ci & 31u))) == 0u) return;
+
+    // Decode the linear index into 3D cell coords, then to a world AABB.
+    ivec3 rc;
+    rc.x = int(ci) % u_grid_res.x;
+    rc.y = (int(ci) / u_grid_res.x) % u_grid_res.y;
+    rc.z = int(ci) / (u_grid_res.x * u_grid_res.y);
+    float cs = 1.0 / u_inv_cell;
+    vec3 lo = u_grid_min + vec3(rc) * cs - vec3(u_reach);
+    vec3 hi = u_grid_min + vec3(rc + 1) * cs + vec3(u_reach);
+
+    // Overlapping L0 cell range.
+    ivec3 c0 = clamp(ivec3(floor((lo - u_l0_min) * u_l0_inv_cell)), ivec3(0), u_l0_res - 1);
+    ivec3 c1 = clamp(ivec3(floor((hi - u_l0_min) * u_l0_inv_cell)), ivec3(0), u_l0_res - 1);
+
+    for (int z = c0.z; z <= c1.z; ++z)
+    for (int y = c0.y; y <= c1.y; ++y)
+    for (int x = c0.x; x <= c1.x; ++x) {
+        uint idx = uint(x + u_l0_res.x * (y + u_l0_res.y * z));
+        atomicOr(coarse_skip[idx], u_bit);
+    }
+}

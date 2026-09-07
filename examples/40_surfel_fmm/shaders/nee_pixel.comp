@@ -1,0 +1,71 @@
+#version 460 core
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// ---------------------------------------------------------------------------
+// The direct term, one thread per PIXEL.
+//
+// Same estimator as nee_direct.comp -- literally the same code, from
+// common/nee.glsl -- with the receiver taken from the G-buffer instead of from
+// the surfel set. That is the whole difference, and it is the difference that
+// matters, because the cache is the resolution limit:
+//
+//   * a surfel is ~19-37 px across at the reference camera, so a per-surfel
+//     shadow boundary is reconstructed from samples spaced that far apart and
+//     then interpolated. The silhouette comes out jagged no matter how good the
+//     interpolation is -- that is Nyquist, not a filtering failure.
+//   * a per-pixel receiver has no such limit. The boundary is resolved at the
+//     resolution of the OCCLUDER representation (the surfel discs) and of the
+//     light stratification (8x8), which are both far finer than the receiver
+//     spacing.
+//
+// The cache still carries the direct term for the BOUNCE transport
+// (bf_lout.comp), so nothing about the solve changes; this only replaces what
+// the image reads. Indirect stays interpolated from the cache, which is the
+// right place for it: it is low frequency and 48x cheaper there.
+//
+// Cost is the reason this was staged second. 1.44M receivers against 30k is 48x
+// the work of the per-surfel pass, on a frustum walk that is already the most
+// expensive thing in the example. It runs on a flat grid with a coarse occupancy
+// bitmask and no hierarchy, so treat the number it prints as an upper bound.
+//
+// ADDS INTO the reconstruction's target rather than writing its own: the gather
+// stores irradiance E directly in .rgb, so the direct term composites with a
+// read-modify-write and needs no extra full-resolution texture.
+// ---------------------------------------------------------------------------
+
+#include "nee.glsl"
+#include "gbuffer.glsl"
+
+layout(binding = 0, rgba32f) uniform image2D u_out;
+
+layout(binding = 1) uniform sampler2D u_gnormal;
+layout(binding = 3) uniform sampler2D u_gdepth;
+
+uniform mat4  u_inv_view_proj;
+uniform ivec2 u_viewport;
+uniform float u_radius;       // the set's global surfel radius
+uniform uint  u_show_light;   // 1 = write the visibility scalar instead of adding E
+
+void main() {
+    const ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= u_viewport.x || px.y >= u_viewport.y) return;
+
+    const float d = texelFetch(u_gdepth, px, 0).r;
+    if (d >= 1.0) return;                       // background: leave it alone
+
+    const vec2 uv = (vec2(px) + 0.5) / vec2(u_viewport);
+    const vec3 n  = normalize(texelFetch(u_gnormal, px, 0).xyz);
+    const vec3 p  = world_from_depth(d, uv, u_inv_view_proj);
+
+    vec3  E;
+    float vis;
+    // No self index: a pixel is not a surfel. sgi_same_surface() is what keeps
+    // the receiver's own surface from shadowing it, and it is a strictly better
+    // test than an index compare -- the index only ever excluded ONE of the
+    // several discs that overlap any given point.
+    sgi_nee_direct(p, n, u_radius, 0xFFFFFFFFu, E, vis);
+
+    if (u_show_light != 0u) { imageStore(u_out, px, vec4(vec3(vis), 1.0)); return; }
+    const vec4 prev = imageLoad(u_out, px);
+    imageStore(u_out, px, vec4(prev.rgb + E, prev.a));
+}

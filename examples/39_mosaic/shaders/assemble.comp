@@ -1,0 +1,78 @@
+#version 460 core
+layout(local_size_x = 256) in;
+
+// S0 — instance assembly.
+//
+// One thread per LIVE surfel. Each instance contributes a contiguous slice of
+// the live buffers, so a thread finds its instance with a binary search over the
+// destination bases (a few steps for a few hundred instances) rather than the
+// host uploading a per-surfel instance id every frame.
+//
+// This is the step that makes object-space storage pay off: a rigid instance is
+// a matrix multiply here, and nothing about the cached irradiance is touched.
+
+#include "surfel.glsl"
+#include "clipmap.glsl"
+
+struct LiveInstance {
+    mat4  xform;
+    vec4  aabb_min;   // xyz = AABB min,    w = radius_scale
+    vec4  aabb_ext;   // xyz = AABB extent, w = object_scale
+    uvec4 range;      // src_base, dst_base, count, flags
+};
+
+layout(std430, binding = 0) readonly buffer SrcSurfels { uvec4 src_surfels[]; };
+layout(std430, binding = 1) readonly buffer SrcEmissive { uint src_emissive[]; };
+layout(std430, binding = 2) readonly buffer Instances { LiveInstance instances[]; };
+layout(std430, binding = 3) writeonly buffer LivePN { vec4 live_pn[]; };
+layout(std430, binding = 4) writeonly buffer LiveAlb { vec4 live_alb[]; };
+layout(std430, binding = 5) writeonly buffer LiveEmissive { vec4 live_emissive[]; };
+layout(std430, binding = 6) writeonly buffer LiveMeta { uint live_meta[]; };
+// Live index -> SOURCE surfel index. The persistent irradiance cache is keyed on
+// the source index, because live indices are reassigned every frame as LOD
+// selection and instance ordering change; a cache keyed on the live index would
+// scramble whenever either did.
+layout(std430, binding = 7) writeonly buffer LiveSrc { uint live_src[]; };
+
+uniform uint u_live_count;
+uniform uint u_instance_count;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= u_live_count) return;
+
+    // Binary search for the instance owning live index i.
+    uint lo = 0u, hi = u_instance_count - 1u;
+    while (lo < hi) {
+        uint mid = (lo + hi + 1u) >> 1u;
+        if (instances[mid].range.y <= i) lo = mid; else hi = mid - 1u;
+    }
+    LiveInstance inst = instances[lo];
+    uint local = i - inst.range.y;
+    if (local >= inst.range.z) return;      // guards a malformed range
+
+    uint src = inst.range.x + local;
+    uvec4 s = src_surfels[src];
+
+    vec3 p_obj = surfel_position(s, inst.aabb_min.xyz, inst.aabb_ext.xyz);
+    float r_obj = surfel_radius(s, inst.aabb_min.w);
+    vec3 n_obj = surfel_normal(s);
+
+    vec3 p_ws = (inst.xform * vec4(p_obj, 1.0)).xyz;
+    // Uniform-scale assumption (checked and warned about on the host): the
+    // normal transform is then just the rotation part, with no inverse
+    // transpose needed, and the radius scales by the same factor.
+    vec3 n_ws = normalize(mat3(inst.xform) * n_obj);
+    float r_ws = r_obj * inst.aabb_ext.w;
+
+    vec3 albedo = surfel_albedo(s);
+    vec3 emissive = unpack_rgb9e5(src_emissive[src]);
+    uint flags = surfel_flags(s);
+
+    live_pn[2u * i]      = vec4(p_ws, r_ws);
+    live_pn[2u * i + 1u] = vec4(n_ws, 0.0);
+    live_alb[i]          = vec4(albedo, dot(emissive, vec3(0.2126, 0.7152, 0.0722)));
+    live_emissive[i]     = vec4(emissive, 0.0);
+    live_meta[i]         = flags | (lo << 8u) | (inst.range.w & 0xFFu) << 24u;
+    live_src[i]          = src;
+}

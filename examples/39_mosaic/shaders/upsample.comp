@@ -1,0 +1,59 @@
+#version 460 core
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// S7b — bilateral upsample of the half-res indirect buffer.
+//
+// A plain bilinear upsample bleeds indirect light across depth discontinuities
+// and across creases, which is exactly where a GI solution is judged. Weighting
+// the four half-res taps by how well their depth and normal agree with the
+// full-res pixel keeps the edges.
+
+#include "gbuffer.glsl"
+
+layout(binding = 0) uniform sampler2D u_gbuf_normal;
+layout(binding = 1) uniform sampler2D u_gbuf_depth;
+layout(binding = 2) uniform sampler2D u_indirect_half;
+
+layout(rgba16f, binding = 0) writeonly uniform image2D u_out;
+
+uniform ivec2 u_full_size;
+uniform ivec2 u_half_size;
+uniform float u_near;
+uniform float u_far;
+
+float linear_depth(float d01) {
+    float z = d01 * 2.0 - 1.0;
+    return (2.0 * u_near * u_far) / (u_far + u_near - z * (u_far - u_near));
+}
+
+void main() {
+    ivec2 fp = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(fp, u_full_size))) return;
+
+    float depth = texelFetch(u_gbuf_depth, fp, 0).r;
+    vec3 N = normalize(texelFetch(u_gbuf_normal, fp, 0).xyz);
+    float z = linear_depth(depth);
+
+    ivec2 hp = fp / 2;
+    vec3 sum = vec3(0.0);
+    float wsum = 0.0;
+
+    for (int dy = 0; dy <= 1; ++dy)
+    for (int dx = 0; dx <= 1; ++dx) {
+        ivec2 h = clamp(hp + ivec2(dx, dy), ivec2(0), u_half_size - 1);
+        ivec2 f = min(h * 2 + 1, u_full_size - 1);
+
+        float hz = linear_depth(texelFetch(u_gbuf_depth, f, 0).r);
+        vec3 hn = normalize(texelFetch(u_gbuf_normal, f, 0).xyz);
+
+        // Relative depth tolerance, so the test behaves the same near and far.
+        float wz = exp(-abs(hz - z) / max(z * 0.05, 1e-4));
+        float wn = pow(max(dot(N, hn), 0.0), 16.0);
+        float w = wz * wn + 1e-5;
+
+        sum += texelFetch(u_indirect_half, h, 0).rgb * w;
+        wsum += w;
+    }
+
+    imageStore(u_out, fp, vec4(sum / wsum, 1.0));
+}

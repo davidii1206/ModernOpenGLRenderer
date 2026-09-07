@@ -1,0 +1,23 @@
+#version 460 core
+layout(local_size_x = 256) in;
+
+// S1 pass 4 — interleave (start, count) into one uvec2 per cell, so a cell
+// probe is a single 8-byte fetch instead of two dependent 4-byte loads from
+// separate arrays.
+
+layout(std430, binding = 0) readonly buffer CellStart { uint cell_start[]; };
+layout(std430, binding = 1) readonly buffer CellCount { uint cell_count[]; };
+layout(std430, binding = 2) writeonly buffer CellSC { uvec2 cell_sc[]; };
+layout(std430, binding = 3) readonly buffer CascadeBase { uint cascade_base[]; };
+
+uniform uint u_total_cells;
+uniform uint u_cells;        // cells per cascade
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= u_total_cells) return;
+    // Fold the cascade base in here so every downstream consumer can use
+    // cell_sc.x as an absolute packed_idx offset without knowing about cascades.
+    uint level = i / u_cells;
+    cell_sc[i] = uvec2(cascade_base[level] + cell_start[i], cell_count[i]);
+}

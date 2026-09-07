@@ -1,0 +1,34 @@
+#version 460 core
+layout(local_size_x = 1) in;
+
+// S3b — find the bucket at which the update budget runs out, and record how the
+// budget splits across it.
+//
+// Everything in a bucket strictly ABOVE the cutoff is taken outright, and by
+// construction that is fewer than the budget. The cutoff bucket itself is
+// oversubscribed, and how its excess is resolved decides whether the scheduler
+// is fair -- see sched_select.
+
+layout(std430, binding = 0) readonly buffer Histogram { uint histogram[]; };
+layout(std430, binding = 1) writeonly buffer Cutoff { uint cutoff[]; };
+
+uniform uint u_budget;
+
+void main() {
+    uint running = 0u;
+    uint bin = 0u;
+    uint above = 0u;
+    for (int b = 255; b >= 0; --b) {
+        uint c = histogram[b];
+        if (running + c >= u_budget) {
+            bin = uint(b);
+            above = running;          // selected from strictly higher buckets
+            break;
+        }
+        running += c;
+    }
+    cutoff[0] = bin;
+    cutoff[1] = 0u;                   // selected count, filled by sched_select
+    cutoff[2] = above;
+    cutoff[3] = max(histogram[bin], 1u);
+}

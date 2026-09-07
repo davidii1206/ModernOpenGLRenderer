@@ -1,0 +1,140 @@
+#version 460 core
+layout(local_size_x = 256) in;
+
+// S3a — per-surfel update priority, bucketed into 256 bins.
+//
+// priority = screen importance + age + temporal radiance variance + disocclusion
+//
+// Screen importance is computed by projecting the surfel and depth-testing it
+// against the G-buffer, rather than by the spec's separate 1/8-res coverage
+// rasterization: the depth buffer already answers "is this surfel visible", and
+// a scatter over live surfels is cheaper than an extra raster pass.
+//
+// Bucketing rather than sorting is what keeps this cheap: a full sort of 260k
+// surfels to pick the top 8k is wasted work when a 256-bin histogram plus a
+// cutoff bin gives the same selection to within one bin's width.
+
+#include "sh.glsl"
+
+layout(std430, binding = 0) readonly buffer LivePN { vec4 live_pn[]; };
+layout(std430, binding = 1) readonly buffer LiveSrc { uint live_src[]; };
+layout(std430, binding = 2) readonly buffer ShCache { vec4 sh_cache[]; };
+layout(std430, binding = 3) writeonly buffer Bucket { uint bucket[]; };
+layout(std430, binding = 4) buffer Histogram { uint histogram[]; };
+
+layout(binding = 0) uniform sampler2D u_gbuf_depth;
+
+uniform uint  u_live_count;
+uniform mat4  u_view_proj;
+uniform vec3  u_eye;
+uniform vec2  u_screen;
+uniform float u_near;
+uniform float u_far;
+uniform uint  u_frame;
+uniform float u_px_scale;      // pixels per radian of angular radius
+
+// Weights. kAgeSpan > kImportanceBase + kImportanceSpan is the property that
+// bounds staleness: a surfel unseen for kAgeSaturate frames outranks every
+// freshly updated visible one.
+const float kImportanceBase = 0.15;
+const float kImportanceSpan = 0.30;
+const float kAgeSpan        = 0.50;
+const float kAgeSaturate    = 64.0;
+const float kVarSpan        = 0.05;
+
+uint hash_u32(uint x) {
+    x ^= x >> 16; x *= 0x7feb352du;
+    x ^= x >> 15; x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+float linear_depth(float d01) {
+    float z = d01 * 2.0 - 1.0;
+    return (2.0 * u_near * u_far) / (u_far + u_near - z * (u_far - u_near));
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= u_live_count) return;
+
+    vec4 pr = live_pn[2u * i];
+    uint src = live_src[i];
+
+    // --- screen importance ---
+    //
+    // Measured in PIXELS COVERED, not in raw surfel radius. Scaling importance
+    // with the radius makes it a function of how finely a mesh happens to be
+    // sampled: the mover bunnies carry surfels a quarter the radius of the
+    // Cornell walls, so they scored 0.44 against the walls' 0.80 and, with an
+    // age term that saturated below that gap, could never be selected at all.
+    // Their cache stayed at zero forever and they rendered as black cut-outs.
+    float importance = 0.0;
+    vec4 clip = u_view_proj * vec4(pr.xyz, 1.0);
+    if (clip.w > 0.0) {
+        vec3 ndc = clip.xyz / clip.w;
+        if (all(lessThanEqual(abs(ndc.xy), vec2(1.0)))) {
+            vec2 uv = ndc.xy * 0.5 + 0.5;
+            ivec2 px = ivec2(uv * u_screen);
+            float scene_z = linear_depth(texelFetch(u_gbuf_depth, px, 0).r);
+            // Generous tolerance: the surfel sits on the surface the depth
+            // buffer recorded, and both are quantized.
+            if (clip.w <= scene_z * 1.02 + pr.w) {
+                // Projected radius in pixels: the angular radius times the
+                // pixels-per-radian of this projection.
+                float px = pr.w / max(clip.w, 1e-4) * u_px_scale;
+                importance = kImportanceBase +
+                             kImportanceSpan * clamp(px / 4.0, 0.0, 1.0);
+            }
+        }
+    }
+
+    // --- age ---
+    //
+    // The age term is deliberately allowed to outrank ANY visible surfel once a
+    // surfel has gone unrefreshed for kAgeSaturate frames (kAgeSpan exceeds the
+    // largest possible importance). Without that guarantee the visible set
+    // starves the rest indefinitely, rather than merely refreshing it more
+    // slowly, which is what the spec's "the tail refreshes in ~30 frames" needs.
+    float age = sh_cache[src * SH_STRIDE + 1u].w;
+    float age_term = kAgeSpan * clamp(age / kAgeSaturate, 0.0, 1.0);
+
+    // --- temporal variance: a surfel whose gathered radiance is still moving
+    // needs more samples than one that has settled ---
+    float variance = sh_cache[src * SH_STRIDE + 0u].w;
+    float var_term = kVarSpan * clamp(variance, 0.0, 1.0);
+
+    // Per-frame dither, on the width of roughly one bucket.
+    //
+    // Without it the selection STARVES: large numbers of surfels land in the
+    // same bucket, sched_select takes the first `budget` of them in atomic
+    // order, and atomic order correlates with thread id — so the same low-index
+    // surfels are refreshed every frame while the rest never update at all.
+    // Dithering ties makes the choice among equals uniformly random per frame,
+    // which is what actually delivers the spec's "visible surfels refresh every
+    // 4-8 frames, the tail in ~30".
+    float dither = float(hash_u32(i * 2654435761u ^ u_frame * 0x9E3779B9u)) *
+                   (1.0 / 4294967296.0) * (1.5 / 255.0);
+
+    // Past saturation the age term does not merely OUTWEIGH importance, it
+    // preempts it.
+    //
+    // The old rule -- kAgeSpan (0.50) greater than the largest possible
+    // importance (0.45) -- only holds against a surfel whose own age term is
+    // zero, and in steady state no visible surfel's is. Visible surfels settled
+    // at age ~6, scoring 0.45 + 0.05 = 0.50+, just above the starved tail's flat
+    // 0.50, and took the entire budget: on Cornell 42.8% of the cache was ever
+    // written at all, the rest sat at zero and splatted as black into every
+    // other surfel's micro-buffer. Raising the budget from 8k to 32k took
+    // coverage to 77.9% and nearly doubled mean irradiance, which is the size of
+    // the energy this was costing.
+    //
+    // Forcing the starved into the top bucket bounds staleness at
+    // kAgeSaturate + live/budget frames, and sched_select's uniform subsample
+    // shares the budget fairly among them.
+    float priority = clamp(importance + age_term + var_term + dither, 0.0, 0.99);
+    if (age >= kAgeSaturate) priority = 1.0;
+    uint b = uint(priority * 255.0);
+    bucket[i] = b;
+    atomicAdd(histogram[b], 1u);
+}

@@ -1,0 +1,214 @@
+#version 460 core
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// S7 — half-resolution screen gather.
+//
+// Per pixel, collect the surfels covering it out of the cascade-0 index grid and
+// blend their cached irradiance. The weight is the spec's
+//
+//   w = max(0, dot(n, ns)) * saturate(1 - |plane_dist| / r) * saturate(1 - d / r)
+//
+// and every factor earns its place. The normal term rejects surfels facing away;
+// the PLANE-DISTANCE term is what makes this leak-free, because a pixel on the
+// lit side of a wall cannot pick up a surfel on the dark side however close it is
+// in space; the radial term feathers the transition so a surfel does not pop as
+// the pixel moves out of its disk.
+//
+// This is the same shape as the reconstruction in example 38's ray_gather
+// (main shaders/ray_gather.comp:116-213), reused here for a screen pixel instead
+// of a ray hit.
+
+#include "clipmap.glsl"
+#include "gbuffer.glsl"
+#include "sh.glsl"
+
+layout(binding = 0) uniform sampler2D u_gbuf_normal;
+layout(binding = 1) uniform sampler2D u_gbuf_depth;
+
+layout(std430, binding = 0) readonly buffer LivePN { vec4 live_pn[]; };
+layout(std430, binding = 1) readonly buffer LiveSrc { uint live_src[]; };
+layout(std430, binding = 2) readonly buffer ShCache { vec4 sh_cache[]; };
+layout(std430, binding = 3) readonly buffer CellSC { uvec2 cell_sc[]; };
+layout(std430, binding = 4) readonly buffer PackedIdx { uint packed_idx[]; };
+// Cluster aggregates, used only by the out-of-cascade fallback below.
+layout(std430, binding = 5) readonly buffer ClusterRad { vec4 cluster_rad[]; };
+
+layout(rgba16f, binding = 0) writeonly uniform image2D u_indirect;
+
+uniform ivec2 u_half_size;
+uniform ivec2 u_full_size;
+uniform mat4  u_inv_view_proj;
+uniform vec3  u_origin;          // cascade 0
+uniform float u_inv_cell;
+uniform uint  u_cnt_off;
+// Every cascade, for the fallback: a pixel farther from the camera than
+// cascade 0's 64-cell reach still has to get an answer.
+uniform int   u_cascades;
+uniform vec3  u_origins[3];
+uniform float u_inv_cells[3];
+uniform uint  u_cnt_offs[3];
+uniform vec3  u_sky;
+uniform int   u_search_radius;   // extra cell rings beyond the 2x2x2 block
+uniform float u_reach;           // surfel reach, in units of its own radius
+
+// Bound the SCAN, never the number of taps accepted.
+//
+// Capping accepted taps looks like a budget and behaves like a tiling artefact:
+// every pixel inside a cascade-0 cell walks the same cell in the same order, so
+// they all keep the same first N members and land on the same value, and the
+// answer changes in one step at the cell boundary. That painted the walls in
+// flat rectangles the size of a C0 cell. The weights already fall off with
+// distance, so accepting everything that passes is both cheaper to reason about
+// and continuous; only the number of candidates INSPECTED needs a ceiling.
+// Ceiling on candidates inspected, so a pathologically dense cell (a crease
+// where several walls' surfels pile into one cell) cannot stall the wavefront.
+const uint kMaxScan = 256u;
+
+// Accumulator for the weighted SH blend, passed through scan_cell().
+struct Gather {
+    vec3  acc[4];
+    float wsum;
+    uint  taps;
+    uint  scanned;
+    uint  best_src;      // nearest front-facing surfel, weight test aside
+    float best_d2;
+};
+
+uint hash_u32(uint x) {
+    x ^= x >> 16; x *= 0x7feb352du;
+    x ^= x >> 15; x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+// Scanned IN ORDER, from the start of the cell.
+//
+// A per-pixel random start would sample the cell without bias, and it does look
+// marginally smoother -- but it also makes neighbouring threads read unrelated
+// addresses, and the uncoalesced gather cost 5.8 ms against 2.4 ms for the
+// sequential walk. With the tap cap gone the sequential scan is already smooth
+// enough that the difference does not pay for itself.
+void scan_cell(ivec3 c, vec3 P, vec3 N, uint seed, inout Gather G) {
+    if (!clip_inside(c)) return;
+    uvec2 sc = cell_sc[u_cnt_off + uint(clip_cell_index(c))];
+    if (sc.y == 0u) return;
+
+    for (uint k = 0u; k < sc.y && G.scanned < kMaxScan; ++k) {
+        ++G.scanned;
+        uint s = packed_idx[sc.x + k];
+        vec4 pr = live_pn[2u * s];
+        vec3 ns = live_pn[2u * s + 1u].xyz;
+
+        float nd = dot(N, ns);
+        if (nd <= 0.0) continue;
+
+        vec3 d = pr.xyz - P;
+        float r = max(pr.w * u_reach, 1e-6);
+        float d2 = dot(d, d);
+        if (d2 < G.best_d2) { G.best_d2 = d2; G.best_src = live_src[s]; }
+        if (d2 > r * r) continue;
+
+        float dist = sqrt(d2);
+        float plane = abs(dot(d, N));
+        float w = nd * clamp(1.0 - plane / r, 0.0, 1.0)
+                     * clamp(1.0 - dist / r, 0.0, 1.0);
+        if (w <= 1e-4) continue;
+
+        uint src = live_src[s];
+        G.acc[0] += sh_cache[src * SH_STRIDE + 0u].xyz * w;
+        G.acc[1] += sh_cache[src * SH_STRIDE + 1u].xyz * w;
+        G.acc[2] += sh_cache[src * SH_STRIDE + 2u].xyz * w;
+        G.acc[3] += sh_cache[src * SH_STRIDE + 3u].xyz * w;
+        G.wsum += w;
+        ++G.taps;
+    }
+}
+
+SH1 sh_from(vec3 c0, vec3 c1, vec3 c2, vec3 c3) {
+    SH1 sh;
+    sh.c[0] = c0; sh.c[1] = c1; sh.c[2] = c2; sh.c[3] = c3;
+    return sh;
+}
+
+void main() {
+    ivec2 hp = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(hp, u_half_size))) return;
+
+    // Sample the full-res G-buffer at the centre of this half-res quad.
+    ivec2 fp = min(hp * 2 + 1, u_full_size - 1);
+    float depth = texelFetch(u_gbuf_depth, fp, 0).r;
+    vec4 nr = texelFetch(u_gbuf_normal, fp, 0);
+
+    if (depth >= 1.0) {   // sky
+        imageStore(u_indirect, hp, vec4(u_sky, 1.0));
+        return;
+    }
+
+    vec2 uv = (vec2(fp) + 0.5) / vec2(u_full_size);
+    vec3 P = world_from_depth(depth, uv, u_inv_view_proj);
+    vec3 N = normalize(nr.xyz);
+
+    Gather G;
+    G.acc[0] = vec3(0.0); G.acc[1] = vec3(0.0);
+    G.acc[2] = vec3(0.0); G.acc[3] = vec3(0.0);
+    G.wsum = 0.0; G.taps = 0u; G.scanned = 0u;
+    G.best_src = 0xFFFFFFFFu; G.best_d2 = 1e30;
+
+    // A surfel's reach is a couple of its own radii, and S0 picks the LOD so a
+    // radius stays well under a cascade-0 cell. The 2x2x2 block of cells around
+    // P therefore holds every surfel that can cover it: the block reaches half a
+    // cell on every axis, several times the largest reach. The home cell goes
+    // first so the taps budget is spent on the nearest surfels.
+    //
+    // The earlier version walked a (2R+1)^3 ring and SUBSAMPLED each cell with a
+    // stride -- testing 8 arbitrary members of an ~80-surfel cell, almost none of
+    // them near P. That is what left most of the screen uncovered.
+    vec3  g    = (P - u_origin) * u_inv_cell;
+    ivec3 home = ivec3(floor(g));
+    ivec3 blk  = ivec3(floor(g - 0.5));
+
+    uint seed = hash_u32(uint(hp.x) * 73856093u ^ uint(hp.y) * 19349663u);
+    scan_cell(home, P, N, seed, G);
+
+    int R = u_search_radius;
+    for (int dz = -R; dz <= R + 1 && G.scanned < kMaxScan; ++dz)
+    for (int dy = -R; dy <= R + 1 && G.scanned < kMaxScan; ++dy)
+    for (int dx = -R; dx <= R + 1 && G.scanned < kMaxScan; ++dx) {
+        ivec3 c = blk + ivec3(dx, dy, dz);
+        if (c == home) continue;
+        scan_cell(c, P, N, seed, G);
+    }
+
+    vec3 indirect;
+    if (G.wsum > 1e-4) {
+        float inv = 1.0 / G.wsum;
+        indirect = sh_eval_irradiance(
+            sh_from(G.acc[0] * inv, G.acc[1] * inv, G.acc[2] * inv, G.acc[3] * inv), N);
+    } else if (G.best_src != 0xFFFFFFFFu) {
+        uint b = G.best_src;
+        indirect = sh_eval_irradiance(
+            sh_from(sh_cache[b * SH_STRIDE + 0u].xyz, sh_cache[b * SH_STRIDE + 1u].xyz,
+                    sh_cache[b * SH_STRIDE + 2u].xyz, sh_cache[b * SH_STRIDE + 3u].xyz), N);
+    } else {
+        // Nothing in the neighbourhood at all. Cascade 0 is camera-centred and
+        // only 64 cells wide, so anything past that reach -- the far end of a
+        // room seen from the doorway -- has no per-surfel answer here at all.
+        // Going to the sky would paint those pixels flat black indoors, which
+        // is how the Cornell back wall used to read. Fall back to the enclosing
+        // cluster of the finest cascade that does contain P: it is the
+        // area-weighted outgoing radiance of exactly the surfaces there, so it
+        // is a coarse but unbiased stand-in for the irradiance.
+        indirect = u_sky;
+        for (int l = 1; l < u_cascades; ++l) {
+            ivec3 c = clip_cell_coord(P, u_origins[l], u_inv_cells[l]);
+            if (!clip_inside(c)) continue;
+            uint ci = u_cnt_offs[l] + uint(clip_cell_index(c));
+            vec4 crad = cluster_rad[ci];
+            if (crad.w <= 0.0) continue;
+            indirect = crad.rgb;
+            break;
+        }
+    }
+
+    imageStore(u_indirect, hp, vec4(indirect, G.wsum > 1e-4 ? 1.0 : 0.0));
+}

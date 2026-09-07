@@ -1,0 +1,47 @@
+#version 460 core
+layout(local_size_x = 256) in;
+
+// Pass 0 -- rebuild outgoing radiance for every surfel, once per sweep.
+//
+// Without this, each of the ~9e8 inner iterations of a sweep would decode an
+// RGB9E5 emission, an RGB8 albedo and an fp32 irradiance and divide by PI. The
+// precompute costs N operations and leaves the hot record as 16 bytes of fp32 --
+// and it puts the /PI in one place. See common/brdf.glsl.
+
+#include "surfel.glsl"
+#include "brdf.glsl"
+
+layout(std430, binding = 5)  readonly  buffer IrradSrc { vec4 irrad_src[]; };
+layout(std430, binding = 6)  writeonly buffer Lout     { vec4 lout[]; };
+layout(std430, binding = 20) readonly  buffer DirectIn { vec4 direct_e[]; };
+
+uniform uint  u_count;
+uniform float u_emissive_scale;
+// NEE partition. When the direct pass handles the proxied emitters, their
+// EMISSION is removed here -- from the single place outgoing radiance is defined,
+// so M1, M2 and every gate see the same partition without one of them being
+// patched separately and drifting. Their bounced light stays (it is not part of
+// the direct term), and their coverage is untouched, so they still occlude.
+uniform uint  u_nee;
+// Where the NEE direct term currently lives. The cache holds residual + direct
+// when the image reads its direct term from the cache, and residual ALONE when
+// the image computes it per pixel -- so this pass has to put it back before
+// forming outgoing radiance. Not optional: the bounce transport is what turns
+// direct light into indirect, and dropping the direct term here would remove the
+// entire first bounce from every subsequent one, which reads as "the GI got
+// dimmer" rather than as a bug.
+uniform uint  u_add_direct;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= u_count) return;
+
+    // irrad_src is the PREVIOUS sweep's result. Reading the destination buffer
+    // here instead would silently turn the Jacobi iteration into Gauss-Seidel:
+    // nondeterministic in workgroup order, and no longer "sweep k == k bounces".
+    const vec3 emission = (u_nee != 0u && surfel_is_emissive(i))
+                        ? vec3(0.0)
+                        : surfel_emission(i) * u_emissive_scale;
+    const vec3 E = irrad_src[i].rgb + (u_add_direct != 0u ? direct_e[i].rgb : vec3(0.0));
+    lout[i] = vec4(sgi_outgoing(emission, surfel_albedo(i), E), 0.0);
+}
