@@ -120,6 +120,7 @@ bool sgi_same_surface(vec3 p_surf, vec3 nP, vec3 C, vec3 n_o, float r_o) {
     return abs(dot(C - p_surf, nP)) < u_self_tol * r_o;
 }
 
+uint g_cells; uint g_cand; uint g_proj;
 SgiMask sgi_trace_mask(vec3 P, vec3 p_surf, vec3 nP, SgiEmitter e, uint self) {
     SgiMask mask = sgi_mask_zero();
 
@@ -160,9 +161,11 @@ SgiMask sgi_trace_mask(vec3 P, vec3 p_surf, vec3 nP, SgiEmitter e, uint self) {
 
             const uint ci = uint(g.x) + uint(u_grid_res.x) *
                             (uint(g.y) + uint(u_grid_res.y) * uint(g.z));
+            g_cells += 1u;
             const uvec2 sc = cell_sc[ci];
             for (uint k = 0u; k < sc.y; ++k) {
                 const uint idx = sc.x + k;
+                g_cand += 1u;
                 const uint j   = cell_item[idx];
                 if (j == self) continue;
                 if (surfel_is_emissive(j)) continue;   // the light is not its own occluder
@@ -175,10 +178,10 @@ SgiMask sgi_trace_mask(vec3 P, vec3 p_surf, vec3 nP, SgiEmitter e, uint self) {
                 // above and clipping here is the pair that separates the two
                 // opposite errors: interior discs must overlap to seal, boundary
                 // discs must not overrun the geometry they represent.
-                sgi_mask_merge(mask,
-                               sgi_raster_ellipse_cut(fp, u_cuts != 0u ? j : 0xFFFFFFFFu,
-                                                      P, pr.xyz, nj,
-                                                      u_thick * pr.w * u_occ, e));
+                g_proj += 1u;
+                sgi_raster_ellipse_cut(mask, fp, u_cuts != 0u ? j : 0xFFFFFFFFu,
+                                       P, pr.xyz, nj,
+                                       u_thick * pr.w * u_occ, e);
             }
         }
         if (sgi_mask_full(mask)) return mask;   // fully shadowed; nothing left to find
@@ -192,6 +195,7 @@ SgiMask sgi_trace_mask(vec3 P, vec3 p_surf, vec3 nP, SgiEmitter e, uint self) {
 void sgi_nee_direct(vec3 p_surf, vec3 nP, float radius, uint self,
                     out vec3 E, out float vis)
 {
+    g_cells = 0u; g_cand = 0u; g_proj = 0u;
     const vec3 p = p_surf + nP * (u_bias * radius);
 
     vec3  sum = vec3(0.0);

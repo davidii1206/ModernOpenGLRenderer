@@ -306,15 +306,19 @@ bool sgi_slab_blocks(float cnum, float dn, float slab_h) {
 // `cut` is the occluder's index, or 0xFFFFFFFF for no clipping. P/C/n_o/slab_h/e
 // reconstruct the ray for each accepted bit; `slab_h` is the spheroid's slab
 // half-thickness, thick * r_effective.
-SgiMask sgi_raster_ellipse_cut(SgiFootprint fp, uint cut, vec3 P, vec3 C, vec3 n_o,
-                               float slab_h, SgiEmitter e) {
-    SgiMask m = sgi_mask_zero();
+// Accumulates INTO the caller's running mask rather than returning its own, so
+// that a bit some earlier occluder already set can be skipped instead of
+// re-derived. OR is idempotent -- setting a set bit is a no-op -- so this is
+// bit-identical to accumulating separately and merging, and it is what makes an
+// umbra cheap: once the mask fills, every later occluder does almost no work.
+void sgi_raster_ellipse_cut(inout SgiMask m, SgiFootprint fp, uint cut,
+                            vec3 P, vec3 C, vec3 n_o, float slab_h, SgiEmitter e) {
 
     // Axis-aligned bound of the ellipse: |a0| + |a1| per component is the
     // support of c + a0 cos t + a1 sin t, componentwise and conservatively.
     const vec2 ext = abs(fp.a0) + abs(fp.a1);
     if (fp.c.x - ext.x >  1.0 || fp.c.x + ext.x < -1.0 ||
-        fp.c.y - ext.y >  1.0 || fp.c.y + ext.y < -1.0) return m;
+        fp.c.y - ext.y >  1.0 || fp.c.y + ext.y < -1.0) return;
 
     const float step = 2.0 / float(kBitsEdge);
     const int lo_i = max(int(floor((fp.c.x - ext.x + 1.0) / step)), 0);
@@ -337,6 +341,8 @@ SgiMask sgi_raster_ellipse_cut(SgiFootprint fp, uint cut, vec3 P, vec3 C, vec3 n
 
     for (int j = lo_j; j <= hi_j; ++j) {
         for (int i = lo_i; i <= hi_i; ++i) {
+            const uint bit = uint(j) * kBitsEdge + uint(i);
+            if (sgi_mask_test(m, bit)) continue;      // already shadowed
             const vec2 uv = sgi_bit_uv(uint(i), uint(j));
             const vec2 q  = uv - fp.c;
             if (ok) {
@@ -381,20 +387,9 @@ SgiMask sgi_raster_ellipse_cut(SgiFootprint fp, uint cut, vec3 P, vec3 C, vec3 n
                 }
                 if (sgi_cut_rejects(cut, q)) continue;
             }
-            sgi_mask_set(m, uint(j) * kBitsEdge + uint(i));
+            sgi_mask_set(m, bit);
         }
     }
-    return m;
-}
-
-// The uncut form, for callers with no surfel index to clip against.
-SgiMask sgi_raster_ellipse(SgiFootprint fp) {
-    SgiEmitter dummy;
-    dummy.centre = vec3(0.0); dummy.half_u = vec3(0.0); dummy.half_v = vec3(0.0);
-    // A slab of infinite half-thickness always blocks, so this reduces to the
-    // pure silhouette test the name promises.
-    return sgi_raster_ellipse_cut(fp, 0xFFFFFFFFu, vec3(0.0), vec3(0.0),
-                                  vec3(0.0, 1.0, 0.0), 1e30, dummy);
 }
 
 #endif

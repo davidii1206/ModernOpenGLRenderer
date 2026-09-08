@@ -2083,6 +2083,74 @@ more, because a warp holding one penumbra pixel runs the loop for all its lanes
 anyway. That path was written, measured, and removed.
 
 
+### Finding 39 — what the direct pass actually costs, and why tiling it is the wrong fix
+
+The first plan for making the direct term realtime was to share one occluder
+candidate list across an 8x8 screen tile -- section 4.1's per-cell reuse, in
+screen space, and the pass already dispatches in 8x8 workgroups so the shape was
+free. The measurement said don't.
+
+Going from an 8x8 mask to 16x16 (finding 38) changed exactly one thing: the
+bit-space area of every splat, by 4x. That is a controlled experiment, and
+solving `243 = C + R`, `677 = C + 4R` splits the pass into
+
+    rasterization  ~578 ms        march + projection + everything else  ~98 ms
+
+at 512^2. Sharing candidates across a tile shrinks the 98 and *grows* the 578,
+because a tile's candidate set is a superset of any one pixel's. The rasterizer
+was the target all along.
+
+**What worked: skip bits that are already set.** `OR` is idempotent, so a bit some
+earlier occluder has already set cannot change, and testing it costs one mask
+lookup against a slab test, a cut test and four plane dots. `sgi_raster_ellipse_cut`
+now accumulates into the caller's running mask instead of building its own and
+merging, so it can skip. **677 -> 333 ms, byte-identical output** -- both the
+direct render and the full-GI render, every pixel.
+
+**What did not: an early-out per cell.** The same idea one level up -- bail out of
+the grid march as soon as the mask is full, per cell rather than per macro block
+-- cost **2.3x** (333 -> 756 ms). Eight `bitCount`s in the innermost loop, plus a
+`return` out of a triple-nested loop, is worth more than the march it saves.
+Reverted. Both results are byte-identical to each other, so this is a pure cost
+measurement with no image to weigh against it.
+
+**Where the remaining 333 ms goes**, at 512^2 and 30k surfels:
+
+| configuration | ms |
+|---|---|
+| shipped (`occ` 2.0, cuts on) | 336 |
+| cuts off | 272 |
+| `occ` 1.0 | 228 |
+| `occ` 1.0, cuts off | 217 |
+
+So the cut test is ~19% and the 2.0 occluder inflation ~32%, and neither is a
+dominant term hiding the rest: ~217 ms is the irreducible march-project-slab-set
+core. Cost against surfel count is sublinear -- 10k / 30k / 60k gives 211 / 331 /
+525 ms -- because the grid holds candidates per unit volume roughly constant while
+the discs get smaller, so bits-rasterized is closer to conserved than to linear.
+
+**The verdict, which is the point of the exercise.** 333 ms over 262144 pixels is
+**1.27 us per visibility query**. A 2 ms budget at 1600x900 is about 1.4 ns per
+query. That is three orders of magnitude, against a 2x from the best available
+micro-optimization. Per-pixel NEE, as a per-pixel grid march over disc occluders,
+does not get there by tuning, and no amount of FMM work touches it -- the FMM
+accelerates surfel-to-surfel transport, and this is neither.
+
+What makes the same query affordable per SURFEL is not that it is cheaper. It is
+identical, 1.27 us either way. It is that the surfel cache is temporally
+amortized: 2048 receivers a frame is 2.6 ms, and a pixel cannot be amortized
+because every pixel must be answered every frame. That is the whole difference,
+and it is the argument for putting the direct term back in the cache -- where
+spec section 8's budget assumed it was all along.
+
+The cost of doing so is not energy. Per-surfel direct measures MAE 5.98 against
+per-pixel's 5.85, which is nothing. It is silhouette sharpness: the cache is
+Nyquist-limited to 19-37 px at this camera at 30k surfels (finding 24). Buying
+that back means camera-distance LOD tiers -- section 6.1, step 9 in section 10's
+order -- which stop being a performance tier and become the thing that makes the
+direct term look right. That reordering is the real result here.
+
+
 ## Gate results
 
 `SGI_GATE=all SGI_NOGUI=1 ./40_surfel_fmm` — 30 assertions, all pass.
