@@ -98,7 +98,18 @@ bool sgi_in_frustum(vec3 C, float R, vec3 P, vec3 dir, float d_e, float half_w) 
     const float t = dot(v, dir);
     if (t < -R || t > d_e + R) return false;
     const float dperp = length(v - dir * t);
-    const float rad = half_w * clamp(t / max(d_e, 1e-6), 0.0, 1.0);
+    // The taper is against the emitter's CENTRE, so a rectangle corner nearer
+    // than the centre needs the cone to have opened sooner. A point of the swept
+    // hull off corner X sits at t = s*t_X with radial offset s*dperp(X), so the
+    // shortfall is s*half_w*(1 - t_X/d_e), largest at s = 1, and t_X is never
+    // less than d_e - half_w. A constant half_w^2/d_e covers it.
+    //
+    // Dividing the taper by (d_e - half_w) instead also covers it and is what I
+    // reached for first -- but it degenerates for a receiver close to the light,
+    // where d_e approaches half_w and the cone becomes a cylinder. It measured
+    // 156 ms against 81. A constant does not have that failure mode.
+    const float rad = half_w * clamp(t / max(d_e, 1e-6), 0.0, 1.0)
+                    + half_w * half_w / max(d_e, 1e-6);
     return dperp <= rad + R;
 }
 
@@ -142,14 +153,36 @@ SgiMask sgi_trace_mask(vec3 P, vec3 p_surf, vec3 nP, SgiEmitter e, uint self,
     // cone was silently dropped -- the grid was quietly undoing part of the
     // inflation that finding 29 added to make surfaces seal. Those come back.
     const float r_occ = r_bake * u_occ;
-    const float pad   = u_cell + 1.7320508 * r_occ;
+    // Exactly r_occ, and no more. The cell test below is
+    //     dperp(cell centre) <= rad + crad + pad
+    // and a surfel that the sphere cull will accept has dperp(centre) <= rad +
+    // r_occ, with its cell's centre within crad of that -- so crad + r_occ
+    // covers it and crad is already there. An earlier sqrt(3) here was a
+    // worst-case bound on the wrong quantity (cell-to-cell, not centre-to-cell)
+    // and cost a factor of 1.73 on the cone's radius, which doubled the cells
+    // walked: 4313 per pixel against 2152 before dedup, to find 1238 candidates
+    // of which 48 project.
+    const float pad   = r_occ;
     SgiMask mask = sgi_mask_zero();
 
     const vec3  to_e = e.centre - P;
     const float d_e  = length(to_e);
     if (d_e < 1e-6) return mask;
     const vec3  dir  = to_e / d_e;
-    const float half_w = length(e.half_u) + length(e.half_v);
+    // The cone's far radius is the rectangle's CIRCUMRADIUS, not the sum of its
+    // half-extents. Every point of the rect is centre + a*half_u + b*half_v with
+    // |a|,|b| <= 1, and the two axes are perpendicular, so the furthest is
+    // |half_u + half_v| = sqrt(lu^2 + lv^2). Cornell's panel: 0.302, against
+    // 0.425 for the sum. Still conservative -- a sphere of that radius contains
+    // the rect -- and the cone's far cross-section is the square of it, so the
+    // sum was walking twice the cells it needed at the wide end, which is
+    // exactly where the cone is widest and the ceiling is.
+    //
+    // Both diagonals, because a minimum-area bounding rectangle is meant to have
+    // perpendicular axes but nothing here checks it, and if they are not then
+    // |hu - hv| is the longer one.
+    const float half_w = max(length(e.half_u + e.half_v),
+                             length(e.half_u - e.half_v));
 
     // Bounding box of the frustum, in macro blocks, dilated by the same pad:
     // a cell is now asked whether a surfel CENTRED in it could reach the cone,

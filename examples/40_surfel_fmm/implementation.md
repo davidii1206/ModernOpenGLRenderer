@@ -2231,6 +2231,67 @@ cold -- but its headline number is not: the per-pixel visibility query is about
 quoted as a cost.
 
 
+### Finding 41 — lever 2 was a wash, and the profile says why
+
+**What was tried.** The cone from receiver to emitter had two loose bounds. Its
+far radius was `|half_u| + |half_v| = 0.425` where the rectangle's circumradius is
+`|half_u + half_v| = 0.302`, and the cone's cross-section is the square of that,
+so the wide end -- which lands on the ceiling around the panel, and supplies most
+of the candidates -- was twice the size it needed to be.
+
+Tightening it measured 133.5 -> 63.6 ms and changed 18 pixels. Which meant it was
+not conservative, and chasing that is the whole finding.
+
+**Three attempts, and what each one taught.**
+
+The far cap `t <= d_e + R` clips a rectangle corner that leans away from the
+receiver, since the emitter's bounding sphere reaches `t = d_e + half_w`.
+Extending it changed nothing: still 18 pixels.
+
+The taper itself is the gap. `rad = half_w * t / d_e` assumes every point of the
+rect sits at `t = d_e`, but a corner nearer than the centre needs the cone to
+have opened to `half_w` by `t_X`, which is as small as `d_e - half_w`. Dividing
+by `d_e - half_w` fixes it and **costs 156 ms against 81** -- because for a
+receiver close to the light `d_e` approaches `half_w` and the cone degenerates
+into a cylinder. Correct and unusable.
+
+The shortfall is `s * half_w * (1 - t_X/d_e)`, largest at `s = 1`, and
+`d_e - t_X <= half_w`, so a constant `half_w^2 / d_e` covers it with no
+degenerate case. That is what shipped.
+
+**And it buys nothing.** 81 ms, against 81 ms before lever 2 started. The tighter
+radius is almost exactly cancelled by the margin it needs and the longer far cap.
+The old bound's slack was doing real work; removing it and paying for correctness
+separately lands in the same place.
+
+What it does buy is that the cull is now provably conservative, where before it
+could drop an occluder near a rectangle corner for an off-axis receiver. 394 of
+262144 direct pixels change, MAE 5.81 either way, GI 12.93 -> 12.94, 30/30 gates.
+A latent gap closed for free, and no speed.
+
+**Where the time actually is.** Instrumented per pixel, after lever 1:
+
+| | per pixel |
+|---|---|
+| macro-block bbox iterations | 945 |
+| macro blocks occupied and in the cone | 251 |
+| **inner cell-loop iterations** | **16064** (251 x 64) |
+| cells that pass the cell cone test | 2683 |
+| owner entries examined | 881 |
+| occluders projected | 48 |
+
+The macro loop is cheap -- 945 bit tests. The cell loop is not: every occupied
+macro block runs its full 4x4x4, so **16064 sphere-vs-cone tests per pixel** to
+find 2683 cells worth reading. Six of every seven are spent on cells that hold
+nothing or lie outside the cone.
+
+The fix is the one the macro level already uses, one level down: a 64-bit cell
+occupancy mask per macro block (one `uvec2`, 32 KB for this grid), so the inner
+loop iterates set bits instead of testing all 64. That replaces ~11000 frustum
+tests per pixel with a bit scan, and it is the next thing to try -- not another
+attempt at tightening the cone, which this finding says is finished.
+
+
 ## Gate results
 
 `SGI_GATE=all SGI_NOGUI=1 ./40_surfel_fmm` — 30 assertions, all pass.
