@@ -167,7 +167,7 @@ void main() {
                         const vec3 dv = p - cell_pr[e].xyz;
                         const float r2 = dot(dv, dv);
                         if (r2 >= bd) continue;
-                        const uint j = cell_item[e];
+                        const uint j = sgi_cell_index(cell_item[e]);
                         const vec3 nj = surfel_normal(j);
                         if (dot(n, nj) <= u_normal_tol) continue;
                         if (abs(dot(dv, nj)) >= u_plane_tol) continue;
@@ -208,7 +208,7 @@ void main() {
                     const float r2 = dot(dv, dv);
                     if (r2 >= r2max && r2 >= best) continue;
 
-                    const uint j  = cell_item[e];
+                    const uint j  = sgi_cell_index(cell_item[e]);
                     const vec3 nj = surfel_normal(j);
 
                     // Both gates are leak conditions -- blending a floor surfel

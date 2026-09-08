@@ -120,8 +120,29 @@ bool sgi_same_surface(vec3 p_surf, vec3 nP, vec3 C, vec3 n_o, float r_o) {
     return abs(dot(C - p_surf, nP)) < u_self_tol * r_o;
 }
 
-uint g_cells; uint g_cand; uint g_proj;
-SgiMask sgi_trace_mask(vec3 P, vec3 p_surf, vec3 nP, SgiEmitter e, uint self) {
+SgiMask sgi_trace_mask(vec3 P, vec3 p_surf, vec3 nP, SgiEmitter e, uint self,
+                       float r_bake) {
+    // Reach of the owner-only walk.
+    //
+    // Fat insertion put surfel S in every cell its sphere touches, and the walk
+    // examined S if ANY of those cells passed the cone test. That is a cull whose
+    // shape is the union of a surfel's cells -- there is no radius that makes a
+    // centre-cell test reproduce it, because a uniform pad both admits surfels
+    // the old cull missed and drops ones it caught. Byte-identical is not on the
+    // table here, and pretending otherwise by tuning the pad made the difference
+    // WORSE, not smaller: 102 pixels at pad = r*u_occ, 375 at pad = h + sqrt(3)r.
+    //
+    // So do the honest thing instead of the equivalent one. Pad the cell tests
+    // enough that no owner cell holding a possible occluder is skipped, then cull
+    // the SURFEL, not its cell, against the cone. That is the test the cell
+    // version was approximating all along, it is tighter, and it is exact.
+    //
+    // It is not the same set as before, in one direction that matters: insertion
+    // only ever knew the bake radius r, so a surfel between r and r*u_occ of the
+    // cone was silently dropped -- the grid was quietly undoing part of the
+    // inflation that finding 29 added to make surfaces seal. Those come back.
+    const float r_occ = r_bake * u_occ;
+    const float pad   = u_cell + 1.7320508 * r_occ;
     SgiMask mask = sgi_mask_zero();
 
     const vec3  to_e = e.centre - P;
@@ -130,10 +151,12 @@ SgiMask sgi_trace_mask(vec3 P, vec3 p_surf, vec3 nP, SgiEmitter e, uint self) {
     const vec3  dir  = to_e / d_e;
     const float half_w = length(e.half_u) + length(e.half_v);
 
-    // Bounding box of the frustum, in macro blocks.
+    // Bounding box of the frustum, in macro blocks, dilated by the same pad:
+    // a cell is now asked whether a surfel CENTRED in it could reach the cone,
+    // not whether the cell itself touches it.
     const vec3 far_c = P + dir * d_e;
-    const vec3 lo = min(P, far_c - vec3(half_w)) - vec3(u_cell);
-    const vec3 hi = max(P, far_c + vec3(half_w)) + vec3(u_cell);
+    const vec3 lo = min(P, far_c - vec3(half_w)) - vec3(pad);
+    const vec3 hi = max(P, far_c + vec3(half_w)) + vec3(pad);
     const ivec3 mlo = clamp(ivec3(floor((lo - u_grid_min) * u_inv_cell)) / 4,
                             ivec3(0), u_macro_res - 1);
     const ivec3 mhi = clamp(ivec3(floor((hi - u_grid_min) * u_inv_cell)) / 4,
@@ -149,7 +172,7 @@ SgiMask sgi_trace_mask(vec3 P, vec3 p_surf, vec3 nP, SgiEmitter e, uint self) {
         const ivec3 m = ivec3(mx, my, mz);
         if (!sgi_macro_occupied(m)) continue;
         const vec3 mc = u_grid_min + (vec3(m) * 4.0 + 2.0) * u_cell;
-        if (!sgi_in_frustum(mc, mrad, P, dir, d_e, half_w)) continue;
+        if (!sgi_in_frustum(mc, mrad + pad, P, dir, d_e, half_w)) continue;
 
         for (int cz = 0; cz < 4; ++cz)
         for (int cy = 0; cy < 4; ++cy)
@@ -157,19 +180,32 @@ SgiMask sgi_trace_mask(vec3 P, vec3 p_surf, vec3 nP, SgiEmitter e, uint self) {
             const ivec3 g = m * 4 + ivec3(cx, cy, cz);
             if (any(greaterThanEqual(g, u_grid_res))) continue;
             const vec3 gc = u_grid_min + (vec3(g) + 0.5) * u_cell;
-            if (!sgi_in_frustum(gc, crad, P, dir, d_e, half_w)) continue;
+            if (!sgi_in_frustum(gc, crad + pad, P, dir, d_e, half_w)) continue;
 
             const uint ci = uint(g.x) + uint(u_grid_res.x) *
                             (uint(g.y) + uint(u_grid_res.y) * uint(g.z));
-            g_cells += 1u;
             const uvec2 sc = cell_sc[ci];
             for (uint k = 0u; k < sc.y; ++k) {
                 const uint idx = sc.x + k;
-                g_cand += 1u;
-                const uint j   = cell_item[idx];
+                const uint raw = cell_item[idx];
+                // One entry per surfel, not one per cell it touches. The other
+                // eleven cost a 4-byte read and nothing else -- no centre fetch,
+                // no normal, no same-surface test, no projection.
+                //
+                // Nothing is lost, because the cell tests above were dilated by
+                // `pad`: a surfel whose centre cell sits just outside the cone,
+                // and which fat insertion would have caught through one of its
+                // other cells, is admitted through its own. The dilation is
+                // conservative, so the set of surfels that actually project is
+                // unchanged and so is the image.
+                if (!sgi_cell_is_owner(raw)) continue;
+                const uint j = sgi_cell_index(raw);
                 if (j == self) continue;
                 if (surfel_is_emissive(j)) continue;   // the light is not its own occluder
                 const vec4 pr = cell_pr[idx];
+                // The exact cull, now that there is exactly one chance to apply
+                // it: does this surfel's own inflated sphere reach the cone?
+                if (!sgi_in_frustum(pr.xyz, pr.w * u_occ, P, dir, d_e, half_w)) continue;
                 const vec3 nj = surfel_normal(j);
                 if (sgi_same_surface(p_surf, nP, pr.xyz, nj, pr.w)) continue;
                 SgiFootprint fp;
@@ -178,7 +214,6 @@ SgiMask sgi_trace_mask(vec3 P, vec3 p_surf, vec3 nP, SgiEmitter e, uint self) {
                 // above and clipping here is the pair that separates the two
                 // opposite errors: interior discs must overlap to seal, boundary
                 // discs must not overrun the geometry they represent.
-                g_proj += 1u;
                 sgi_raster_ellipse_cut(mask, fp, u_cuts != 0u ? j : 0xFFFFFFFFu,
                                        P, pr.xyz, nj,
                                        u_thick * pr.w * u_occ, e);
@@ -195,7 +230,6 @@ SgiMask sgi_trace_mask(vec3 P, vec3 p_surf, vec3 nP, SgiEmitter e, uint self) {
 void sgi_nee_direct(vec3 p_surf, vec3 nP, float radius, uint self,
                     out vec3 E, out float vis)
 {
-    g_cells = 0u; g_cand = 0u; g_proj = 0u;
     const vec3 p = p_surf + nP * (u_bias * radius);
 
     vec3  sum = vec3(0.0);
@@ -209,7 +243,7 @@ void sgi_nee_direct(vec3 p_surf, vec3 nP, float radius, uint self,
         if (dot(to_c, nP) <= 0.0) continue;
         if (dot(-to_c, e.normal) <= 0.0) continue;
 
-        const SgiMask mask = sgi_trace_mask(p, p_surf, nP, e, self);
+        const SgiMask mask = sgi_trace_mask(p, p_surf, nP, e, self, radius);
         const vec3  Le   = vec3(e.rad_r, e.rad_g, e.rad_b);
         const float dA   = e.area / float(kBitsN);
 

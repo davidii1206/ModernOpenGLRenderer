@@ -1,3 +1,4 @@
+#include <cmath>
 #include "window.hpp"
 
 #include <glad/glad.h>
@@ -236,6 +237,35 @@ Window::Window(const WindowDesc& desc) {
     glfwSwapInterval(d->vsync ? 1 : 0);
 
     impl_ = d;
+}
+
+bool Window::set_framebuffer_size(int width, int height) {
+    auto* d = to_data(impl_);
+    if (!d || !d->handle || width <= 0 || height <= 0) return false;
+
+    // The window-to-framebuffer ratio is the compositor's scale, and it is not
+    // reliably queryable across backends -- so measure it and divide it out,
+    // then iterate, because the scale can itself change when the window moves
+    // to a monitor with a different one. Converges in one step in practice.
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        glfwGetFramebufferSize(d->handle, &d->fb_width, &d->fb_height);
+        if (d->fb_width == width && d->fb_height == height) {
+            gl::viewport(0, 0, d->fb_width, d->fb_height);
+            return true;
+        }
+        int ww = 0, wh = 0;
+        glfwGetWindowSize(d->handle, &ww, &wh);
+        if (ww <= 0 || wh <= 0) return false;
+        const double sx = double(d->fb_width) / double(ww);
+        const double sy = double(d->fb_height) / double(wh);
+        if (sx <= 0.0 || sy <= 0.0) return false;
+        glfwSetWindowSize(d->handle, int(std::lround(double(width) / sx)),
+                                     int(std::lround(double(height) / sy)));
+        glfwPollEvents();
+    }
+    glfwGetFramebufferSize(d->handle, &d->fb_width, &d->fb_height);
+    gl::viewport(0, 0, d->fb_width, d->fb_height);
+    return d->fb_width == width && d->fb_height == height;
 }
 
 Window::~Window() {

@@ -95,7 +95,7 @@ void main() {
 
                 for (uint k = 0; k < sc.y; ++k) {
                     const uint e = sc.x + k;
-                    const uint j = cell_item[e];
+                    const uint j = sgi_cell_index(cell_item[e]);
                     if (j == i) continue;
 
                     const vec3  dv = cell_pr[e].xyz - p;

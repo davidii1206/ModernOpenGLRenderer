@@ -2151,6 +2151,86 @@ order -- which stop being a performance tier and become the thing that makes the
 direct term look right. That reordering is the real result here.
 
 
+### Finding 40 — one entry per surfel, not one per cell; and three ways the rig was lying
+
+**The change.** The grid inserts a surfel into every cell its bounding sphere
+touches -- 11.9 cells per surfel here -- because a range query has to find every
+surfel whose disc covers the query point, whichever cell that point is in. The
+NEE shadow march is not a range query. It walks a volume, so it meets the same
+surfel once per cell it occupies and pays a centre fetch, a normal fetch, a
+same-surface test and an ellipse projection every time.
+
+Measured per pixel at 512² before the change: **2152 cells visited, 6480 candidate
+entries iterated, 420 entries projected.** Six thousand candidates against a scene
+of thirty thousand surfels is a fifth of the scene per pixel -- but divided by
+11.9 entries per surfel it is about 545 distinct surfels, each tested a dozen
+times.
+
+So the bake now marks the entry whose cell holds the surfel's centre
+(`kCellOwner`, the top bit of `cell_item`; the bake caps indices at 65535 so the
+bit is free, and an assertion checks that exactly one entry per surfel carries
+it -- none makes a surfel invisible to the march, two counts it twice). The march
+takes that entry and skips the rest for the cost of a 4-byte read.
+
+**It is not byte-identical, and the attempt to make it so is the interesting
+part.** Fat insertion's cull is "does ANY cell of this surfel's span pass the cone
+test" -- a union-of-cells shape. No uniform pad on a centre-cell test reproduces
+it, because a pad both admits surfels the old cull missed and drops ones it
+caught. Tuning the pad made the difference WORSE rather than smaller: 102
+differing pixels at `pad = r*u_occ`, 375 at `pad = h + sqrt(3)r`. That is the
+signature of a different shape, not a wrong size, and it is what said to stop
+tuning.
+
+The honest replacement is to cull the SURFEL rather than its cell: pad the cell
+tests enough that no owner cell holding a possible occluder is skipped, then test
+the surfel's own inflated sphere against the cone. Tighter, exact, and it is the
+test the cell version was approximating.
+
+That change has a real consequence: insertion only ever knew the bake radius `r`,
+so a surfel between `r` and `r * u_occ` of the cone was silently dropped -- **the
+grid was quietly undoing part of the occluder inflation finding 29 added to make
+surfaces seal.** Those come back.
+
+**Result**, 512², warmed:
+
+| | Direct/px | ratio | MAE |
+|---|---|---|---|
+| fat insertion | 133.5 - 135.0 ms | 1.057 | 5.81 |
+| owner entry only | 104.8 - 107.4 ms | 1.057 | 5.81 |
+
+**1.27x**, with every direct band identical to two decimals and every GI band
+within 0.02. 147 direct pixels differ (0.056%), 5591 GI pixels (2.1%) at a
+magnitude of a few units. 30/30 gates.
+
+### The rig was lying in three ways, and all three are fixed
+
+None of these were bugs in the renderer. All three produced numbers that looked
+entirely plausible.
+
+**1. The reference camera was steerable.** `camera_control` ran whatever `SGI_GTCAM`
+said, so a stray mouse movement while the window came up rendered a different
+view and every number taken from that shot was wrong. One measurement in this
+session came out at MAE 14.69 against a true 5.81 and was very nearly believed.
+`SGI_GTCAM != 0` now locks the camera; use `SGI_GTCAM=0` to fly.
+
+**2. The framebuffer was not the size it asked for.** A window created at 512x512
+comes back with a 640x640 framebuffer under a 125% desktop scale. Nothing
+notices: the render is correct, it is simply not the size the reference image is.
+`gllib::Window::set_framebuffer_size` now forces the exact pixel size by
+measuring the compositor's scale and dividing it out, and `SGI_GTCAM` logs an
+error rather than proceeding if it cannot get there.
+
+**3. `SGI_BENCH=8` measures GPU clock ramp, not the shader.** The same
+configuration reports 133 ms at `SGI_BENCH=40` and anywhere from 144 to 248 ms at
+`SGI_BENCH=8`, run to run. **Every absolute millisecond figure in finding 39 was
+taken at `SGI_BENCH=8` and is inflated by roughly 3x.** The ratios that finding
+draws its conclusions from are unaffected -- both sides of each comparison were
+cold -- but its headline number is not: the per-pixel visibility query is about
+**400 ns warmed, not 1.27 us**, and the gap to a 2 ms budget at 1600x900 is about
+**290x, not three orders of magnitude.** Use `SGI_BENCH=40` or higher for anything
+quoted as a cost.
+
+
 ## Gate results
 
 `SGI_GATE=all SGI_NOGUI=1 ./40_surfel_fmm` — 30 assertions, all pass.

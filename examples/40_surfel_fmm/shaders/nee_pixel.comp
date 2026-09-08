@@ -65,7 +65,7 @@ void main() {
     // several discs that overlap any given point.
     sgi_nee_direct(p, n, u_radius, 0xFFFFFFFFu, E, vis);
 
-    if (u_show_light != 0u) { imageStore(u_out, px, vec4(float(g_cells), float(g_cand), float(g_proj), 1.0)); return; }
+    if (u_show_light != 0u) { imageStore(u_out, px, vec4(vec3(vis), 1.0)); return; }
     const vec4 prev = imageLoad(u_out, px);
     imageStore(u_out, px, vec4(prev.rgb + E, prev.a));
 }

@@ -383,6 +383,22 @@ int main() {
 
     // --- Camera --------------------------------------------------------------
 
+    // A reference comparison is only a comparison if the pixel grids match. The
+    // window is created at kGtRes but a scaled desktop hands back a bigger
+    // framebuffer, so ask for the exact size and say so loudly if it is refused
+    // -- silently rendering 640x640 against a 512x512 reference is the kind of
+    // measurement that wastes a day.
+    if (env.gtcam != 0) {
+        const int want_w = env.gtcam == 1 ? kGtRes : 1600;
+        const int want_h = env.gtcam == 1 ? kGtRes : 900;
+        if (!window.set_framebuffer_size(want_w, want_h))
+            gllib::logf(gllib::LogLevel::error,
+                        "SGI_GTCAM wanted a %dx%d framebuffer, got %dx%d -- "
+                        "reference comparisons at this size are meaningless",
+                        want_w, want_h, window.framebuffer_width(),
+                        window.framebuffer_height());
+    }
+
     gfx::Camera cam;
     const float radius = std::max(0.1f, sb.radius());
     cam.perspective(env.gtcam != 0 ? kGtFovY : 45.0f,
@@ -455,7 +471,15 @@ int main() {
             cam.set_aspect(float(fw) / float(fh));
         }
 
-        camera_control(window, cam, dt, !env.nogui && !gui.wants_mouse(), captured);
+        // A scripted measurement must not be steerable. SGI_GTCAM exists to put
+        // the camera exactly where the path-traced references were rendered
+        // from, and camera_control ran anyway -- so a stray mouse movement while
+        // the window came up silently rendered a different view, and every
+        // number taken from that shot was wrong while looking perfectly
+        // plausible. This example has been bitten by measurements that lie more
+        // than by bugs. Use SGI_GTCAM=0 to fly the camera.
+        if (env.gtcam == 0)
+            camera_control(window, cam, dt, !env.nogui && !gui.wants_mouse(), captured);
 
         geometry.poll();
         gather.poll();

@@ -1,3 +1,4 @@
+#include <cassert>
 #include "grid.hpp"
 
 #include <gl/gl.hpp>
@@ -70,17 +71,35 @@ void SurfelGrid::build(const SurfelSet& set, float cell_mul) {
     std::vector<uint32_t>  item(entries_);
     std::vector<glm::vec4> cpr(entries_);
     std::vector<uint32_t>  cursor(nc, 0);
+    // The entry in the surfel's OWN cell carries kCellOwner. A range query wants
+    // every entry -- that is what fat insertion is for -- but a volume query
+    // (the NEE shadow march) walks a region and would otherwise meet the same
+    // surfel once per cell it occupies, ~12 times in this bake, and pay a
+    // projection for each. Marking one lets that query take one.
+    //
+    // Exactly one entry per surfel gets the bit: the centre cell is inside the
+    // span by construction, since floor((c-s)/h) <= floor(c/h) <= floor((c+s)/h)
+    // and both ends are clamped to the same grid.
+    uint32_t owners = 0;
     for (uint32_t i = 0; i < count_; ++i) {
         span(i, lo, hi);
+        const glm::ivec3 own = glm::clamp(
+            glm::ivec3(glm::floor((glm::vec3(pr[i]) - min_) * inv)),
+            glm::ivec3(0), res_ - 1);
         for (int z = lo.z; z <= hi.z; ++z)
             for (int y = lo.y; y <= hi.y; ++y)
                 for (int x = lo.x; x <= hi.x; ++x) {
                     const uint32_t c = index(x, y, z);
                     const uint32_t s = sc[c].x + cursor[c]++;
-                    item[s] = i;
+                    const bool is_own = (x == own.x && y == own.y && z == own.z);
+                    owners += is_own ? 1u : 0u;
+                    item[s] = i | (is_own ? 0x80000000u : 0u);
                     cpr[s]  = pr[i];
                 }
     }
+    // Cheap and load-bearing: a surfel with no owner entry is invisible to the
+    // shadow march, and a surfel with two is counted twice.
+    assert(owners == count_);
 
     // Coarse occupancy: one bit per 4x4x4 block.
     const int kMacro = 4;

@@ -54,6 +54,18 @@ public:
     int height() const;
     int framebuffer_width() const;
     int framebuffer_height() const;
+
+    // Force the FRAMEBUFFER to an exact pixel size, whatever the desktop's
+    // scale factor is doing to the window. Returns false if it could not get
+    // there, in which case the caller should say so rather than quietly
+    // measuring something else.
+    //
+    // A window created at 512x512 comes back with a 640x640 framebuffer under a
+    // 125% desktop scale, and nothing in the GL code notices -- the render is
+    // correct, it is simply not the size the reference image is, and every
+    // number computed from it is wrong while looking entirely plausible. Any
+    // example that compares against a fixed-size reference wants this.
+    bool set_framebuffer_size(int width, int height);
     float time() const;
 
     bool key_down(Key key) const;

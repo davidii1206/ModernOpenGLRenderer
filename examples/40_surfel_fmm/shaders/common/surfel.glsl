@@ -1,6 +1,20 @@
 #ifndef SGI_SURFEL_GLSL
 #define SGI_SURFEL_GLSL
 
+// The grid inserts a surfel into EVERY cell its bounding sphere touches -- 11.9
+// cells per surfel in this bake -- because a range query has to find every
+// surfel whose disc covers the query point, whichever cell that point is in.
+// A shadow march does not: it walks a whole volume, so it meets the same surfel
+// once per cell it occupies and tests it every time. This bit marks the one
+// entry whose cell holds the surfel's CENTRE, so a volume query can take that
+// one and skip the other eleven. Surfel indices are capped at 65535 by the bake,
+// so the top bit is free.
+//
+// Every read of cell_item must mask it off.
+const uint kCellOwner = 0x80000000u;
+uint sgi_cell_index(uint e) { return e & ~kCellOwner; }
+bool sgi_cell_is_owner(uint e) { return (e & kCellOwner) != 0u; }
+
 // ---------------------------------------------------------------------------
 // The SoA surfel set of spec section 1.1. Bindings are global to this example
 // (SurfelSet::bind in surfels.cpp binds all six), not per-pass.
