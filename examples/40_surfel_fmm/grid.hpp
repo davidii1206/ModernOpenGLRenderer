@@ -42,6 +42,7 @@ enum GridBinding : uint32_t {
     kBindCellItem = 9,   // uint[entries]   surfel indices, cell-sorted
     kBindCellPR   = 10,  // vec4[entries]   cell-sorted pos.xyz + radius
     kBindMacro    = 21,  // uint[]          occupancy bit per 4x4x4 macro block
+    kBindMacroCell = 23, // uvec2[blocks]   occupancy bit per CELL within a block
     kBindIrradFilt = 11, // vec4[N]         denoised irradiance, display only
     kBindLightGrad = 18, // vec4[N]         world-space gradient of light_vis, w = fit quality
 };
@@ -90,6 +91,10 @@ private:
     gl::Buffer b_item_{gl::BufferType::shader, gl::BufferUsage::static_draw};
     gl::Buffer b_pr_  {gl::BufferType::shader, gl::BufferUsage::static_draw};
     gl::Buffer b_macro_{gl::BufferType::shader, gl::BufferUsage::static_draw};
+    // 64 bits per macro block, one per cell inside it. The macro bit says "this
+    // block holds something"; these say WHICH of its 64 cells, so a walk can
+    // iterate the occupied ones instead of testing all 64. 8 bytes a block.
+    gl::Buffer b_macro_cell_{gl::BufferType::shader, gl::BufferUsage::static_draw};
 };
 
 } // namespace sgi

@@ -37,6 +37,7 @@ layout(std430, binding = 9)  readonly buffer CellIt   { uint  cell_item[]; };
 layout(std430, binding = 10) readonly buffer CellPR   { vec4  cell_pr[]; };
 layout(std430, binding = 19) readonly buffer Emitters { vec4  emitters[]; };
 layout(std430, binding = 21) readonly buffer Macro    { uint  macro_bits[]; };
+layout(std430, binding = 23) readonly buffer MacroCell{ uvec2 macro_cell[]; };
 
 uniform uint  u_emitters;
 uniform vec3  u_grid_min;
@@ -207,20 +208,31 @@ SgiMask sgi_trace_mask(vec3 P, vec3 p_surf, vec3 nP, SgiEmitter e, uint self,
         const vec3 mc = u_grid_min + (vec3(m) * 4.0 + 2.0) * u_cell;
         if (!sgi_in_frustum(mc, mrad + pad, P, dir, d_e, half_w)) continue;
 
-        for (int cz = 0; cz < 4; ++cz)
-        for (int cy = 0; cy < 4; ++cy)
-        for (int cx = 0; cx < 4; ++cx) {
-            const ivec3 g = m * 4 + ivec3(cx, cy, cz);
-            if (any(greaterThanEqual(g, u_grid_res))) continue;
+        // Only the OCCUPIED cells of this block, straight off its 64-bit mask.
+        // The full 4x4x4 ran a sphere-vs-cone test on every one of the 64,
+        // occupied or not: 16064 tests per pixel to find 2683 cells worth
+        // reading (finding 41). Six of every seven were spent on nothing.
+        const uint mb = uint(m.x) + uint(u_macro_res.x) *
+                        (uint(m.y) + uint(u_macro_res.y) * uint(m.z));
+        uvec2 cbits = macro_cell[mb];
+        while ((cbits.x | cbits.y) != 0u) {
+            uint c;
+            if (cbits.x != 0u) { c = uint(findLSB(cbits.x));       cbits.x &= cbits.x - 1u; }
+            else               { c = 32u + uint(findLSB(cbits.y)); cbits.y &= cbits.y - 1u; }
+            const ivec3 g = m * 4 + ivec3(int(c & 3u), int((c >> 2) & 3u), int(c >> 4));
             const vec3 gc = u_grid_min + (vec3(g) + 0.5) * u_cell;
             if (!sgi_in_frustum(gc, crad + pad, P, dir, d_e, half_w)) continue;
 
             const uint ci = uint(g.x) + uint(u_grid_res.x) *
                             (uint(g.y) + uint(u_grid_res.y) * uint(g.z));
             const uvec2 sc = cell_sc[ci];
-            for (uint k = 0u; k < sc.y; ++k) {
+            // Owners only, and they are the first entries of the cell -- so this
+            // reads 881 of the 11500 entries the cell holds across a march,
+            // contiguously, instead of all of them to test one bit each.
+            const uint n_own = sgi_cell_owners(sc);
+            for (uint k = 0u; k < n_own; ++k) {
                 const uint idx = sc.x + k;
-                const uint raw = cell_item[idx];
+                const uint j = sgi_cell_index(cell_item[idx]);
                 // One entry per surfel, not one per cell it touches. The other
                 // eleven cost a 4-byte read and nothing else -- no centre fetch,
                 // no normal, no same-surface test, no projection.
@@ -231,8 +243,6 @@ SgiMask sgi_trace_mask(vec3 P, vec3 p_surf, vec3 nP, SgiEmitter e, uint self,
                 // other cells, is admitted through its own. The dilation is
                 // conservative, so the set of surfels that actually project is
                 // unchanged and so is the image.
-                if (!sgi_cell_is_owner(raw)) continue;
-                const uint j = sgi_cell_index(raw);
                 if (j == self) continue;
                 if (surfel_is_emissive(j)) continue;   // the light is not its own occluder
                 const vec4 pr = cell_pr[idx];

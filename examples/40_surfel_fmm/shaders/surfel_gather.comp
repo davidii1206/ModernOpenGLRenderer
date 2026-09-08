@@ -162,7 +162,7 @@ void main() {
                     const uint ci = uint(cx) + uint(u_grid_res.x) *
                                     (uint(cy) + uint(u_grid_res.y) * uint(cz));
                     const uvec2 sc = cell_sc[ci];
-                    for (uint k = 0; k < sc.y; ++k) {
+                    for (uint k = 0; k < sgi_cell_count(sc); ++k) {
                         const uint e = sc.x + k;
                         const vec3 dv = p - cell_pr[e].xyz;
                         const float r2 = dot(dv, dv);
@@ -198,7 +198,7 @@ void main() {
                                  (uint(cy) + uint(u_grid_res.y) * uint(cz));
                 const uvec2 sc = cell_sc[ci];
 
-                for (uint k = 0; k < sc.y; ++k) {
+                for (uint k = 0; k < sgi_cell_count(sc); ++k) {
                     const uint  e  = sc.x + k;
                     const vec4  pr = cell_pr[e];
                     const vec3  dv = p - pr.xyz;

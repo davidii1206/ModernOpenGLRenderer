@@ -13,6 +13,13 @@
 // Every read of cell_item must mask it off.
 const uint kCellOwner = 0x80000000u;
 uint sgi_cell_index(uint e) { return e & ~kCellOwner; }
+
+// cell_sc.y carries two counts: the low 16 bits are all the entries in the cell,
+// the high 16 the OWNER entries, which the bake places first. A range query
+// wants the former, a volume query only ever the latter -- and reading eleven
+// entries to find one owner is most of what a volume query costs.
+uint sgi_cell_count(uvec2 sc)  { return sc.y & 0xFFFFu; }
+uint sgi_cell_owners(uvec2 sc) { return sc.y >> 16u; }
 bool sgi_cell_is_owner(uint e) { return (e & kCellOwner) != 0u; }
 
 // ---------------------------------------------------------------------------

@@ -93,7 +93,7 @@ void main() {
                                  (uint(cy) + uint(u_grid_res.y) * uint(cz));
                 const uvec2 sc = cell_sc[ci];
 
-                for (uint k = 0; k < sc.y; ++k) {
+                for (uint k = 0; k < sgi_cell_count(sc); ++k) {
                     const uint e = sc.x + k;
                     const uint j = sgi_cell_index(cell_item[e]);
                     if (j == i) continue;

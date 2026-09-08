@@ -2292,6 +2292,52 @@ tests per pixel with a bit scan, and it is the next thing to try -- not another
 attempt at tightening the cone, which this finding says is finished.
 
 
+### Finding 42 — the march was bound by reads, not by tests
+
+Finding 41's profile said the cone march ran 16064 sphere-vs-cone tests per pixel
+to find 2683 cells worth reading, and pointed at a cell-occupancy mask as the
+fix. It was right about the fix and wrong about why it would pay.
+
+**A 64-bit cell mask per macro block.** The macro level already stores one bit
+per 4x4x4 block; this adds one bit per CELL inside it, a `uvec2` per block, 32 KB
+for this grid. The inner loop iterates set bits with `findLSB` instead of running
+the full 4x4x4. That is ~11000 fewer frustum tests per pixel and it bought
+**80.6 -> 71.2 ms**, byte-identical. Twelve percent, for cutting two thirds of
+the arithmetic the profile was counting -- which is how you find out the
+arithmetic was not the constraint.
+
+**Owners first.** The real cost was in the entry loop. Each visited cell holds
+~4.3 entries and the march read every one of them to test a single bit, about
+11500 four-byte reads per pixel to find 881 owners. So the bake now places a
+cell's owner entries FIRST and packs the count of them into the high half of
+`cell_sc.y` -- free, since the low half tops out at 9 here and the whole `uvec2`
+is read anyway. The march loops to that count and touches nothing else.
+
+**71.2 -> 52.3 ms.** Direct output byte-identical; the GI render differs by four
+pixels at a magnitude of one, because reordering entries within a cell reorders a
+float sum in the gather.
+
+**Cumulative, 512^2, warmed, against the pre-optimization march:**
+
+| | Direct/px | |
+|---|---|---|
+| fat insertion, all entries, full 4x4x4 | 133.5 ms | |
+| owner dedup + exact sphere cull (finding 40) | 105 ms | |
+| ...with the pad fixed to r_occ | 81.2 ms | byte-identical |
+| ...+ conservative cone (finding 41) | 80.6 ms | 394 px, a correctness fix |
+| ...+ per-block cell mask | 71.2 ms | byte-identical |
+| ...+ owner entries contiguous | **52.3 ms** | 4 px in GI |
+
+**2.55x**, MAE 5.81 direct and 12.94 full GI throughout, 30/30 gates. The frame is
+now Direct/px 53.1, reconstruct 1.9, everything else 0.05.
+
+**The lesson, twice in two findings.** Finding 41 counted tests and predicted a
+win from removing them; the win was 12%. This finding counted reads and got 27%
+from removing them. Both numbers came off the same instrument in the same pass.
+An operation count is not a cost model, and on this hardware the difference
+between the two is most of the answer.
+
+
 ## Gate results
 
 `SGI_GATE=all SGI_NOGUI=1 ./40_surfel_fmm` — 30 assertions, all pass.

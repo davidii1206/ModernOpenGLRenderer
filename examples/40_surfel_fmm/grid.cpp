@@ -61,6 +61,9 @@ void SurfelGrid::build(const SurfelSet& set, float cell_mul) {
     occupied_ = 0;
     max_per_cell_ = 0;
     for (uint32_t c = 0; c < nc; ++c) {
+        // The owner count rides in the high half, so a cell may hold at most
+        // 65535 entries. This bake tops out at 9.
+        assert(count[c] < 65536u);
         sc[c] = glm::uvec2(running, count[c]);
         if (count[c] != 0) ++occupied_;
         max_per_cell_ = std::max(max_per_cell_, count[c]);
@@ -80,22 +83,30 @@ void SurfelGrid::build(const SurfelSet& set, float cell_mul) {
     // Exactly one entry per surfel gets the bit: the centre cell is inside the
     // span by construction, since floor((c-s)/h) <= floor(c/h) <= floor((c+s)/h)
     // and both ends are clamped to the same grid.
+    // Two sweeps, owners first, so a cell's owner entries are CONTIGUOUS at its
+    // start and the count of them fits in the high half of sc.y. The volume
+    // query then reads only those: it was walking every entry of every cell it
+    // visited to test one bit, about 11500 four-byte reads per pixel to find 881
+    // owners, and reads are what this pass is bound by.
     uint32_t owners = 0;
-    for (uint32_t i = 0; i < count_; ++i) {
-        span(i, lo, hi);
-        const glm::ivec3 own = glm::clamp(
-            glm::ivec3(glm::floor((glm::vec3(pr[i]) - min_) * inv)),
-            glm::ivec3(0), res_ - 1);
-        for (int z = lo.z; z <= hi.z; ++z)
-            for (int y = lo.y; y <= hi.y; ++y)
-                for (int x = lo.x; x <= hi.x; ++x) {
-                    const uint32_t c = index(x, y, z);
-                    const uint32_t s = sc[c].x + cursor[c]++;
-                    const bool is_own = (x == own.x && y == own.y && z == own.z);
-                    owners += is_own ? 1u : 0u;
-                    item[s] = i | (is_own ? 0x80000000u : 0u);
-                    cpr[s]  = pr[i];
-                }
+    for (int sweep = 0; sweep < 2; ++sweep) {
+        for (uint32_t i = 0; i < count_; ++i) {
+            span(i, lo, hi);
+            const glm::ivec3 own = glm::clamp(
+                glm::ivec3(glm::floor((glm::vec3(pr[i]) - min_) * inv)),
+                glm::ivec3(0), res_ - 1);
+            for (int z = lo.z; z <= hi.z; ++z)
+                for (int y = lo.y; y <= hi.y; ++y)
+                    for (int x = lo.x; x <= hi.x; ++x) {
+                        const bool is_own = (x == own.x && y == own.y && z == own.z);
+                        if (is_own != (sweep == 0)) continue;
+                        const uint32_t c = index(x, y, z);
+                        const uint32_t s = sc[c].x + cursor[c]++;
+                        if (is_own) { ++owners; sc[c].y += 1u << 16; }
+                        item[s] = i | (is_own ? 0x80000000u : 0u);
+                        cpr[s]  = pr[i];
+                    }
+        }
     }
     // Cheap and load-bearing: a surfel with no owner entry is invisible to the
     // shadow march, and a surfel with two is counted twice.
@@ -107,6 +118,12 @@ void SurfelGrid::build(const SurfelSet& set, float cell_mul) {
     const uint32_t nmb = uint32_t(macro_res_.x) * uint32_t(macro_res_.y) *
                          uint32_t(macro_res_.z);
     std::vector<uint32_t> macro((nmb + 31u) / 32u, 0u);
+    // ...and one bit per CELL inside each block, so a walk that has accepted a
+    // block can iterate its occupied cells rather than testing all 64. The cone
+    // march was running the full 4x4x4 for every block it accepted -- 16064
+    // sphere-vs-cone tests per pixel to find 2683 cells worth reading (finding
+    // 41). Bit c of block mb is cell (mb*4 + (c&3, (c>>2)&3, c>>4)).
+    std::vector<glm::uvec2> macro_cell(nmb, glm::uvec2(0u));
     macro_occupied_ = 0;
     for (int z = 0; z < res_.z; ++z)
         for (int y = 0; y < res_.y; ++y)
@@ -118,8 +135,14 @@ void SurfelGrid::build(const SurfelSet& set, float cell_mul) {
                                      uint32_t(macro_res_.y) * uint32_t(z / kMacro));
                 if ((macro[mb >> 5] & (1u << (mb & 31u))) == 0u) ++macro_occupied_;
                 macro[mb >> 5] |= 1u << (mb & 31u);
+                const uint32_t c = uint32_t(x % kMacro) +
+                                   4u * uint32_t(y % kMacro) +
+                                   16u * uint32_t(z % kMacro);
+                if (c < 32u) macro_cell[mb].x |= 1u << c;
+                else         macro_cell[mb].y |= 1u << (c - 32u);
             }
     b_macro_.data(macro.data(), macro.size() * sizeof(uint32_t));
+    b_macro_cell_.data(macro_cell.data(), macro_cell.size() * sizeof(glm::uvec2));
 
     b_sc_.data(sc.data(), sc.size() * sizeof(glm::uvec2));
     b_item_.data(item.data(), item.size() * sizeof(uint32_t));
@@ -142,6 +165,7 @@ void SurfelGrid::bind() const {
     b_item_.bind_base(kBindCellItem);
     b_pr_.bind_base(kBindCellPR);
     b_macro_.bind_base(kBindMacro);
+    b_macro_cell_.bind_base(kBindMacroCell);
 }
 
 std::size_t SurfelGrid::bytes() const {
