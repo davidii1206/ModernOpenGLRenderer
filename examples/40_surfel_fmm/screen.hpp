@@ -102,9 +102,14 @@ public:
                 float grad_scale, bool show_light, int mls, bool debug_fallback,
                 gl::Buffer* irrad = nullptr);
     const gl::Texture& target() const { return accum_; }
+    // [min, max] of light_vis over the surfels that fed each pixel. The direct
+    // pass uses it to decide whether the march can be skipped; it cannot ride in
+    // accum_.a, which display.frag divides by.
+    const gl::Texture& bracket() const { return bracket_; }
 private:
     Pipeline prog_;
     gl::Texture accum_{gl::TextureType::tex_2d};
+    gl::Texture bracket_{gl::TextureType::tex_2d};
     int width_ = 0, height_ = 0;
 };
 
@@ -127,7 +132,8 @@ public:
     void render(const GBuffer& gb, SurfelSet& set, const SurfelGrid& grid,
                 const EmitterSet& emitters, const CutSet& cuts,
                 const gfx::Camera& cam,
-                const gl::Texture& target, int width, int height,
+                const gl::Texture& target, const gl::Texture& bracket,
+                int width, int height,
                 const SolveConfig& cfg, bool show_light);
 private:
     Pipeline prog_;

@@ -232,6 +232,14 @@ void SurfelGatherPass::resize(int w, int h) {
     t.parameter(GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     t.parameter(GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     accum_ = std::move(t);
+
+    gl::Texture b(gl::TextureType::tex_2d);
+    b.image_2d(0, GL_RG16F, w, h, GL_RG, GL_FLOAT, nullptr);
+    b.parameter(GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    b.parameter(GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    b.parameter(GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    b.parameter(GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    bracket_ = std::move(b);
 }
 
 void SurfelGatherPass::render(const GBuffer& gb, SurfelSet& set, const SurfelGrid& grid,
@@ -247,6 +255,7 @@ void SurfelGatherPass::render(const GBuffer& gb, SurfelSet& set, const SurfelGri
     gb.normal.bind(1);
     gb.depth.bind(3);
     accum_.bind_image(0, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA32F);
+    bracket_.bind_image(2, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RG16F);
 
     const glm::mat4 vp = cam.view_projection();
     prog_.use();
@@ -277,7 +286,8 @@ bool DirectPixelPass::init() {
 void DirectPixelPass::render(const GBuffer& gb, SurfelSet& set, const SurfelGrid& grid,
                              const EmitterSet& emitters, const CutSet& cuts,
                              const gfx::Camera& cam,
-                             const gl::Texture& target, int width, int height,
+                             const gl::Texture& target, const gl::Texture& bracket,
+                             int width, int height,
                              const SolveConfig& cfg, bool show_light) {
     if (!prog_.valid() || set.count() == 0 || !grid.valid() || emitters.count() == 0) return;
 
@@ -290,6 +300,7 @@ void DirectPixelPass::render(const GBuffer& gb, SurfelSet& set, const SurfelGrid
     // READ_WRITE, not WRITE_ONLY: the pass composites onto what the
     // reconstruction left behind.
     target.bind_image(0, 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA32F);
+    bracket.bind_image(2, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RG16F);
 
     prog_.use();
     prog_.set("u_inv_view_proj", glm::inverse(cam.view_projection()));
@@ -308,6 +319,7 @@ void DirectPixelPass::render(const GBuffer& gb, SurfelSet& set, const SurfelGrid
     prog_.set("u_self_tol", cfg.nee_self_tol);
     prog_.set("u_radius", set.radius());
     prog_.set("u_show_light", show_light ? 1u : 0u);
+    prog_.set("u_skip", cfg.nee_skip);
 
     gl::dispatch_compute(uint32_t((width + 7) / 8), uint32_t((height + 7) / 8), 1);
     glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);

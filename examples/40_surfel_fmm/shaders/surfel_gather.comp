@@ -42,6 +42,7 @@ layout(std430, binding = 17) readonly buffer LightMax { uint  light_max[]; };
 layout(std430, binding = 18) readonly buffer LightGrd { vec4  light_grad[]; };
 
 layout(binding = 0, rgba32f) uniform writeonly image2D u_out;
+layout(binding = 2, rg16f)  uniform writeonly image2D u_bracket;
 
 layout(binding = 1) uniform sampler2D u_gnormal;
 layout(binding = 3) uniform sampler2D u_gdepth;
@@ -115,7 +116,11 @@ void main() {
 
     const vec2  uv = (vec2(px) + 0.5) / vec2(u_viewport);
     const float d  = texelFetch(u_gdepth, px, 0).r;
-    if (d >= 1.0) { imageStore(u_out, px, vec4(0.0)); return; }
+    if (d >= 1.0) {
+        imageStore(u_out, px, vec4(0.0));
+        imageStore(u_bracket, px, vec4(0.0, 1.0, 0.0, 0.0));   // "no idea": march it
+        return;
+    }
 
     const vec3 n = normalize(texelFetch(u_gnormal, px, 0).xyz);
     const vec3 p = world_from_depth(d, uv, u_inv_view_proj);
@@ -125,6 +130,13 @@ void main() {
 
     vec3  acc  = vec3(0.0);
     float lacc = 0.0;
+    // Bracket of the RAW light_vis over every surfel that contributes to this
+    // pixel. Not the mean: the direct pass needs to know whether the neighbours
+    // AGREE, and a mean of 0 and 1 looks exactly like a half-lit surfel.
+    // Unnormalized on purpose -- lnorm is 1/max over the set, so if nothing in
+    // the scene is fully lit it scales a partly-lit surfel up to 1.0 and the
+    // agreement test would read a shadow as open sky.
+    float vmin = 1.0, vmax = 0.0;
     float wsum = 0.0;
     // Degree-1 moments. Offsets are expressed in the pixel's tangent frame and
     // normalized by the radius so the matrix stays O(1) and the determinant test
@@ -246,6 +258,8 @@ void main() {
                     const vec3 Ej = irrad[j].rgb;
                     acc  += Ej * w;
                     lacc += light_vis[j] * w;
+                    vmin = min(vmin, light_vis[j]);
+                    vmax = max(vmax, light_vis[j]);
                     wsum += w;
 
                     if (u_mls != 0u) {
@@ -294,5 +308,17 @@ void main() {
         imageStore(u_out, px, vec4(vec3(v), 1.0));
         return;
     }
+    // A pixel with no contributing surfel gets [0, 1] -- "no idea" -- which the
+    // direct pass reads as "march it", the only safe default.
+    //
+    // So does every pixel when light_vis has never been written. The cache is
+    // only populated once the solve has run, and a paused or unstarted solve
+    // leaves it all zeros -- which reads as "every neighbour agrees the light is
+    // blocked" and renders a black room with a lit panel in it. The running
+    // maximum is the signal that anything is in there at all.
+    const bool have_vis = uintBitsToFloat(light_max[0]) > 1e-6;
+    imageStore(u_bracket, px,
+               vec4((have_vis && wsum > 1e-8) ? vec2(vmin, vmax) : vec2(0.0, 1.0),
+                    0.0, 0.0));
     imageStore(u_out, px, vec4(E, u_debug != 0u ? fbk : 1.0));
 }

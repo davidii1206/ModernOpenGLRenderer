@@ -2338,6 +2338,86 @@ An operation count is not a cost model, and on this hardware the difference
 between the two is most of the answer.
 
 
+### Finding 43 — ask the cache before marching the grid
+
+The per-pixel march answers the same question for every pixel, and finding 39
+measured that 87% of them have a locally flat visibility field: no occluder edge
+crosses them, so the answer is "wholly lit" or "wholly dark" and the march is
+being run to rediscover it.
+
+The classification is already in the cache. `light_vis` is written per surfel by
+the per-surfel NEE pass -- an energy-weighted fraction, noise-free by
+construction -- and the gather already interpolates it. What the gather did not
+publish is whether the neighbours AGREE, which is the only part that matters: a
+mean of 0 and 1 looks exactly like a half-lit surfel.
+
+So the gather now writes the **bracket** `[min, max]` of raw `light_vis` over
+every surfel that fed the pixel, into its own RG16F target. Where `min` is 1 the
+emitter is unoccluded and its irradiance has a closed form -- Lambert's contour
+integral over the rectangle, four `acos` against a 256-sample quadrature. Where
+`max` is 0 it is zero. Otherwise, march.
+
+Two things it must not do, and both are in the code rather than in this note:
+
+* **Normalize.** `lnorm` is `1/max` over the set, so if nothing in the scene is
+  fully lit it scales a partly-lit surfel up to 1.0 and the agreement test reads
+  a shadow as open sky. The bracket carries raw `light_vis`.
+* **Trust an empty cache.** A paused or unstarted solve leaves `light_vis` all
+  zeros, which reads as "every neighbour agrees the light is blocked" and renders
+  a black room with a lit panel in it. That is exactly what the first run did.
+  The running maximum is the signal that anything has been written at all, and
+  the gather falls back to `[0, 1]` -- "no idea", march it -- without it.
+
+**Measured**, 7 bounces, warmed:
+
+| | Direct/px | GI MAE |
+|---|---|---|
+| 512², march every pixel | 48.7 ms | 12.94 |
+| 512², skip on agreement | **33.5 ms** | 12.93 |
+| 1600x900, march every pixel | 109.2 ms | |
+| 1600x900, skip on agreement | **57.9 ms** | |
+
+**1.45x at 512², 1.88x at 1600x900** -- more at higher resolution, because more of
+the screen is flat. 3755 pixels change (1.43%), and on exactly those pixels the
+error against the reference *falls*, 13.36 to 12.84. The difference map puts them
+all on the ceiling around the panel, which is where `u_occ`'s inflation
+over-occludes; nothing moves at the contact shadows. 30/30 gates.
+
+**What it cannot survive** is an occluder whose entire shadow falls between
+surfels, since then no neighbour disagrees and the pixel is declared lit. The
+gather's radius is the margin -- every surfel within it must agree -- so the
+shadow has to be finer than the cache's spacing across the whole neighbourhood.
+Cornell has nothing like that. A scene with wires or foliage might.
+
+**It is off by default** (`SGI_NEE_SKIP=0`). This example is the reference the
+accelerated stages get asserted against, and its shipped image should be the one
+the gates and the reference comparisons were run against, not a faster one that
+depends on cache state. Turn it on for the realtime path.
+
+**And it has a dynamic-scene hazard that is not yet tested.** The classification
+is only as fresh as the cache, and the cache is amortized over ~15 frames. A
+moving light or a moving occluder makes `light_vis` stale, and a stale bracket
+does not degrade gracefully -- it says "no need to look" about a region whose
+answer has changed. Any dynamic version needs the bracket invalidated wherever
+the solve is, which is the same invalidation the transport needs and should share
+it.
+
+### Where the direct term stands
+
+| | 512² | 1600x900 |
+|---|---|---|
+| start of this optimization pass | 133.5 ms | ~734 ms (extrapolated) |
+| owner dedup, cell mask, owners contiguous | 52.3 ms | 109.2 ms |
+| + cache agreement skip | 33.5 ms | 57.9 ms |
+
+**4.0x at 512²**, and at 1600x900 the per-pixel visibility query is now **40 ns**
+against the ~1.4 ns a 2 ms budget allows -- about **29x**, from ~290x when this
+started. Still not realtime, and the remaining distance is unlikely to come from
+culling: the per-pixel profile no longer has a dominant term. It comes from not
+answering every pixel every frame, which is temporal reuse, which is the same
+argument the cache already makes for the indirect term.
+
+
 ## Gate results
 
 `SGI_GATE=all SGI_NOGUI=1 ./40_surfel_fmm` — 30 assertions, all pass.

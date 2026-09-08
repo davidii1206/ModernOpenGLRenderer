@@ -37,6 +37,7 @@ layout(local_size_x = 8, local_size_y = 8) in;
 #include "gbuffer.glsl"
 
 layout(binding = 0, rgba32f) uniform image2D u_out;
+layout(binding = 2, rg16f)  uniform readonly image2D u_bracket;
 
 layout(binding = 1) uniform sampler2D u_gnormal;
 layout(binding = 3) uniform sampler2D u_gdepth;
@@ -45,6 +46,8 @@ uniform mat4  u_inv_view_proj;
 uniform ivec2 u_viewport;
 uniform float u_radius;       // the set's global surfel radius
 uniform uint  u_show_light;   // 1 = write the visibility scalar instead of adding E
+uniform float u_skip;         // agreement margin for the cache's visibility
+                              // bracket; 0 disables the skip entirely
 
 void main() {
     const ivec2 px = ivec2(gl_GlobalInvocationID.xy);
@@ -57,15 +60,57 @@ void main() {
     const vec3 n  = normalize(texelFetch(u_gnormal, px, 0).xyz);
     const vec3 p  = world_from_depth(d, uv, u_inv_view_proj);
 
+    const vec4 prev = imageLoad(u_out, px);
+
+    // Ask the cache before marching the grid.
+    //
+    // The gather publishes the bracket [min, max] of light_vis over every
+    // surfel that contributed to this pixel. Where those neighbours AGREE the
+    // answer is already known: unanimously lit means the emitter is unoccluded
+    // and its irradiance has a closed form, unanimously dark means zero. Only
+    // where they disagree -- the penumbra, and the silhouettes -- does the
+    // per-pixel march have anything to add, and that is about an eighth of the
+    // screen (finding 39 measured 87% of pixels with a locally flat visibility
+    // field).
+    //
+    // This is the cache doing what it is good at, which is a low-frequency
+    // classification, and the march doing what it is good at, which is the
+    // boundary the cache cannot resolve. What it CANNOT survive is an occluder
+    // whose entire shadow falls between surfels, since then no neighbour
+    // disagrees and the pixel is declared lit. The gather's radius is the
+    // margin: every surfel within it must agree, so the shadow has to be finer
+    // than the cache's spacing across the whole neighbourhood to be missed.
+    //
+    // u_skip = 0 turns it off and restores the unconditional march.
     vec3  E;
     float vis;
+    bool  marched = true;
+    if (u_skip > 0.0 && u_emitters == 1u && u_show_light == 0u) {
+        const vec2 br = imageLoad(u_bracket, px).xy;
+        const SgiEmitter e = sgi_emitter(emitters[0], emitters[1],
+                                         emitters[2], emitters[3]);
+        const vec3 to_c = e.centre - p;
+        float omega_p;
+        if (dot(to_c, n) > 0.0 && dot(-to_c, e.normal) > 0.0 &&
+            sgi_rect_exact(p, n, e, omega_p)) {
+            if (br.x >= 1.0 - u_skip) {                       // all neighbours lit
+                E = vec3(e.rad_r, e.rad_g, e.rad_b) * omega_p;
+                vis = 1.0;
+                marched = false;
+            } else if (br.y <= u_skip) {                      // all neighbours dark
+                E = vec3(0.0);
+                vis = 0.0;
+                marched = false;
+            }
+        }
+    }
+
     // No self index: a pixel is not a surfel. sgi_same_surface() is what keeps
     // the receiver's own surface from shadowing it, and it is a strictly better
     // test than an index compare -- the index only ever excluded ONE of the
     // several discs that overlap any given point.
-    sgi_nee_direct(p, n, u_radius, 0xFFFFFFFFu, E, vis);
+    if (marched) sgi_nee_direct(p, n, u_radius, 0xFFFFFFFFu, E, vis);
 
     if (u_show_light != 0u) { imageStore(u_out, px, vec4(vec3(vis), 1.0)); return; }
-    const vec4 prev = imageLoad(u_out, px);
     imageStore(u_out, px, vec4(prev.rgb + E, prev.a));
 }

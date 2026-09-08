@@ -42,6 +42,8 @@
 //   SGI_METHOD=0|1          M1 analytic (no occlusion) | M2 microbuffer
 //   SGI_NEE=1               split the direct term out of the microbuffer
 //   SGI_NEE_PIXEL=0         evaluate that direct term per pixel, not per surfel
+//   SGI_NEE_SKIP=0          skip the march where the cache's neighbours agree
+//                           the light is wholly visible or wholly blocked
 //   SGI_NEE_OCC=2.0         occluder radius scale, visibility only (finding 29)
 //   SGI_NEE_CUTS=1          clip occluder discs at mesh feature edges
 //   SGI_NEE_THICK=0.25      surfel slab half-thickness, in radii
@@ -130,6 +132,7 @@ struct EnvOpts {
     bool  points = false;        // SGI_POINTS=1
     int   nee = 1;               // SGI_NEE      1 = split direct out of the microbuffer
     int   neepixel = 0;          // SGI_NEE_PIXEL 1 = direct term per pixel, not per surfel
+    float neeskip = 0.0f;        // SGI_NEE_SKIP  cache-agreement margin, 0 = off
     float neethick = 0.25f;      // SGI_NEE_THICK surfel slab half-thickness, in radii
     float neeself = 0.9f;        // SGI_NEE_SELF  same-surface normal agreement
     float neeselftol = 1.0f;     // SGI_NEE_SELF_TOL same-surface plane tolerance, in radii
@@ -192,6 +195,7 @@ EnvOpts read_env() {
     if (const char* v = getenv("SGI_POINTS"))   o.points = atoi(v) != 0;
     if (const char* v = getenv("SGI_NEE"))       o.nee = atoi(v);
     if (const char* v = getenv("SGI_NEE_PIXEL")) o.neepixel = atoi(v);
+    if (const char* v = getenv("SGI_NEE_SKIP")) o.neeskip = float(atof(v));
     if (const char* v = getenv("SGI_NEE_THICK")) o.neethick = float(atof(v));
     if (const char* v = getenv("SGI_NEE_SELF"))  o.neeself = float(atof(v));
     if (const char* v = getenv("SGI_NEE_SELF_TOL")) o.neeselftol = float(atof(v));
@@ -352,6 +356,7 @@ int main() {
     cfg.nee_self_tol = env.neeselftol;
     cfg.nee_bias = env.neebias;
     cfg.nee_occ = env.neeocc;
+    cfg.nee_skip = env.neeskip;
     cfg.nee_cuts = env.neecuts != 0;
     if (env.bias >= 0.0f) cfg.plane_bias = env.bias;
     if (env.soft >= 0.0f) cfg.soft_eps = env.soft;
@@ -533,7 +538,7 @@ int main() {
         if (cfg.nee && cfg.nee_pixel) {
             ScopedPass p(t_direct_px);
             direct_px.render(gbuf, scene, grid, emitters, cuts, cam,
-                             gather.target(),
+                             gather.target(), gather.bracket(),
                              gbuf.width, gbuf.height, cfg, show_light);
         } else {
             t_direct_px.skip();

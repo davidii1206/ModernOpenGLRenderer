@@ -114,6 +114,35 @@ vec2 sgi_bit_uv(uint i, uint j) {
     return (vec2(float(i), float(j)) + 0.5) * (2.0 / float(kBitsEdge)) - 1.0;
 }
 
+// Exact irradiance from a uniform-radiance rectangle, as the PROJECTED solid
+// angle: Lambert's contour integral
+//
+//     Omega_p = 1/2 SUM_edges beta_i * (n . u_i)
+//
+// with beta_i the angle the edge subtends at p and u_i the unit normal of the
+// triangle (p, v_i, v_i+1). E is L * Omega_p. Four acos against the 256-sample
+// quadrature, and exact rather than a Riemann sum -- but it integrates the WHOLE
+// polygon with no way to drop the part below the horizon, so it reports failure
+// when any corner is at or under the tangent plane and the caller falls back.
+bool sgi_rect_exact(vec3 p, vec3 nP, SgiEmitter e, out float omega_p) {
+    omega_p = 0.0;
+    const vec3 a[4] = vec3[4](e.centre - e.half_u - e.half_v - p,
+                              e.centre + e.half_u - e.half_v - p,
+                              e.centre + e.half_u + e.half_v - p,
+                              e.centre - e.half_u + e.half_v - p);
+    float s = 0.0;
+    for (int i = 0; i < 4; ++i) {
+        if (dot(a[i], nP) <= 1e-6) return false;      // corner on or below the horizon
+        const vec3  c  = cross(a[i], a[(i + 1) & 3]);
+        const float lc = length(c);
+        if (lc < 1e-20) return false;
+        s += acos(clamp(dot(normalize(a[i]), normalize(a[(i + 1) & 3])), -1.0, 1.0))
+           * dot(nP, c / lc);
+    }
+    omega_p = abs(0.5 * s);
+    return true;
+}
+
 // An occluder's shadow on the emitter plane: the ellipse
 //
 //     c + a0*cos(t) + a1*sin(t),   t in [0, 2pi)

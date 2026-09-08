@@ -98,6 +98,11 @@ struct SolveConfig {
     // is free to inflate the interior as much as sealing requires.
     bool  nee_cuts = true;
     float nee_bias = 0.05f;       // receiver offset along its normal, in radii
+    // Per-pixel direct only: skip the grid march where every surfel that feeds
+    // the pixel agrees the light is fully visible or fully blocked, and take the
+    // rectangle's closed form instead. The value is the agreement margin; 0 is
+    // off. See nee_pixel.comp.
+    float nee_skip = 0.0f;
 
     bool  running = true;
 };
