@@ -2681,6 +2681,67 @@ comes with its own assertion: bit-identical against step 3, which is now the
 thing that has to hold.
 
 
+### Finding 48 — step 4 has nothing to amortize here, and the reason is measurable
+
+Step 4 is section 10's "pure performance, no image change": one workgroup per
+occupied cell instead of per receiver, so the U-list is gathered once and shared.
+Section 4.1 gives two reasons -- redundant fetch, and lane occupancy at ~10%
+because a cell holds only ~3.4 surfels.
+
+Three variants of that argument, all measured against step 3's 2.36 ms per
+2048-receiver slice at 30k surfels and `SGI_NEAR=1.5`:
+
+| variant | solve | |
+|---|---|---|
+| step 3 (baseline) | 2.36 ms | |
+| enumerate through macro blocks instead of cells | 3.38 ms | worse |
+| 32-thread workgroup (the spec's WAVE) | 3.92 ms | worse |
+| 64-thread workgroup | 3.00 ms | worse |
+| 64 buckets instead of 256 | 2.16 - 2.74 ms | within noise |
+
+The macro-block walk is worse for a reason worth keeping: a 3^3 block span covers
+1728 cell slots where the tight cell span is 343. Block-granular enumeration
+over-covers whenever the query radius is smaller than a block, and at 1.5
+spacings it is.
+
+**Then the diagnostic that explains all of it.** Shrink the near horizon until
+there are essentially no candidates at all:
+
+| horizon | solve |
+|---|---|
+| 0.05 spacings (no candidates) | 2.70 ms |
+| 0.5 | 2.24 ms |
+| 1.5 | 2.36 ms |
+| 3 | 2.50 ms |
+| 6 | 3.19 ms |
+| 0.05, far march off | **1.88 ms** |
+
+At 0.05 spacings the U-list is empty and the pass still costs 2.7 ms. So the
+2.36 ms breaks down as roughly **1.9 ms of fixed per-receiver overhead, 0.5-0.8
+ms of far march, and almost nothing for the candidates themselves.**
+
+Which is why step 4 cannot pay. It amortizes candidate gathering, and candidate
+gathering is about five percent of this pass. The cost is the 256-bucket
+machinery run once per receiver: clearing seven LDS arrays, the winner-plane
+pass, the far DDA, the integrate, and the cross-wave reduction -- all O(buckets)
+and all indifferent to how the candidates arrived.
+
+Cutting the buckets fourfold moves it from 2.36 to 2.16, which is less than the
+run-to-run spread, so the per-bucket loops are not the whole of it either. What
+is left is per-workgroup: 2048 receivers is 2048 workgroup launches with a 16 KB
+LDS footprint each, and at that footprint only a handful are resident per SM.
+
+**So the next lever for the solve is the LDS footprint and the per-receiver fixed
+cost, not the candidate list.** Step 4's own structure is still the right one for
+that -- several receivers per workgroup would amortize the launch, not the gather
+-- but it has to be built for that reason, and sized against LDS residency rather
+than against lane occupancy on a 30-candidate loop.
+
+Recorded as a negative result rather than skipped, because "step 4 is pure
+performance" is the kind of claim that is true of the design the spec was written
+for and not automatically true of this one.
+
+
 ## Gate results
 
 `SGI_GATE=all SGI_NOGUI=1 ./40_surfel_fmm` — 30 assertions, all pass.
