@@ -466,6 +466,21 @@ int main() {
         solver.run_sweeps(scene, cfg, env.solve, 0);
         cfg.running = false;
         gllib::logf(gllib::LogLevel::info, "pre-solved %u sweep(s), holding", env.solve);
+        // What actually landed in the cache. A scripted shot that comes out black
+        // has two very different causes -- an empty cache, or a reconstruction
+        // that cannot find it -- and they look identical from the outside.
+        {
+            const std::vector<glm::vec4> E = scene.read_irradiance();
+            double sum = 0.0; uint32_t nz = 0;
+            for (const glm::vec4& e : E) {
+                const double l = 0.2126 * e.r + 0.7152 * e.g + 0.0722 * e.b;
+                sum += l; nz += l > 1e-6 ? 1u : 0u;
+            }
+            gllib::logf(gllib::LogLevel::info,
+                        "cache: mean irradiance %.5f over %zu surfels, %u nonzero (%.1f%%)",
+                        E.empty() ? 0.0 : sum / double(E.size()), E.size(), nz,
+                        E.empty() ? 0.0 : 100.0 * double(nz) / double(E.size()));
+        }
     }
 
     while (!window.should_close()) {

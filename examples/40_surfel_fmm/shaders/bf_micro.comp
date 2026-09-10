@@ -330,7 +330,21 @@ void main() {
         }
     }
     barrier();
-    const bool ulist = use_ulist && lds_over == 0u;
+    // Overflow policy, and it cannot be one rule.
+    //
+    // Falling back to the all-pairs stride is exact, and that is the right
+    // answer while the set is small enough for the all-pairs key to address it.
+    // Above 65536 it is not an answer at all: the key aliases, and 285594
+    // candidates per receiver over 285594 receivers does not finish. Sponza
+    // overflows every dense cell at SGI_NEAR >= 0.5 -- one of its cells holds
+    // 2605 entries -- and the fallback rendered a completely black cache while
+    // the same scene at 0.2 spacings lit up fine.
+    //
+    // So above that, clamp instead: take the first kMaxCand candidates and drop
+    // the rest. That loses occluders in the densest cells, which is wrong, but
+    // it is bounded and it is visible. The fallback was neither.
+    const bool can_fallback = u_count <= 65536u;
+    const bool ulist = use_ulist && (lds_over == 0u || !can_fallback);
     const uint ncand = ulist ? min(lds_ncand, kMaxCand) : u_count;
 
     // === phase A: resolve the depth winner per bucket =======================
@@ -408,7 +422,14 @@ void main() {
 
     // === the far field, one DDA per bucket ==================================
     for (uint b = tid; b < ms2; b += kWG) {
-        lds_far_L[b] = vec3(0.0);
+        // A bucket whose march finds nothing sees the SKY, and saying so here
+        // is what keeps the far field from swallowing it. The integrate below
+        // took mix(u_sky, L, fill) before finding 46 and the near/far blend
+        // after, and the blend had no sky term -- invisible in Cornell, where
+        // the room is closed and u_sky is zero, and total in Sponza, which has
+        // no emissive surface at all and is lit by nothing else. It rendered
+        // black.
+        lds_far_L[b] = u_sky;
         if (u_far_occ == 0u || u_near <= 0.0) continue;
         const vec3 ld = bucket[b * 2u + 0u].xyz;          // tangent-frame direction
         const vec3 wd = normalize(T * ld.x + B * ld.y + nP * ld.z);
@@ -420,10 +441,10 @@ void main() {
         // own plane's blocks and gains height as it goes, because cosP > 0 for
         // every bucket.
         const int mb = sgi_far_block(posP + nP * u_macro_cell, wd, u_near, 3.4e38);
-        if (mb < 0) continue;
+        if (mb < 0) continue;                    // left the grid: sky
         const uint base = uint(mb) * 4u;
         const float n = float(blk[base + 3u]);
-        if (n < 0.5) continue;
+        if (n < 0.5) continue;                   // block holds nothing: sky
         lds_far_L[b] = vec3(float(blk[base + 0u]), float(blk[base + 1u]),
                             float(blk[base + 2u])) * (1.0 / (kFixed * n));
     }

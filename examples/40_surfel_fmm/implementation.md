@@ -2865,6 +2865,56 @@ Cornell's numbers are unchanged where they should be: direct MAE 5.81, 30/30
 gates.
 
 
+### Finding 51 — Sponza was black for two reasons, and neither was Sponza
+
+Asking whether Sponza should show anything yet turned up two real bugs, both
+invisible in Cornell.
+
+**The far field ate the sky.** Finding 46 replaced `mix(u_sky, L, fill)` with
+section 5's blend, `L * fill + Lfar * (1 - fill)` -- and that has no sky term at
+all. Cornell is a closed room with `u_sky` at zero, so nothing showed. Sponza has
+no emissive surface anywhere and is lit by nothing else, so it rendered a
+completely black cache. A bucket whose march finds nothing sees the sky, and
+`lds_far_L` is initialised to `u_sky` now rather than to zero.
+
+**The U-list overflow fallback does not scale.** On overflow both phases fell back
+to the all-pairs stride, which is exact and was the right call while the set fit
+the all-pairs key. Above 65536 it is not an answer at all: the key aliases, and
+285594 candidates over 285594 receivers does not finish. Sponza overflows every
+dense cell at `SGI_NEAR >= 0.5` -- one of its cells holds 2605 entries -- so the
+cache came out empty:
+
+| `SGI_NEAR` | cache after one sweep |
+|---|---|
+| 0.2 | mean 0.468, 50.0% nonzero |
+| 0.5 | **0, 0% nonzero** |
+| 1.5 | **0, 0% nonzero** |
+
+Above 65536 it now clamps to `kMaxCand` instead, dropping candidates in the
+densest cells. That is wrong, but it is bounded and it is visible; the fallback
+was neither. After both fixes, two sweeps give **mean 0.607 over 285594 surfels,
+100% nonzero.**
+
+**The diagnostic that found it** is worth keeping and is now in `main.cpp`: after
+a scripted pre-solve, log the cache's mean irradiance and its nonzero fraction. A
+black shot has two completely different causes -- an empty cache, or a
+reconstruction that cannot find a full one -- and from the outside they look
+identical. This chased the wrong one for several rounds.
+
+**And Sponza still shows nothing recognisable**, for a third reason that is not a
+bug: the default free camera sits at `centre + (0, 0, 2.2 * radius)`, which for
+Sponza is outside the building looking at its blank exterior wall. The albedo
+view is a flat grey rectangle. A useful Sponza image needs an interior camera and
+real lighting -- section 5.1's sun and sky, which are genuinely not built -- not
+more debugging.
+
+**Also learned:** `SGI_SURFELS` cannot reduce Sponza below 262266, because the
+bake floors at one surfel per triangle and Sponza has that many. Every "30k"
+Sponza run in this session was really 285594.
+
+Cornell is untouched by both fixes -- byte-identical render, 30/30 gates.
+
+
 ## Gate results
 
 `SGI_GATE=all SGI_NOGUI=1 ./40_surfel_fmm` — 30 assertions, all pass.
