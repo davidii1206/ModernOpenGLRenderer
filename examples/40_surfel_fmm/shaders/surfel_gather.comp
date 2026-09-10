@@ -174,7 +174,7 @@ void main() {
                     const uint ci = uint(cx) + uint(u_grid_res.x) *
                                     (uint(cy) + uint(u_grid_res.y) * uint(cz));
                     const uvec2 sc = cell_sc[ci];
-                    for (uint k = 0; k < sgi_cell_count(sc); ++k) {
+                    for (uint k = 0; k < sgi_cell_owners(sc); ++k) {
                         const uint e = sc.x + k;
                         const vec3 dv = p - cell_pr[e].xyz;
                         const float r2 = dot(dv, dv);
@@ -193,9 +193,21 @@ void main() {
         }
     }
 
-    // A 3x3x3 window. Fat insertion means a cell already lists every disc whose
-    // sphere reaches it, so with a cell of about one spacing this covers every
-    // surfel within u_radius as long as u_radius stays under about one cell.
+    // A 3x3x3 window of OWNER entries -- one per surfel, in the cell holding its
+    // centre -- which covers every surfel within u_radius as long as u_radius
+    // stays under about one cell. The pixel sits within half a cell of its own
+    // cell centre and the window reaches 1.5 cells, so a surfel within one cell
+    // of the pixel has its centre inside the window. That is the same
+    // precondition the fat-insertion version had.
+    //
+    // Reading every entry instead was both slower and WRONG. Fat insertion lists
+    // a surfel in each of the ~9.6 cells its sphere touches, and however many of
+    // those fall inside the window, that is how many times it was accumulated --
+    // with the same weight each time. The duplication factor varies per surfel
+    // with how centred it is, so it does not cancel between the numerator and
+    // the denominator: it is a bias toward surfels near the middle of the
+    // window. On Sponza, where one cell holds 1595 entries, it is also most of
+    // the reconstruction's cost.
     for (int dz = -1; dz <= 1; ++dz) {
         const int cz = hc.z + dz;
         if (cz < 0 || cz >= u_grid_res.z) continue;
@@ -210,7 +222,7 @@ void main() {
                                  (uint(cy) + uint(u_grid_res.y) * uint(cz));
                 const uvec2 sc = cell_sc[ci];
 
-                for (uint k = 0; k < sgi_cell_count(sc); ++k) {
+                for (uint k = 0; k < sgi_cell_owners(sc); ++k) {
                     const uint  e  = sc.x + k;
                     const vec4  pr = cell_pr[e];
                     const vec3  dv = p - pr.xyz;

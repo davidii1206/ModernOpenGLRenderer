@@ -93,7 +93,18 @@ void main() {
                                  (uint(cy) + uint(u_grid_res.y) * uint(cz));
                 const uvec2 sc = cell_sc[ci];
 
-                for (uint k = 0; k < sgi_cell_count(sc); ++k) {
+                // Owner entries only. Fat insertion lists a surfel in each of
+                // the ~9.6 cells its sphere touches, so every one of those that
+                // falls inside the window accumulated it again, with the same
+                // weight -- a bias toward surfels near the middle of the window
+                // that does not cancel between numerator and denominator. It was
+                // also the whole cost: six iterations of this over Sponza, where
+                // one cell holds 1595 entries, is 188 ms a frame.
+                //
+                // The reach shrinks from about 2 cells to 1.5, since a surfel is
+                // now found only through the cell holding its centre. u_radius
+                // was already effectively capped near 2 by the same mechanism.
+                for (uint k = 0; k < sgi_cell_owners(sc); ++k) {
                     const uint e = sc.x + k;
                     const uint j = sgi_cell_index(cell_item[e]);
                     if (j == i) continue;

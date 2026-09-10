@@ -2742,6 +2742,67 @@ performance" is the kind of claim that is true of the design the spec was writte
 for and not automatically true of this one.
 
 
+### Finding 49 — Sponza, and the reconstruction was double-counting
+
+Sponza loads: 262266 triangles, area 8108, bounds 30 x 12 x 18. Three things
+stop it being a test scene yet, and one of them was a bug in Cornell too.
+
+**The blockers.**
+
+* **The 16-bit surfel index.** The bake wants 285594 surfels and the microbuffer's
+  `depth16 | index16` key caps it at 65535, so coverage comes out at **0.229** --
+  gate 6's condition is `sum(pi r^2)/A == 1` and this is a quarter of that. Every
+  surface has holes in it. Step 3 makes the fix available: the spec's own key is
+  `packEntry(depth, j)` with **j LOCAL to the U-list**, 0..K-1, so ten bits of
+  index buy twenty-two of depth and the cap disappears.
+* **No light.** Sponza has zero emissive surfaces. `SGI_SKY` gives it something
+  to be lit by, which is what the numbers below use, but the sun and sky of
+  section 5.1 are genuinely not built.
+* **Density.** One cell holds 1595 entries against a mean of 7.1. Cornell's
+  geometry is uniform and hid every cost that scales with the worst cell.
+
+**Which is how the reconstruction's double-count surfaced.** The gather and the
+cache denoise both walk a 3x3x3 window and read EVERY entry in each cell. Fat
+insertion lists a surfel once per cell its sphere touches -- 9.6 of them -- so
+however many of those fall inside the window is how many times it was
+accumulated, at the same weight each time. The factor varies per surfel with how
+centred it happens to be, so it does not cancel between the numerator and the
+denominator. It is a bias toward the middle of the window, and it has been in
+every image this example has produced.
+
+Owner entries only, the same fix the NEE march got in finding 40:
+
+| Sponza, reconstruct | |
+|---|---|
+| all entries | 188.8 ms |
+| owner entries | **61.4 ms** |
+
+3.1x, and the frame goes 207 -> 80 ms. Cornell moves MAE 12.94 -> 12.98, which is
+the bias leaving and the filter's reach shrinking from about 2 cells to 1.5 at
+the same time. 30/30 gates.
+
+**Where Sponza's time is.** The gather is 0.4 ms. The denoise is all the rest --
+one iteration costs 45 ms and each of the other five about 2.5 -- and the solve
+is 19.3 ms per 2048-receiver slice, which at 65535 surfels is **32 slices and
+about 620 ms a bounce.**
+
+So: no, the sweeps would not survive being asked to run in real time, and Sponza
+says so an order of magnitude more loudly than Cornell did.
+
+### A measurement caveat that now has three instances
+
+The absolute cost of the per-pixel direct pass measured 52.3 ms at 512^2 in one
+session and 128 ms in the next, on five different commits including the one the
+52.3 was taken on, with the framebuffer verified at 512^2, memory at its maximum
+clock and the GPU in P0. The code did not change.
+
+Finding 40 recorded the first version of this (`SGI_BENCH=8` measures clock ramp)
+and finding 42 the second (an operation count is not a cost model). This is the
+third: **absolute timings do not survive across sessions on this machine.** Only
+A/B pairs taken in the same session are worth quoting, and every ratio in these
+findings is one. The absolute figures are scale, not measurement.
+
+
 ## Gate results
 
 `SGI_GATE=all SGI_NOGUI=1 ./40_surfel_fmm` — 30 assertions, all pass.
