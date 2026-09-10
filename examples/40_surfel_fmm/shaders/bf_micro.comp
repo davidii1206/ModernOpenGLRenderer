@@ -127,7 +127,11 @@ uniform float u_depth_tol;       // world units. Doubles as the "same surface as
                                  // the plane test in phase B.
 uniform float u_normal_tol;      // cos of the largest normal disagreement still
                                  // counted as the winner's own surface
-uniform vec3  u_sky;             // radiance of an uncovered bucket
+uniform vec3  u_sky;             // zenith radiance of an uncovered bucket
+uniform vec3  u_sky_ground;      // radiance below the horizon
+uniform vec3  u_sun;             // sun radiance, added inside its disc
+uniform vec3  u_sun_dir;         // world direction TO the sun
+uniform float u_sun_cos;         // cos of the sun's angular radius
 uniform uint  u_no_occlusion;    // gate 5: accept every candidate, no cov clamp
 uniform uint  u_rotate;          // 0 = none, 1 = static per surfel, 2 = per frame
 uniform uint  u_frame;
@@ -255,6 +259,20 @@ int sgi_far_block(vec3 P, vec3 d, float t_start, float t_max) {
         if (t >= t_max) return -1;
     }
     return -1;
+}
+
+// What a bucket sees when it sees no geometry: a zenith-to-ground gradient with
+// the sun as a disc on top. `w` is a WORLD direction.
+//
+// The sun lives here rather than in the NEE path because this is where its
+// shadow comes from: a bucket that hits something never evaluates this at all,
+// so occlusion is whatever the microbuffer already resolved. The price is that
+// the shadow is only as sharp as 16x16 buckets, which is why the disc wants to
+// be a few degrees rather than the sun's real 0.53.
+vec3 sgi_env(vec3 w) {
+    vec3 L = mix(u_sky_ground, u_sky, clamp(w.y * 0.5 + 0.5, 0.0, 1.0));
+    if (dot(w, u_sun_dir) >= u_sun_cos) L += u_sun;
+    return L;
 }
 
 void main() {
@@ -429,10 +447,10 @@ void main() {
         // the room is closed and u_sky is zero, and total in Sponza, which has
         // no emissive surface at all and is lit by nothing else. It rendered
         // black.
-        lds_far_L[b] = u_sky;
+        const vec3 ld0 = bucket[b * 2u + 0u].xyz;         // tangent-frame direction
+        const vec3 wd  = normalize(T * ld0.x + B * ld0.y + nP * ld0.z);
+        lds_far_L[b] = sgi_env(wd);
         if (u_far_occ == 0u || u_near <= 0.0) continue;
-        const vec3 ld = bucket[b * 2u + 0u].xyz;          // tangent-frame direction
-        const vec3 wd = normalize(T * ld.x + B * ld.y + nP * ld.z);
         // Lift the origin a full macro block off the receiver's own plane before
         // marching. A macro block is 4 cells -- wider than the near horizon --
         // so a march started at the receiver hits the block its own surface
@@ -650,7 +668,8 @@ void main() {
         if (u_far_occ != 0u && u_near > 0.0) {
             Lin = L * fill + lds_far_L[b] * (1.0 - fill);
         } else {
-            Lin = mix(u_sky, L, fill);
+            const vec3 ld = bucket[b * 2u + 0u].xyz;
+            Lin = mix(sgi_env(normalize(T * ld.x + B * ld.y + nP * ld.z)), L, fill);
         }
         if (u_debug_constant != 0u) Lin = vec3(u_debug_radiance);
 

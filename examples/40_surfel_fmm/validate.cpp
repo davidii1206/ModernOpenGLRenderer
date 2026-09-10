@@ -44,6 +44,10 @@ SolveConfig exact(const SolveConfig& base) {
     c.horizon = 0.0f;
     c.emissive_scale = 1.0f;
     c.sky = glm::vec3(0.0f);
+    // The environment is a gradient with a sun in it now, so a gate that wants a
+    // known sky has to pin all of it, not just the zenith.
+    c.sky_ground = glm::vec3(0.0f);
+    c.sun = glm::vec3(0.0f);
     c.two_sided = false;
     c.rotate = 0;                 // any per-surfel rotation makes runs incomparable
     c.no_occlusion = false;
@@ -413,7 +417,9 @@ void gate_occ(SurfelSet& scene, Solver& solver, const SolveConfig& base,
 
     SolveConfig c = base;
     c.method = Method::Micro;
-    c.sky = glm::vec3(1.0f);        // unit sky ...
+    c.sky = glm::vec3(1.0f);        // unit sky, UNIFORM: zenith and ground alike,
+    c.sky_ground = glm::vec3(1.0f); // or openness is measured against a gradient
+    c.sun = glm::vec3(0.0f);        // ...
     c.emissive_scale = 0.0f;        // ... and nothing else emitting
     c.rotate = 0;
     c.no_occlusion = false;

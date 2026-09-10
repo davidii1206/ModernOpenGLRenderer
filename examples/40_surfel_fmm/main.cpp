@@ -42,6 +42,13 @@
 //   SGI_METHOD=0|1          M1 analytic (no occlusion) | M2 microbuffer
 //   SGI_NEE=1               split the direct term out of the microbuffer
 //   SGI_NEE_PIXEL=0         evaluate that direct term per pixel, not per surfel
+//   SGI_SKY=0               zenith radiance of an uncovered bucket
+//   SGI_SKY_GROUND=         below-horizon radiance; default 0.25 * SGI_SKY
+//   SGI_SUN=0               sun radiance, added inside its disc
+//   SGI_SUN_ELEV=50         sun elevation in degrees
+//   SGI_SUN_AZIM=30         sun azimuth in degrees
+//   SGI_SUN_ANGLE=4         sun angular RADIUS in degrees; the microbuffer is
+//                           16x16, so a realistic 0.53 aliases into a bucket
 //   SGI_NEAR=0              occlusion horizon in SPACINGS; beyond it a surfel
 //                           lights but does not block. 0 = unlimited. Simulates
 //                           the FMM's U-list horizon (finding 44). Non-zero also
@@ -117,7 +124,12 @@ struct EnvOpts {
     uint32_t bounces = 3;        // SGI_BOUNCES  sweeps; 1 == direct only
     uint32_t buckets = 16;       // SGI_BUCKETS  microbuffer edge (8 or 16)
     int   method = 1;            // SGI_METHOD   0 = M1 radiance, 1 = M2 micro
-    float sky = 0.0f;            // SGI_SKY
+    float sky = 0.0f;            // SGI_SKY        zenith radiance
+    float skyground = -1.0f;     // SGI_SKY_GROUND below-horizon radiance, <0 = 0.25 * sky
+    float sun = 0.0f;            // SGI_SUN        sun radiance
+    float sunelev = 50.0f;       // SGI_SUN_ELEV   degrees above the horizon
+    float sunazim = 30.0f;       // SGI_SUN_AZIM   degrees, 0 = +X toward +Z
+    float sunangle = 4.0f;       // SGI_SUN_ANGLE  angular RADIUS in degrees
     float emissive = 1.0f;       // SGI_EMISSIVE
     int   view = 7;              // SGI_VIEW     display mode index
     // 1 = reference camera at 512^2 (pixel-aligned against the PNGs)
@@ -155,7 +167,12 @@ struct EnvOpts {
     float horizon = -1.0f;       // SGI_HORIZON  receiver-side cos floor
     int   twosided = -1;         // SGI_TWOSIDED force all surfels two-sided
     float cell = 1.0f;           // SGI_CELL     grid cell size, in spacings
-    float gradius = 2.5f;        // SGI_GATHER_R gather radius, in spacings
+    // 1.5, not 2.5. With fat insertion a 3x3x3 window reached about 1.5 spacings
+    // whatever this said, so 2.5 was never what the gather actually did; now that
+    // the window is sized from the radius, asking for 2.5 costs 3.5x the
+    // reconstruction (4.97 ms against 1.41) and measures the same -- MAE 12.94
+    // against 12.95, flat from 1.0 to 2.5. This is the value it was.
+    float gradius = 1.5f;        // SGI_GATHER_R gather radius, in spacings
     float gplane = 1.0f;         // SGI_GATHER_P gather plane tolerance, in spacings
     float gnormal = 0.0f;        // SGI_GATHER_N gather min dot(n_px, n_surfel)
     int   gkernel = 1;           // SGI_GATHER_K 0 = (r-d) cone, 1 = Wendland C2, 2 = Gaussian
@@ -189,6 +206,11 @@ EnvOpts read_env() {
     if (const char* v = getenv("SGI_BUCKETS"))  u32(v, o.buckets);
     if (const char* v = getenv("SGI_METHOD"))   o.method = atoi(v);
     if (const char* v = getenv("SGI_SKY"))      o.sky = float(atof(v));
+    if (const char* v = getenv("SGI_SKY_GROUND")) o.skyground = float(atof(v));
+    if (const char* v = getenv("SGI_SUN"))      o.sun = float(atof(v));
+    if (const char* v = getenv("SGI_SUN_ELEV")) o.sunelev = float(atof(v));
+    if (const char* v = getenv("SGI_SUN_AZIM")) o.sunazim = float(atof(v));
+    if (const char* v = getenv("SGI_SUN_ANGLE")) o.sunangle = float(atof(v));
     if (const char* v = getenv("SGI_EMISSIVE")) o.emissive = float(atof(v));
     if (const char* v = getenv("SGI_VIEW"))     o.view = atoi(v);
     if (const char* v = getenv("SGI_GTCAM"))    o.gtcam = atoi(v);
@@ -356,6 +378,18 @@ int main() {
     cfg.max_sweeps = env.bounces;
     cfg.ms = env.buckets >= 16 ? 16u : 8u;
     cfg.sky = glm::vec3(env.sky);
+    // A ground bounce that is a quarter of the zenith by default: without it an
+    // outdoor scene's downward-facing surfaces get nothing at all and read as
+    // holes rather than as shadow.
+    cfg.sky_ground = glm::vec3(env.skyground >= 0.0f ? env.skyground : 0.25f * env.sky);
+    cfg.sun = glm::vec3(env.sun);
+    {
+        const float el = glm::radians(env.sunelev), az = glm::radians(env.sunazim);
+        cfg.sun_dir = glm::normalize(glm::vec3(std::cos(el) * std::cos(az),
+                                               std::sin(el),
+                                               std::cos(el) * std::sin(az)));
+        cfg.sun_cos = std::cos(glm::radians(std::max(env.sunangle, 0.05f)));
+    }
     cfg.emissive_scale = env.emissive;
     cfg.rotate = std::clamp(env.jitter, 0, 2);
     cfg.nee = env.nee != 0;

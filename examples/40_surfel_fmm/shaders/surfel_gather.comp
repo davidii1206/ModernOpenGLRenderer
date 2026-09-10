@@ -127,6 +127,18 @@ void main() {
 
     const vec3  g  = (p - u_grid_min) * u_inv_cell;
     const ivec3 hc = clamp(ivec3(floor(g)), ivec3(0), u_grid_res - 1);
+    // Window sized from the RADIUS, not fixed at one cell.
+    //
+    // With fat insertion a 3x3x3 window reached u_radius + a surfel radius,
+    // because every cell listed the discs that merely touched it. Owner entries
+    // do not: a surfel is found only through the cell holding its centre, so the
+    // window has to span the radius itself. The query point sits up to half a
+    // cell from its own cell centre, hence the +0.5.
+    //
+    // Leaving it at 3x3x3 silently truncated the gather to 1.5 spacings against
+    // a default radius of 2.5. Cornell is dense enough per pixel that it still
+    // found something; Sponza rendered a dither of half-empty pixels.
+    const int wr = int(ceil(u_radius * u_inv_cell + 0.5));
 
     vec3  acc  = vec3(0.0);
     float lacc = 0.0;
@@ -162,13 +174,13 @@ void main() {
     vec4  grad_p = vec4(0.0);
     {
         float bd = 3.4e38;
-        for (int dz = -1; dz <= 1; ++dz) {
+        for (int dz = -wr; dz <= wr; ++dz) {
             const int cz = hc.z + dz;
             if (cz < 0 || cz >= u_grid_res.z) continue;
-            for (int dy = -1; dy <= 1; ++dy) {
+            for (int dy = -wr; dy <= wr; ++dy) {
                 const int cy = hc.y + dy;
                 if (cy < 0 || cy >= u_grid_res.y) continue;
-                for (int dx = -1; dx <= 1; ++dx) {
+                for (int dx = -wr; dx <= wr; ++dx) {
                     const int cx = hc.x + dx;
                     if (cx < 0 || cx >= u_grid_res.x) continue;
                     const uint ci = uint(cx) + uint(u_grid_res.x) *
@@ -208,13 +220,13 @@ void main() {
     // the denominator: it is a bias toward surfels near the middle of the
     // window. On Sponza, where one cell holds 1595 entries, it is also most of
     // the reconstruction's cost.
-    for (int dz = -1; dz <= 1; ++dz) {
+    for (int dz = -wr; dz <= wr; ++dz) {
         const int cz = hc.z + dz;
         if (cz < 0 || cz >= u_grid_res.z) continue;
-        for (int dy = -1; dy <= 1; ++dy) {
+        for (int dy = -wr; dy <= wr; ++dy) {
             const int cy = hc.y + dy;
             if (cy < 0 || cy >= u_grid_res.y) continue;
-            for (int dx = -1; dx <= 1; ++dx) {
+            for (int dx = -wr; dx <= wr; ++dx) {
                 const int cx = hc.x + dx;
                 if (cx < 0 || cx >= u_grid_res.x) continue;
 

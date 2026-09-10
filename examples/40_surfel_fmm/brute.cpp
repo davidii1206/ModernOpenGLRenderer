@@ -356,6 +356,10 @@ void Solver::dispatch(SurfelSet& set, const SolveConfig& cfg,
         micro_.set("u_depth_tol", cfg.depth_tol_radii * set.radius());
         micro_.set("u_normal_tol", cfg.normal_tol);
         micro_.set("u_sky", cfg.sky);
+        micro_.set("u_sky_ground", cfg.sky_ground);
+        micro_.set("u_sun", cfg.sun);
+        micro_.set("u_sun_dir", glm::normalize(cfg.sun_dir));
+        micro_.set("u_sun_cos", cfg.sun_cos);
         micro_.set("u_store_light", 1u);
         micro_.set("u_nee", nee ? 1u : 0u);
         micro_.set("u_nee_add", cfg.nee_pixel ? 0u : 1u);

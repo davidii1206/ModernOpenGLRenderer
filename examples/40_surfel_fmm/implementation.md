@@ -2915,6 +2915,71 @@ Sponza run in this session was really 285594.
 Cornell is untouched by both fixes -- byte-identical render, 30/30 gates.
 
 
+### Finding 52 — sun and sky, and the window the owner fix broke
+
+**The environment.** `sgi_env(w)` is a zenith-to-ground gradient with the sun as a
+disc on top, evaluated in the bucket's WORLD direction:
+
+```
+L = mix(u_sky_ground, u_sky, w.y * 0.5 + 0.5);
+if (dot(w, u_sun_dir) >= u_sun_cos) L += u_sun;
+```
+
+The sun lives in the environment rather than in the NEE path, and that is the
+whole design: a bucket that hits geometry never evaluates it, so the sun's shadow
+is whatever the microbuffer already resolved and costs nothing extra. The price
+is that the shadow is only as sharp as 16x16 buckets, which is why
+`SGI_SUN_ANGLE` defaults to a 4-degree radius -- the real sun's 0.53 falls inside
+one bucket and aliases into a bucket-shaped shadow. A sharp sun needs the NEE
+path and a directional emitter proxy, which is not built.
+
+`SGI_SKY`, `SGI_SKY_GROUND` (default a quarter of the sky, so downward-facing
+surfaces read as shadow rather than as holes), `SGI_SUN`, `SGI_SUN_ELEV`,
+`SGI_SUN_AZIM`, `SGI_SUN_ANGLE`.
+
+Gate 8 caught the first mistake immediately: it measures openness against a unit
+sky and my gradient made that sky directional, so it read 0.0764 against a
+tolerance of 0.0693. A gate that wants a known environment now pins all of it --
+`sky`, `sky_ground` and `sun` -- not just the zenith.
+
+**And Sponza rendered a dither**, which turned out to be finding 49's owner-entry
+fix, incomplete. With fat insertion a 3x3x3 window reached `u_radius` plus a
+surfel radius, because every cell listed the discs that merely touched it. Owner
+entries do not: a surfel is found only through the cell holding its centre, so a
+fixed 3x3x3 window silently truncates the gather to 1.5 spacings against a
+default radius of 2.5. Cornell is dense enough per pixel to still find something.
+Sponza is not, and half its pixels came back empty.
+
+The window is sized from the radius now, `ceil(u_radius / cell + 0.5)`. It also
+recovers accuracy that had been quietly lost: **Cornell's GI MAE goes 13.01 ->
+12.95.**
+
+**Which made the radius honest, and it had been lying.** At 2.5 spacings the
+gather now costs what 2.5 spacings costs:
+
+| `SGI_GATHER_R` | reconstruct | MAE |
+|---|---|---|
+| 1.0 | 1.33 ms | 12.95 |
+| **1.5** | **1.41 ms** | **12.95** |
+| 2.0 | 2.83 ms | 12.95 |
+| 2.5 | 4.97 ms | 12.94 |
+
+Flat in quality, 3.5x in cost, so the default is 1.5 -- which is what the gather
+was really doing all along. `SGI_FILTER_R` stays at 3.0: it costs the same as 2.0
+and measures better.
+
+**Where the frame lands**, Cornell 512^2 and Sponza 1600x900, both with the solve
+held:
+
+| | Cornell | Sponza |
+|---|---|---|
+| reconstruct | 1.51 ms | 32.2 ms |
+| Sponza before this pass | | 63.6 ms |
+
+30/30 gates. Sponza's exterior renders as a smooth lit wall -- correct for what
+the default camera sees, which is the outside of the building.
+
+
 ## Gate results
 
 `SGI_GATE=all SGI_NOGUI=1 ./40_surfel_fmm` — 30 assertions, all pass.

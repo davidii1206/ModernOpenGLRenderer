@@ -63,7 +63,21 @@ struct SolveConfig {
     // since M0b and is now what the shaders read; this only forces it on.
     bool  two_sided = false;
     float emissive_scale = 1.0f;
-    glm::vec3 sky{0.0f};           // radiance of an uncovered bucket
+    // The environment a bucket sees when it sees no geometry. `sky` is the
+    // zenith radiance and `sky_ground` the radiance below the horizon, blended
+    // over the bucket's world direction; the sun is a bright disc added on top.
+    //
+    // The sun rides in the environment rather than in the NEE path because that
+    // is where its SHADOW comes from for free: a bucket that hits something
+    // never asks what the sky looks like. The cost is that its shadow is only as
+    // sharp as the microbuffer's 16x16, which is why u_sun_cos defaults to a
+    // disc several degrees wide rather than the sun's real 0.53 -- an unresolved
+    // source in 256 buckets aliases into a bucket-shaped shadow.
+    glm::vec3 sky{0.0f};           // zenith radiance of an uncovered bucket
+    glm::vec3 sky_ground{0.0f};    // radiance below the horizon
+    glm::vec3 sun{0.0f};           // sun radiance, added inside its disc
+    glm::vec3 sun_dir{0.0f, 1.0f, 0.0f};   // world direction TO the sun
+    float     sun_cos = 0.999f;    // cos of the sun's angular radius
 
     float depth_tol_radii = 2.0f;  // distance from the winner's plane, in radii
     float normal_tol = 0.7f;       // cos of the largest normal disagreement kept
