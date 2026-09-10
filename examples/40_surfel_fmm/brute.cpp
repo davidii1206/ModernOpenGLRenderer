@@ -320,6 +320,9 @@ void Solver::dispatch(SurfelSet& set, const SolveConfig& cfg,
             micro_.set("u_grid_min", grid_->min());
             micro_.set("u_macro_res", grid_->macro_res());
             micro_.set("u_macro_cell", grid_->cell() * 4.0f);
+            micro_.set("u_grid_res", grid_->res());
+            micro_.set("u_cell", grid_->cell());
+            micro_.set("u_radius", set.radius());
             micro_.set("u_far_occ", cfg.far_occlusion ? 1u : 0u);
             b_blk_.bind_base(kBindBlkRad);
         } else {

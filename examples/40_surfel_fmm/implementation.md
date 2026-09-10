@@ -2634,6 +2634,53 @@ Neither is a knob. Both are the next increment of the same structure, which is
 what says this is the right structure.
 
 
+### Finding 47 — step 3: the U-list walk, and it is exact
+
+Spec section 10 step 3: near field through the grid, everything else through the
+far field. With finding 46's order-0 multipole carrying the far field, the near
+field can finally stop being "all N candidates, most of which exit early".
+
+The walk gathers the U-list once into LDS and both phases read it -- owner
+entries only, cell span dilated by a cell plus a radius so a surfel whose centre
+cell falls just outside still gets in, and the `d2 > near2` test still deciding
+membership. Overflowing the list would silently drop occluders, so it does not:
+the walk raises a flag and both phases fall back to the all-pairs stride, which
+is slow and correct, and keeps large `SGI_NEAR` values usable as a diagnostic
+even when the U-list they imply is far too big to gather.
+
+**It is byte-identical at every horizon** -- 0, 1.5 and 6 spacings, zero pixels
+differing against the all-pairs near field. Same candidate set, reached a
+different way, which is the assertion step 3 exists for. 30/30 gates.
+
+**Solve, per 2048-receiver slice:**
+
+| | all-pairs | U-list | |
+|---|---|---|---|
+| 10k surfels | 11.54 ms | 1.13 ms | 10.2x |
+| 30k surfels | 34.24 ms | 2.34 ms | **14.6x** |
+| 60k surfels | 72.87 ms | 5.24 ms | 13.9x |
+
+At 30k that is **~34 ms a bounce against ~500 ms**.
+
+**The far march is not the cost.** Disabling it leaves 0.90 / 1.92 / 4.61 ms
+against 1.13 / 2.34 / 5.24, so the per-bucket DDA is 0.2-0.6 ms -- a fifth of the
+pass at most, and the part that does not grow with surfel count.
+
+**What does grow is the walk, and section 4.1 already says why.** The U-list is a
+constant ~30 surfels at 1.5 spacings whatever N is, and the cell span is a
+constant 7^3 -- but every receiver re-reads those 343 `cell_sc` entries for
+itself, out of a grid that gets larger with N, so the cache hit rate falls away.
+That is exactly the redundant fetch section 4.1 describes: "every receiver in a
+cell has the same 27-cell U-list and the same K candidates", re-probed and
+re-fetched per receiver.
+
+Which makes step 4 -- one workgroup per occupied cell rather than per receiver,
+with the U-list gathered once and shared -- not just the performance step the
+spec calls it but the fix for the one number here that does not scale. And it
+comes with its own assertion: bit-identical against step 3, which is now the
+thing that has to hold.
+
+
 ## Gate results
 
 `SGI_GATE=all SGI_NOGUI=1 ./40_surfel_fmm` — 30 assertions, all pass.

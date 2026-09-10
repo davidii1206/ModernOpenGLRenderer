@@ -81,6 +81,10 @@ layout(std430, binding = 20) readonly buffer DirectIn { vec4 direct_e[]; };
 layout(std430, binding = 21) readonly buffer Macro  { uint macro_bits[]; };
 // Order-0 multipole: sum(L_out) and a count per macro block. See blk_rad.comp.
 layout(std430, binding = 24) readonly buffer BlkRad { uint blk[]; };
+// The grid, for the U-list walk. Same structures the NEE march uses: owner
+// entries first in each cell, and their count in the high half of sc.y.
+layout(std430, binding = 8)  readonly buffer CellSC { uvec2 cell_sc[]; };
+layout(std430, binding = 9)  readonly buffer CellIt { uint  cell_item[]; };
 uniform uint u_store_light;
 // With NEE on, light_vis comes from the direct pass's bitmask (64 stratified
 // samples of the emitter, noise-free) instead of this kernel's emissive-coverage
@@ -112,6 +116,9 @@ uniform uint  u_far_occ;         // 1 = march the macro bitmask for a far horizo
 uniform vec3  u_grid_min;
 uniform ivec3 u_macro_res;
 uniform float u_macro_cell;      // world size of one macro block
+uniform ivec3 u_grid_res;
+uniform float u_cell;
+uniform float u_radius;          // the set's global surfel radius
 uniform float u_soft_eps;        // identical to bf_radiance.comp
 uniform uint  u_two_sided;       // 1 = force every surfel two-sided (diagnostic)
 uniform float u_depth_scale;     // 65535 / u_max_depth
@@ -164,6 +171,18 @@ shared uint lds_cov_emit[kMaxMS2];
 // The far field's radiance per bucket: the mean outgoing radiance of the first
 // occupied macro block along the bucket's direction past the near horizon.
 shared vec3 lds_far_L[kMaxMS2];
+// The U-list: the near field's candidates, gathered once and read by both
+// phases. Spec section 10 step 3 -- near field through the grid, everything else
+// through the far field, which since finding 46 is the order-0 multipole.
+//
+// Overflowing it would silently drop occluders, so it does not: the walk sets
+// lds_over and both phases fall back to the all-pairs stride, which is slow and
+// correct. That keeps large SGI_NEAR values usable as a diagnostic even though
+// the U-list they imply is far too big to gather.
+const uint kMaxCand = 1024u;
+shared uint lds_cand[kMaxCand];
+shared uint lds_ncand;
+shared uint lds_over;
 // Cross-thread reduction of the per-bucket integral, one slot per invocation.
 shared vec3  lds_red[kWG];
 shared float lds_vis[kWG];
@@ -260,8 +279,51 @@ void main() {
     // inner loop cost 48% of the solve (22.5 -> 33.4 ms).
     const float near2 = u_near > 0.0 ? u_near * u_near : 3.4e38;
 
+    // === the U-list =========================================================
+    //
+    // Everything inside the near horizon, gathered from the grid instead of by
+    // striding all N. Owner entries only (one per surfel, not one per cell it
+    // touches), and the cell span is dilated by a cell plus a radius so a surfel
+    // whose centre cell falls just outside still gets in -- the d2 test below is
+    // what decides membership, this only decides what to look at.
+    if (tid == 0u) { lds_ncand = 0u; lds_over = 0u; }
+    barrier();
+
+    const bool use_ulist = u_near > 0.0;
+    if (use_ulist) {
+        const float reach = u_near + u_cell + u_radius;
+        const ivec3 glo = clamp(ivec3(floor((posP - reach - u_grid_min) / u_cell)),
+                                ivec3(0), u_grid_res - 1);
+        const ivec3 ghi = clamp(ivec3(floor((posP + reach - u_grid_min) / u_cell)),
+                                ivec3(0), u_grid_res - 1);
+        const ivec3 span = ghi - glo + ivec3(1);
+        const uint  ncell = uint(span.x) * uint(span.y) * uint(span.z);
+        if (ncell > 32768u) {
+            if (tid == 0u) lds_over = 1u;          // U-list too big to gather
+        } else {
+            for (uint ci = tid; ci < ncell; ci += kWG) {
+                const ivec3 g = glo + ivec3(int(ci % uint(span.x)),
+                                            int((ci / uint(span.x)) % uint(span.y)),
+                                            int(ci / (uint(span.x) * uint(span.y))));
+                const uint idx = uint(g.x) + uint(u_grid_res.x) *
+                                 (uint(g.y) + uint(u_grid_res.y) * uint(g.z));
+                const uvec2 sc = cell_sc[idx];
+                const uint  n  = sgi_cell_owners(sc);
+                for (uint k = 0u; k < n; ++k) {
+                    const uint slot = atomicAdd(lds_ncand, 1u);
+                    if (slot < kMaxCand) lds_cand[slot] = sgi_cell_index(cell_item[sc.x + k]);
+                    else                 atomicMax(lds_over, 1u);
+                }
+            }
+        }
+    }
+    barrier();
+    const bool ulist = use_ulist && lds_over == 0u;
+    const uint ncand = ulist ? min(lds_ncand, kMaxCand) : u_count;
+
     // === phase A: resolve the depth winner per bucket =======================
-    for (uint j = tid; j < u_count; j += kWG) {
+    for (uint jj = tid; jj < ncand; jj += kWG) {
+        const uint j = ulist ? lds_cand[jj] : jj;
         if (j == P) continue;
 
         const vec4  cpr = s_pos_rad[j];
@@ -354,7 +416,8 @@ void main() {
     barrier();
 
     // === phase B: accumulate coverage and radiance on the winning surface ====
-    for (uint j = tid; j < u_count; j += kWG) {
+    for (uint jj = tid; jj < ncand; jj += kWG) {
+        const uint j = ulist ? lds_cand[jj] : jj;
         if (j == P) continue;
 
         const vec4  cpr = s_pos_rad[j];
