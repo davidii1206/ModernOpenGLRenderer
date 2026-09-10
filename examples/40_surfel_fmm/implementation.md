@@ -2980,6 +2980,43 @@ held:
 the default camera sees, which is the outside of the building.
 
 
+### Finding 53 — Sponza's lighting was Voronoi cells, and the cause was density
+
+Reported from the GUI as "basically just voronoi noise", and that is literally
+what it was: the gather falls back to the nearest plane-consistent surfel when no
+neighbour passes the weighted test, and one value per surfel drawn over a screen
+is a Voronoi diagram of the surfel set.
+
+The cause is density against SCREEN SIZE, not against surface area. Coverage is
+1.000000 either way -- the bake guarantees `sum(pi r^2)/A == 1` -- so the bake's
+own measure says nothing is wrong. What matters is how many pixels a surfel
+covers:
+
+| target | surfels | spacing | result |
+|---|---|---|---|
+| 30000 (the Cornell default) | 285594 | 0.168 | flat patches, structure legible but shading is cells |
+| 1200000 | **1387840** | **0.076** | smooth; arcade, columns and vault all read |
+
+285594 is not the 30000 that was asked for: the bake floors at one surfel per
+triangle and Sponza has 262266 of them. From inside the arcade at 1600x900 a
+0.168 spacing is about eighty pixels per surfel, and the gather has nothing to
+interpolate between.
+
+Cornell never showed this at 30000 because its ratio is completely different --
+scene radius over spacing is 65 there against 250 for the Sponza that works -- and
+because its geometry is flat, so the gather's plane test admits neighbours
+instead of rejecting them.
+
+**Cost of the density that works:** 79 MB of surfels, a **383 MB grid**, 54 ms to
+bake and 2.0 s to build the grid. The grid is the expensive part by five to one,
+and it is 13292456 entries at 9.58 per surfel -- fat insertion again, on a
+structure where only the owner entry is now read by the shadow march.
+
+So the surfel count is a GUI control now, with the spacing and the grid size
+printed next to it, because it is a per-scene decision that cannot be defaulted:
+too low and the reconstruction draws cells, too high and the grid does not fit.
+
+
 ## Gate results
 
 `SGI_GATE=all SGI_NOGUI=1 ./40_surfel_fmm` — 30 assertions, all pass.

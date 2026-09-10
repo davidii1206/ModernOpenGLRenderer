@@ -153,6 +153,8 @@ struct EnvOpts {
     float neeskip = 0.0f;        // SGI_NEE_SKIP  cache-agreement margin, 0 = off
     float nearspac = 0.0f;       // SGI_NEAR      occlusion horizon in SPACINGS, 0 = unlimited
     bool  farocc = true;         // SGI_FAR_OCC   march the macro bitmask for the far field
+    // Scripted camera, for scenes that have no reference view. "x,y,z".
+    std::string eye, at;         // SGI_EYE / SGI_AT
     float neethick = 0.25f;      // SGI_NEE_THICK surfel slab half-thickness, in radii
     float neeself = 0.9f;        // SGI_NEE_SELF  same-surface normal agreement
     float neeselftol = 1.0f;     // SGI_NEE_SELF_TOL same-surface plane tolerance, in radii
@@ -239,6 +241,8 @@ EnvOpts read_env() {
     if (const char* v = getenv("SGI_BIAS"))     o.bias = float(atof(v));
     if (const char* v = getenv("SGI_NEAR"))     o.nearspac = float(atof(v));
     if (const char* v = getenv("SGI_FAR_OCC"))  o.farocc = atoi(v) != 0;
+    if (const char* v = getenv("SGI_EYE"))      o.eye = v;
+    if (const char* v = getenv("SGI_AT"))       o.at = v;
     if (const char* v = getenv("SGI_SOFT"))     o.soft = float(atof(v));
     if (const char* v = getenv("SGI_HORIZON"))  o.horizon = float(atof(v));
     if (const char* v = getenv("SGI_TWOSIDED")) o.twosided = atoi(v);
@@ -356,6 +360,13 @@ int main() {
     // is why they are held in their own units and converted per frame rather
     // than baked into cfg once at startup.
     std::string current_model = env.model;
+    // Mutable, because the right density is a property of the SCENE and the
+    // viewing distance, not a constant. Sponza at the Cornell default of 30000
+    // floors at one surfel per triangle -- 285594, spacing 0.168 -- and from
+    // inside the arcade one surfel covers about eighty pixels, so the
+    // reconstruction draws their Voronoi cells instead of a lit room. At
+    // 1387840, spacing 0.076, it resolves.
+    uint32_t target_surfels = env.surfels;
     auto rebuild_scene = [&](const char* path) {
         auto next = std::make_unique<gfx::Model>();
         if (!next->load(path)) {
@@ -369,7 +380,7 @@ int main() {
         }
         model = std::move(next);
         tris  = std::move(next_tris);
-        scene.build(tris, env.surfels);
+        scene.build(tris, target_surfels);
         grid.build(scene, env.cell);
         emitters.build(tris);
         cuts.build(scene, tris);
@@ -511,7 +522,16 @@ int main() {
                     float(window.framebuffer_width()) /
                         float(std::max(1, window.framebuffer_height())),
                     radius * 0.002f, radius * 20.0f);
-    if (env.gtcam != 0) {
+    auto parse3 = [](const std::string& t, glm::vec3& out) {
+        return !t.empty() && std::sscanf(t.c_str(), "%f,%f,%f", &out.x, &out.y, &out.z) == 3;
+    };
+    glm::vec3 eye_v, at_v;
+    if (parse3(env.eye, eye_v) && parse3(env.at, at_v)) {
+        // An explicit camera beats both presets: a scene with no reference view
+        // has nowhere sensible to put one, and Sponza's default framing is the
+        // outside of the building.
+        cam.look_at(eye_v, at_v);
+    } else if (env.gtcam != 0) {
         cam.look_at(kGtEye, kGtTarget);
     } else {
         cam.look_at(sb.center() + glm::vec3(0.0f, 0.0f, radius * 2.2f), sb.center());
@@ -890,8 +910,22 @@ int main() {
                         }
                     }
                     ImGui::TextUnformatted(current_model.c_str());
-                    ImGui::Separator();
                 }
+                // Density. The bake floors at one surfel per triangle, so this is
+                // a target rather than a count, and the spacing it produces is
+                // the number that matters: when a surfel covers more than a few
+                // pixels the gather has nothing to interpolate between and falls
+                // back to the nearest one, which draws Voronoi cells.
+                int want = int(target_surfels);
+                ImGui::SetNextItemWidth(180.0f);
+                if (ImGui::DragInt("Target surfels", &want, 5000.0f, 1000, 4000000))
+                    target_surfels = uint32_t(std::max(want, 1000));
+                ImGui::SameLine();
+                if (ImGui::Button("Rebuild")) rebuild_scene(current_model.c_str());
+                ImGui::Text("%u surfels, spacing %.4f, %.0f MB grid",
+                            scene.count(), scene.spacing(),
+                            double(grid.bytes()) / (1024.0 * 1024.0));
+                ImGui::Separator();
 
                 ImGui::Text("surfels     %u (%u emissive)", scene.count(),
                             scene.emissive_count());
