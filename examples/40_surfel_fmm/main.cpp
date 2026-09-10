@@ -83,6 +83,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <filesystem>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -290,7 +291,7 @@ int main() {
 
     // --- Scene ---------------------------------------------------------------
 
-    auto model = std::make_unique<gfx::Model>();
+    std::unique_ptr<gfx::Model> model = std::make_unique<gfx::Model>();
     if (!model->load(env.model.c_str())) {
         gllib::logf(gllib::LogLevel::error, "failed to load '%s'", env.model.c_str());
         return 1;
@@ -340,20 +341,75 @@ int main() {
     // Static set, so the grid is built once. It is Tier 1's candidate lookup and
     // Tier 2's ray-traversal structure both.
     SurfelGrid grid;
-    grid.build(scene, env.cell);
-
     // Emitter proxies for next event estimation: the direct term is split out
     // of the microbuffer, which resolves this panel with about 4 of 256 buckets.
     EmitterSet emitters;
-    emitters.build(tris);
-
     // Cut planes: the mesh's own sharp and boundary edges, resolved per surfel,
     // so an occluder disc ends where its geometry does. This is what lets
     // nee_occ inflate the interior without dilating every silhouette -- see
     // cuts.hpp.
     CutSet cuts;
+
+    // Everything downstream of the mesh, in one place so the GUI can load a
+    // different one. Every knob that is expressed in SPACINGS has to be
+    // recomputed after this, because the spacing changes with the scene -- which
+    // is why they are held in their own units and converted per frame rather
+    // than baked into cfg once at startup.
+    std::string current_model = env.model;
+    auto rebuild_scene = [&](const char* path) {
+        auto next = std::make_unique<gfx::Model>();
+        if (!next->load(path)) {
+            gllib::logf(gllib::LogLevel::error, "failed to load '%s'", path);
+            return false;
+        }
+        std::vector<Tri> next_tris = extract_triangles(*next);
+        if (next_tris.empty()) {
+            gllib::logf(gllib::LogLevel::error, "no triangles in '%s'", path);
+            return false;
+        }
+        model = std::move(next);
+        tris  = std::move(next_tris);
+        scene.build(tris, env.surfels);
+        grid.build(scene, env.cell);
+        emitters.build(tris);
+        cuts.build(scene, tris);
+        solver.attach(&grid, &emitters, &cuts);
+        solver.reset(scene);
+        current_model = path;
+        const Bounds& b = scene.bounds();
+        gllib::logf(gllib::LogLevel::info,
+                    "loaded '%s': %zu tris, %u surfels (%u emissive), spacing %.5f, "
+                    "bounds [%.2f %.2f %.2f]..[%.2f %.2f %.2f]",
+                    path, tris.size(), scene.count(), scene.emissive_count(),
+                    scene.spacing(), b.mn.x, b.mn.y, b.mn.z, b.mx.x, b.mx.y, b.mx.z);
+        return true;
+    };
+
+    grid.build(scene, env.cell);
+    emitters.build(tris);
     cuts.build(scene, tris);
     solver.attach(&grid, &emitters, &cuts);
+
+    // Every .glb next to the binary and in the repo's data directory, so the GUI
+    // can switch scenes without an env var. Sponza is the reason: it is the only
+    // thing here that is not a shoebox, and it cannot be reached any other way
+    // from a default launch.
+    std::vector<std::string> model_files;
+    for (const char* dir : {".", "../../../data"}) {
+        std::error_code ec;
+        for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
+            if (!e.is_regular_file(ec)) continue;
+            const std::string ext = e.path().extension().string();
+            if (ext == ".glb" || ext == ".gltf") model_files.push_back(e.path().string());
+        }
+    }
+    std::sort(model_files.begin(), model_files.end());
+
+    // Held in their own units and converted every frame: the sun's direction is
+    // spherical, and the near horizon is in SPACINGS, which changes with the
+    // scene. Baking either into cfg once would break on a model reload.
+    float sun_elev = env.sunelev, sun_azim = env.sunazim, sun_angle = env.sunangle;
+    float near_spacings = env.nearspac;
 
     float gather_radius = env.gradius;
     float gather_plane  = env.gplane;
@@ -554,6 +610,16 @@ int main() {
         display.poll();
         if (solver.poll()) solver.reset(scene);
 
+        // Derived per frame so the GUI's sliders and a model reload both land.
+        {
+            const float el = glm::radians(sun_elev), az = glm::radians(sun_azim);
+            cfg.sun_dir = glm::normalize(glm::vec3(std::cos(el) * std::cos(az),
+                                                   std::sin(el),
+                                                   std::cos(el) * std::sin(az)));
+            cfg.sun_cos = std::cos(glm::radians(std::max(sun_angle, 0.05f)));
+            cfg.near_radius = near_spacings > 0.0f ? near_spacings * scene.spacing() : 0.0f;
+        }
+
         const glm::mat4 view_proj = cam.view_projection();
 
         // 1. G-buffer.
@@ -686,8 +752,29 @@ int main() {
 
             if (ImGui::CollapsingHeader("Transport", ImGuiTreeNodeFlags_DefaultOpen)) {
                 ImGui::SliderFloat("Emissive scale", &cfg.emissive_scale, 0.0f, 8.0f);
-                ImGui::SliderFloat("Sky", &cfg.sky.x, 0.0f, 4.0f);
+                // The environment a bucket sees when it sees no geometry. The
+                // sun is a disc in it rather than an emitter proxy, so its
+                // shadow comes from the microbuffer's own occlusion -- and is
+                // only as sharp as 16x16 buckets, which is why its angular
+                // radius wants to be degrees rather than the real 0.53.
+                ImGui::SliderFloat("Sky zenith", &cfg.sky.x, 0.0f, 4.0f);
                 cfg.sky.y = cfg.sky.z = cfg.sky.x;
+                ImGui::SliderFloat("Sky ground", &cfg.sky_ground.x, 0.0f, 4.0f);
+                cfg.sky_ground.y = cfg.sky_ground.z = cfg.sky_ground.x;
+                ImGui::SliderFloat("Sun", &cfg.sun.x, 0.0f, 40.0f);
+                cfg.sun.y = cfg.sun.z = cfg.sun.x;
+                ImGui::SliderFloat("Sun elevation", &sun_elev, 0.0f, 90.0f, "%.0f deg");
+                ImGui::SliderFloat("Sun azimuth", &sun_azim, -180.0f, 180.0f, "%.0f deg");
+                ImGui::SliderFloat("Sun radius", &sun_angle, 0.5f, 20.0f, "%.1f deg");
+                // Above 65536 surfels the all-pairs path cannot index its own
+                // winners, so a big scene NEEDS this non-zero. Sponza is 285594.
+                if (ImGui::SliderFloat("Near horizon", &near_spacings, 0.0f, 8.0f,
+                                       "%.2f spacings"))
+                    solver.reset(scene);
+                if (scene.count() > 65536u && near_spacings <= 0.0f)
+                    ImGui::TextColored(ImVec4(1, 0.4f, 0.3f, 1),
+                                       "%u surfels: raise the near horizon above 0",
+                                       scene.count());
                 ImGui::SliderFloat("Horizon cos", &cfg.horizon, 0.0f, 0.2f, "%.4f");
                 ImGui::SliderFloat("Plane bias (radii)", &cfg.plane_bias, 0.0f, 4.0f);
                 ImGui::SliderFloat("Disc softening eps", &cfg.soft_eps, 0.0f, 4.0f);
@@ -757,7 +844,55 @@ int main() {
                 }
             }
 
-            if (ImGui::CollapsingHeader("Scene")) {
+            if (ImGui::CollapsingHeader("Scene", ImGuiTreeNodeFlags_DefaultOpen)) {
+                // Loading a different mesh rebuilds the surfels, the grid, the
+                // emitter proxies and the cut planes, and resets the solve.
+                // Sponza is the whole reason this exists: it is 262266 triangles
+                // against Cornell's 32, and a default launch has no other way to
+                // reach it.
+                if (!model_files.empty()) {
+                    static int sel = 0;
+                    std::vector<const char*> names(model_files.size());
+                    for (std::size_t k = 0; k < model_files.size(); ++k)
+                        names[k] = model_files[k].c_str();
+                    ImGui::SetNextItemWidth(260.0f);
+                    ImGui::Combo("##model", &sel, names.data(), int(names.size()));
+                    ImGui::SameLine();
+                    if (ImGui::Button("Load")) {
+                        if (rebuild_scene(model_files[std::size_t(sel)].c_str())) {
+                            // Frame the new scene: its bounds have nothing to do
+                            // with the old one's, and a camera left where it was
+                            // is usually inside a wall or a mile away.
+                            const float r = std::max(0.1f, scene.bounds().radius());
+                            cam.perspective(45.0f,
+                                            float(gbuf.width) / float(std::max(1, gbuf.height)),
+                                            r * 0.002f, r * 20.0f);
+                            cam.look_at(scene.bounds().center() +
+                                            glm::vec3(0.0f, 0.0f, r * 2.2f),
+                                        scene.bounds().center());
+
+                            // Make the load land somewhere it can be seen.
+                            //
+                            // A scene with no emissive surface has no light at
+                            // all in this renderer, and one past 65536 surfels
+                            // cannot use the all-pairs path -- so loading Sponza
+                            // with the Cornell defaults gives a black screen for
+                            // two reasons at once, neither of which is obvious
+                            // from looking at it.
+                            if (scene.count() > 65536u && near_spacings <= 0.0f)
+                                near_spacings = 1.5f;
+                            if (scene.emissive_count() == 0 &&
+                                cfg.sky.x <= 0.0f && cfg.sun.x <= 0.0f) {
+                                cfg.sky = glm::vec3(0.6f);
+                                cfg.sky_ground = glm::vec3(0.15f);
+                                cfg.sun = glm::vec3(8.0f);
+                            }
+                        }
+                    }
+                    ImGui::TextUnformatted(current_model.c_str());
+                    ImGui::Separator();
+                }
+
                 ImGui::Text("surfels     %u (%u emissive)", scene.count(),
                             scene.emissive_count());
                 ImGui::Text("radius      %.5f", scene.radius());
