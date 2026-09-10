@@ -45,6 +45,9 @@ struct SolveConfig {
     float horizon = 0.02f;         // cos(theta) floor on the receiver side
     float plane_bias = 1.0f;       // in receiver radii
     float soft_eps = 1.0f;         // disc softening d^2 -> d^2 + eps*r^2
+    // Radius beyond which a surfel lights but does not occlude, in world units.
+    // 0 = unlimited. Simulates the FMM's U-list horizon without any FMM code.
+    float near_radius = 0.0f;
 
     // Force EVERY surfel to emit from both faces. Diagnostic only; off.
     //

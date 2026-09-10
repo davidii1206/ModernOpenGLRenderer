@@ -96,6 +96,13 @@ uniform uint  u_ms;              // microbuffer edge: 8 -> 64 buckets, 16 -> 256
 uniform float u_horizon;         // identical to bf_radiance.comp
 uniform float u_plane_bias;      // identical to bf_radiance.comp
 uniform float u_self_cos;        // identical to bf_radiance.comp
+// Occlusion horizon, in world units. Beyond it a surfel still contributes its
+// radiance but never blocks and never wins a bucket's depth test -- which is
+// exactly the FMM's near/far split (spec section 5): the U-list is the only
+// geometry the microbuffer resolves, and everything past it arrives as an
+// unoccluded expansion masked only by near coverage. 0 = unlimited, which is
+// what the brute-force reference does today.
+uniform float u_near;
 uniform float u_soft_eps;        // identical to bf_radiance.comp
 uniform uint  u_two_sided;       // 1 = force every surfel two-sided (diagnostic)
 uniform float u_depth_scale;     // 65535 / u_max_depth
@@ -171,6 +178,10 @@ void main() {
     barrier();
 
     const uint tol_q = uint(max(u_depth_tol, 0.0) * u_depth_scale);
+    // Squared, and hoisted: comparing against d2 costs one compare on a value
+    // the loop already has. The obvious `u_near > 0.0 && dist > u_near` in the
+    // inner loop cost 48% of the solve (22.5 -> 33.4 ms).
+    const float near2 = u_near > 0.0 ? u_near * u_near : 3.4e38;
 
     // === phase A: resolve the depth winner per bucket =======================
     for (uint j = tid; j < u_count; j += kWG) {
@@ -180,6 +191,7 @@ void main() {
         const vec3  dv  = cpr.xyz - posP;
         const float d2  = dot(dv, dv);
         if (d2 < 1e-14) continue;
+        if (d2 > near2) continue;                         // far field: never blocks
         // Same-surface cull: normals agree AND the centre is near the
         // receiver's plane. bf_radiance.comp carries the reasoning and
         // gate 5 requires the two to stay identical.
@@ -308,7 +320,7 @@ void main() {
                 const uint t = uint(y) * ms + uint(x);
 
                 bool front = true;
-                if (u_no_occlusion == 0u) {
+                if (u_no_occlusion == 0u && d2 <= near2) {
                     const uint win = lds_key[t];
                     if (win == kEmpty) continue;
 

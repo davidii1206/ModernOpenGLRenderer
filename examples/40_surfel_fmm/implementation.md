@@ -2418,6 +2418,83 @@ answering every pixel every frame, which is temporal reuse, which is the same
 argument the cache already makes for the indirect term.
 
 
+### Finding 44 — the FMM accelerates transport, and Cornell's image depends on visibility
+
+Before building section 10's steps 3-7, one question is worth an hour: what does
+the FMM's near/far split do to the picture? The answer decides whether this is an
+optimization with assertions or a different algorithm needing re-validation.
+
+**The FMM's visibility horizon is the U-list, and the U-list is tiny.** Section
+4.1 dispatches per leaf cell at `h = 1.5s` and flattens the 27 surrounding cells
+into at most 256 candidates. So the microbuffer resolves geometry within about
++/-1.5 spacings -- **0.044 units in a 2-unit room** -- and everything past it
+arrives as an unoccluded SH expansion, masked only by near coverage (section 5).
+
+**Simulating it needs no FMM code.** `SGI_NEAR` sets an occlusion horizon in
+spacings: beyond it a surfel still lights but never blocks and never wins a
+bucket's depth test. That is the near/far split, minus the SH approximation of
+the far radiance. Full GI, 7 bounces, against the path-traced reference:
+
+| occlusion horizon | ratio | MAE |
+|---|---|---|
+| unlimited (shipped) | 0.949 | 12.94 |
+| 200 spacings | 0.949 | 12.94 |
+| 25 spacings | 0.841 | 15.03 |
+| 12 spacings | 0.838 | 15.17 |
+| 6 spacings | 0.838 | 15.18 |
+| 3 spacings | 0.838 | 15.18 |
+| **1.5 spacings (the spec's h)** | **0.838** | **15.18** |
+| 0.2 spacings | 0.838 | 15.18 |
+
+The 200-spacing row reproducing the unlimited one exactly is what says the knob
+is sound. The rest is the finding: **every horizon from 0.2 to 12 spacings gives
+the identical image.** Nothing in that entire range occludes anything. The
+occlusion that matters starts around 25 spacings and is all at room scale -- the
+boxes and the walls, 0.5 to 2 units, 17 to 69 spacings.
+
+Which is obvious in hindsight. Surfaces are locally flat and the same-surface
+cull already removes a receiver's own neighbours, so there is nothing left within
+a few spacings to block anything. The occluders are the other side of the room.
+
+Visually the near-field-only render flattens: the boxes' faces brighten, the
+contact darkening weakens, and the soft indirect shading that gives the image its
+depth is largely gone.
+
+**Fair caveat.** This simulation is cruder than section 5's prescribed blend. It
+averages far radiance into one `L` per bucket, back-facing zeros included, rather
+than keeping `Lnear` and `Lfar` separate and blending by coverage -- so the
+magnitude of the error is not exactly what the FMM would produce. The structural
+conclusion does not depend on that: in a closed room the near coverage within 1.5
+spacings is essentially zero, so section 5's `(1 - cov)` is essentially 1 and the
+far field arrives unmasked either way. The box casts no indirect shadow.
+
+**Enlarging the U-list is not the fix.** It spans +/-1.5 spacings at 27 cells;
+reaching 25 spacings means +/-16.7 cells, 33^3 = 36000 of them, against a `MAXK`
+of 256.
+
+**The spec half-knows this.** Section 5.1 warns that a sealed room "receives the
+full outdoor sky through its walls, masked only by whatever happens to sit in the
+receiver's own 27-cell U-list", and prescribes a per-cell sky visibility scalar
+for it. The measurement says the same hole applies to *interior* light, not just
+sky, and a per-cell scalar will not close that one -- interior occlusion is
+directional.
+
+**What this means for the plan.** The FMM accelerates the transport, which is
+real and needed: the solve is ~25-30 ms per 2048-receiver slice, ~15 slices a
+sweep, ~400 ms a bounce, and O(N^2). But it does not accelerate visibility, and
+visibility is what this image is made of. Building steps 3-7 first would trade a
+validated image for a fast one and then spend the validation budget getting the
+image back.
+
+The missing piece is a **coarse far-field occluder**, and one is already in the
+tree: the grid's 4x4x4 macro occupancy bitmask is exactly a low-resolution binary
+voxelization of the scene. Marching it per bucket -- a handful of bit tests along
+each bucket's direction -- would restore room-scale occlusion at a cost that does
+not grow with surfel count. That is the piece to build and validate BEFORE the
+FMM, so that when the far field becomes an SH expansion it lands on a visibility
+model that already works.
+
+
 ## Gate results
 
 `SGI_GATE=all SGI_NOGUI=1 ./40_surfel_fmm` — 30 assertions, all pass.

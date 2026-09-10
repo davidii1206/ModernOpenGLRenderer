@@ -42,6 +42,9 @@
 //   SGI_METHOD=0|1          M1 analytic (no occlusion) | M2 microbuffer
 //   SGI_NEE=1               split the direct term out of the microbuffer
 //   SGI_NEE_PIXEL=0         evaluate that direct term per pixel, not per surfel
+//   SGI_NEAR=0              occlusion horizon in SPACINGS; beyond it a surfel
+//                           lights but does not block. 0 = unlimited. Simulates
+//                           the FMM's U-list horizon (finding 44)
 //   SGI_NEE_SKIP=0          skip the march where the cache's neighbours agree
 //                           the light is wholly visible or wholly blocked
 //   SGI_NEE_OCC=2.0         occluder radius scale, visibility only (finding 29)
@@ -133,6 +136,7 @@ struct EnvOpts {
     int   nee = 1;               // SGI_NEE      1 = split direct out of the microbuffer
     int   neepixel = 0;          // SGI_NEE_PIXEL 1 = direct term per pixel, not per surfel
     float neeskip = 0.0f;        // SGI_NEE_SKIP  cache-agreement margin, 0 = off
+    float nearspac = 0.0f;       // SGI_NEAR      occlusion horizon in SPACINGS, 0 = unlimited
     float neethick = 0.25f;      // SGI_NEE_THICK surfel slab half-thickness, in radii
     float neeself = 0.9f;        // SGI_NEE_SELF  same-surface normal agreement
     float neeselftol = 1.0f;     // SGI_NEE_SELF_TOL same-surface plane tolerance, in radii
@@ -207,6 +211,7 @@ EnvOpts read_env() {
     if (const char* v = getenv("SGI_EXPOSURE")) o.exposure = float(atof(v));
     if (const char* v = getenv("SGI_PAUSE"))    o.paused = atoi(v) != 0;
     if (const char* v = getenv("SGI_BIAS"))     o.bias = float(atof(v));
+    if (const char* v = getenv("SGI_NEAR"))     o.nearspac = float(atof(v));
     if (const char* v = getenv("SGI_SOFT"))     o.soft = float(atof(v));
     if (const char* v = getenv("SGI_HORIZON"))  o.horizon = float(atof(v));
     if (const char* v = getenv("SGI_TWOSIDED")) o.twosided = atoi(v);
@@ -357,6 +362,7 @@ int main() {
     cfg.nee_bias = env.neebias;
     cfg.nee_occ = env.neeocc;
     cfg.nee_skip = env.neeskip;
+    cfg.near_radius = env.nearspac > 0.0f ? env.nearspac * scene.spacing() : 0.0f;
     cfg.nee_cuts = env.neecuts != 0;
     if (env.bias >= 0.0f) cfg.plane_bias = env.bias;
     if (env.soft >= 0.0f) cfg.soft_eps = env.soft;

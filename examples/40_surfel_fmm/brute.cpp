@@ -282,6 +282,7 @@ void Solver::dispatch(SurfelSet& set, const SolveConfig& cfg,
         micro_.set("u_horizon", cfg.horizon);
         micro_.set("u_plane_bias", cfg.plane_bias);
         micro_.set("u_self_cos", cfg.nee_self_cos);
+        micro_.set("u_near", cfg.near_radius);
         micro_.set("u_soft_eps", cfg.soft_eps);
         micro_.set("u_two_sided", cfg.two_sided ? 1u : 0u);
         // The microbuffer spans the whole scene: there is no grid yet, so no h
