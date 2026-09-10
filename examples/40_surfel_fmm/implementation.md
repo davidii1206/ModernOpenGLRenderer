@@ -2418,17 +2418,20 @@ answering every pixel every frame, which is temporal reuse, which is the same
 argument the cache already makes for the indirect term.
 
 
-### Finding 44 — the FMM accelerates transport, and Cornell's image depends on visibility
+### Finding 44 — sizing the occlusion pass, which is not the FMM's job
 
-Before building section 10's steps 3-7, one question is worth an hour: what does
-the FMM's near/far split do to the picture? The answer decides whether this is an
-optimization with assertions or a different algorithm needing re-validation.
+**Read this one as a measurement of the OCCLUSION pass, not a criticism of the
+FMM.** The architecture splits the two on purpose: the FMM carries unoccluded
+transport to whatever needs it, and resolving occlusion is a separate, independent
+stage. An earlier version of this finding read the split as the FMM breaking the
+image, which is a misreading -- the FMM is doing exactly its job. What the numbers
+below actually size is the job left over.
 
-**The FMM's visibility horizon is the U-list, and the U-list is tiny.** Section
-4.1 dispatches per leaf cell at `h = 1.5s` and flattens the 27 surrounding cells
-into at most 256 candidates. So the microbuffer resolves geometry within about
-+/-1.5 spacings -- **0.044 units in a 2-unit room** -- and everything past it
-arrives as an unoccluded SH expansion, masked only by near coverage (section 5).
+The microbuffer resolves geometry within the U-list: section 4.1 dispatches per
+leaf cell at `h = 1.5s` and flattens the 27 surrounding cells into at most 256
+candidates, so about +/-1.5 spacings -- **0.044 units in a 2-unit room**. Past
+that, occlusion has to come from somewhere else. The question worth an hour is
+how much there is to do.
 
 **Simulating it needs no FMM code.** `SGI_NEAR` sets an occlusion horizon in
 spacings: beyond it a surfel still lights but never blocks and never wins a
@@ -2479,20 +2482,105 @@ for it. The measurement says the same hole applies to *interior* light, not just
 sky, and a per-cell scalar will not close that one -- interior occlusion is
 directional.
 
-**What this means for the plan.** The FMM accelerates the transport, which is
-real and needed: the solve is ~25-30 ms per 2048-receiver slice, ~15 slices a
-sweep, ~400 ms a bounce, and O(N^2). But it does not accelerate visibility, and
-visibility is what this image is made of. Building steps 3-7 first would trade a
-validated image for a fast one and then spend the validation budget getting the
-image back.
+**What this sizes.** The occlusion pass has to cover 0.838 -> 0.949 in ratio and
+15.18 -> 12.94 in MAE, and it has to do it at room scale rather than near scale,
+because that is where all of it is. Nothing it does inside 12 spacings will
+register.
 
-The missing piece is a **coarse far-field occluder**, and one is already in the
-tree: the grid's 4x4x4 macro occupancy bitmask is exactly a low-resolution binary
-voxelization of the scene. Marching it per bucket -- a handful of bit tests along
-each bucket's direction -- would restore room-scale occlusion at a cost that does
-not grow with surfel count. That is the piece to build and validate BEFORE the
-FMM, so that when the far field becomes an SH expansion it lands on a visibility
-model that already works.
+The structure to build it on is already in the tree: the grid's 4x4x4 macro
+occupancy bitmask is a low-resolution binary voxelization of the scene. Marched
+per bucket -- a handful of bit tests along each bucket's direction -- it gives a
+far-field visibility scalar at a cost that does not grow with surfel count, which
+is the property the FMM has for transport and the microbuffer does not have for
+visibility.
+
+Worth building and validating BEFORE the FMM, for a reason that has nothing to do
+with the FMM being at fault: the near/far blend of section 5 is the seam the two
+meet at, and it is easier to get that seam right against an exact far field
+(today's all-pairs) than against an SH approximation of one. Once the occlusion
+pass holds the image at `SGI_NEAR=1.5`, the far field can become an expansion
+without the two changes being confounded.
+
+
+### Finding 45 — the far field needs cell radiance, not surfel radiance
+
+Building the occlusion pass finding 44 sized. Three pieces landed, in order, each
+one measured.
+
+**1. Section 5's blend, properly separated.** `lds_cov_far` / `lds_rad_far` hold
+the far field apart from the near, and the integrate is
+`Lin = L * fill + Efar * (1 - fill)`. With no horizon set nothing is far and this
+reduces to `mix(u_sky, L, fill)` exactly -- byte-identical to the shipped
+reference, which is the assertion this rests on.
+
+Two errors on the way, both worth keeping:
+
+* **The far share is not composited by its own coverage.** `cov_far * (1 - fill)`
+  leaves partially-covered buckets dark: ratio 0.533 against 0.838. The far field
+  is a directional estimate for the rest of the bucket, not a second layer.
+* **The far field is a SUMMED irradiance, not an averaged radiance.**
+  `rad_far / cov_far` is the mean radiance of everything in the bucket -- near
+  wall, far wall and back faces alike -- and it reads far darker than the truth.
+  The FMM expands radiant *intensity* for exactly this reason: it sums flux, it
+  does not average radiance.
+
+And one bug that looked like neither: the far branch sat *after* the winner
+block, which bails on an empty bucket -- and a bucket whose only geometry is far
+IS empty, because phase A skips far candidates. Every far candidate was dropped.
+The symptom was three different far-field formulas producing bit-identical black
+rooms, which is what said the branch was never running at all.
+
+With the far field working and nothing occluding it, `SGI_NEAR=1.5` gives ratio
+**1.043**, against 0.949 for exact all-pairs -- too bright, dark bands twice the
+reference. That is the hole, now measured from the other side.
+
+**2. The coarse march.** `sgi_far_horizon` DDAs the grid's macro occupancy
+bitmask -- one bit per 4x4x4 cell block, ~2 spacings -- from the near horizon
+outwards, per bucket, and reports the distance to the first occupied block. Cost
+is a DDA per bucket and does not grow with surfel count.
+
+It needs the ray lifted a full macro block off the receiver's own plane. A block
+(0.059 units) is WIDER than the near horizon (0.044), so a march started at the
+receiver hits the block its own surface occupies on the first test and reports
+everything as blocked: a black room. Lifted, a grazing ray travels above its own
+plane's blocks and gains height as it goes.
+
+**3. And it does not work with a distance window.** Culling far candidates at
+`t_first` throws away the very surface the march just found, because the march
+returns where the block STARTS and the surfels are inside it. A slack window past
+the first hit trades one error against the other:
+
+| slack, in macro blocks | ratio | MAE | band 5-15 |
+|---|---|---|---|
+| 1.5 | 0.707 | 21.66 | 0.55 |
+| 3 | 0.830 | 16.03 | 2.77 |
+| 6 | 0.869 | 14.66 | 5.80 |
+| 1000 (no far occlusion) | 1.043 | 12.92 | 21.53 |
+| **exact all-pairs** | **0.949** | **12.94** | **10.62** |
+
+The 1000-block row reproducing the un-occluded result exactly is what says the
+plumbing is right. The rest says no value of it is correct: a surface seen at a
+grazing angle spans many blocks along the ray, so any window wide enough to keep
+it also admits the surface behind it. This is the same lesson the microbuffer
+already learned -- "the winner's SUPPORTING PLANE, not its depth" -- and the same
+fix is not available here, because the far field is supposed to be cheap and a
+per-candidate plane test is the all-pairs cost again.
+
+Note also that MAE is the wrong instrument for this one: it reads 12.92 for the
+un-occluded far field against 12.94 for exact, while the 5-15 band is twice the
+reference. The bands are what to watch.
+
+**What the measurement actually says.** The mismatch is not in the occlusion, it
+is in the pairing: far *radiance* still comes from individual surfels while far
+*occlusion* comes from voxels, and the two disagree about what a surface is.
+
+In the FMM they do not. The far field's radiance comes from CELLS, so a march
+that stops at the first occupied cell takes that cell's aggregate and there is no
+window to tune -- the cell you hit is the surface you see. That is the version to
+build: a per-block mean outgoing radiance, one cheap reduction over surfels per
+sweep, sampled at the march's first hit. It is an order-0 multipole, it deletes
+the far candidate loop entirely rather than making it cheaper, and it is the
+first real piece of the FMM rather than a stand-in for it.
 
 
 ## Gate results

@@ -283,6 +283,19 @@ void Solver::dispatch(SurfelSet& set, const SolveConfig& cfg,
         micro_.set("u_plane_bias", cfg.plane_bias);
         micro_.set("u_self_cos", cfg.nee_self_cos);
         micro_.set("u_near", cfg.near_radius);
+        // The far-field occluder. The macro bitmask is a low-resolution binary
+        // voxelization of the scene and it is already built; marching it per
+        // bucket is what stops the far field arriving through walls.
+        if (grid_ != nullptr && grid_->valid()) {
+            grid_->bind();
+            micro_.set("u_grid_min", grid_->min());
+            micro_.set("u_macro_res", grid_->macro_res());
+            micro_.set("u_macro_cell", grid_->cell() * 4.0f);
+            micro_.set("u_far_occ", cfg.far_occlusion ? 1u : 0u);
+            micro_.set("u_far_slack", cfg.far_slack);
+        } else {
+            micro_.set("u_far_occ", 0u);
+        }
         micro_.set("u_soft_eps", cfg.soft_eps);
         micro_.set("u_two_sided", cfg.two_sided ? 1u : 0u);
         // The microbuffer spans the whole scene: there is no grid yet, so no h

@@ -48,6 +48,11 @@ struct SolveConfig {
     // Radius beyond which a surfel lights but does not occlude, in world units.
     // 0 = unlimited. Simulates the FMM's U-list horizon without any FMM code.
     float near_radius = 0.0f;
+    // March the grid's macro occupancy bitmask per bucket to find how far the
+    // far field can reach before something is in the way. Only meaningful with
+    // near_radius set, since without a horizon nothing is far.
+    bool far_occlusion = true;
+    float far_slack = 1.5f;        // depth window past the first hit, in macro blocks
 
     // Force EVERY surfel to emit from both faces. Diagnostic only; off.
     //
