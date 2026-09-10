@@ -247,18 +247,20 @@ void SurfelSet::build(const std::vector<Tri>& tris, uint32_t target_count, uint3
 
     count_ = uint32_t(pos_rad_.size());
 
-    // bf_micro.comp packs the microbuffer winner as depth16 | index16, so a set
-    // larger than this would alias winners onto the wrong surfel. Assert rather
-    // than truncate: a silently wrong reference is worse than no reference.
-    if (count_ > 65535u) {
-        gllib::logf(gllib::LogLevel::error,
-                    "surfel count %u exceeds the 65535 the microbuffer key can address; "
-                    "lower the target count", count_);
-        count_ = 65535u;
-        pos_rad_.resize(count_); normal_.resize(count_);
-        albedo_.resize(count_);  emission_.resize(count_);
-        tri_of_.resize(count_);
-    }
+    // bf_micro.comp's winner key is depth16 | index16, and the index is LOCAL to
+    // the U-list whenever there is one -- so the set size is not what has to fit
+    // in sixteen bits, the candidate list is. Truncating here instead is what
+    // left Sponza at coverage 0.229 (finding 49).
+    //
+    // The all-pairs path has no candidate list and does still store a global
+    // index. Solver::dispatch refuses that combination rather than aliasing
+    // winners onto the wrong surfel; this only warns, because whether it matters
+    // depends on a config the bake cannot see.
+    if (count_ > 65536u)
+        gllib::logf(gllib::LogLevel::info,
+                    "surfel count %u exceeds 65536: the microbuffer needs its U-list "
+                    "path (SGI_NEAR > 0) above that, the all-pairs path cannot index it",
+                    count_);
     upload();
 
     bake_seconds_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();

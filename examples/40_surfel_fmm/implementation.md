@@ -2803,6 +2803,68 @@ A/B pairs taken in the same session are worth quoting, and every ratio in these
 findings is one. The absolute figures are scale, not measurement.
 
 
+### Finding 50 — the index cap was the U-list's to lift
+
+`bf_micro.comp` packs its winner as `depth16 | index16`, and the index was the
+GLOBAL surfel index, so the bake truncated any set past 65536. Sponza wants
+285594 and was cut to 65535, which is how it ended up at coverage 0.229 against
+gate 6's 1.0 -- every surface holed (finding 49).
+
+The spec's own key is `packEntry(depth, j)` with **j local to the U-list**, and
+step 3 is what made that available: the candidate list is at most `kMaxCand`, so
+sixteen bits is generous where ten would do. The plane pass resolves back through
+`lds_cand`. The all-pairs path has no list to be local to, still stores a global
+index, and `Solver::dispatch` now refuses it above 65536 rather than aliasing
+winners onto the wrong surfel.
+
+| Sponza bake | surfels | coverage |
+|---|---|---|
+| before | 65535 | 0.229 |
+| after | **285594** | **1.000000** |
+
+**Two things it cost.**
+
+*An off-by-one.* A 16-bit field addresses 0..65535, so a set of exactly 65536 is
+the largest whose last index still fits. Gate 13's 32k rows build precisely that
+-- two planes of 32768 -- and refusing at `> 65535` failed the gate at 100%
+error. The bound is `> 65536`.
+
+*A tie-break.* `atomicMin` on `depth | index` picks the lower index when two
+candidates quantize to the same depth, and the index changed, so ties resolve to
+a different surfel. 130038 pixels move at `SGI_NEAR=1.5`. It is arbitrary either
+way and it costs nothing measurable: ratio 0.926 both ways, MAE 14.57 -> 14.61.
+
+### Defaults: three bounces, two denoise iterations
+
+| | ratio | MAE |
+|---|---|---|
+| 7 bounces, filter 6 | 0.948 | 12.98 |
+| 7 bounces, filter 2 | 0.948 | 13.02 |
+| 3 bounces, filter 6 | 0.913 | 12.96 |
+| **3 bounces, filter 2** | **0.913** | **13.01** |
+
+Three bounces costs 3.5% of the global energy and nothing in MAE; two denoise
+iterations cost nothing either, and on Sponza the denoise is most of the frame.
+
+### Sponza at full density
+
+| | |
+|---|---|
+| surfels | 285594, coverage 1.000000, bake 19.6 ms, 16.3 MB |
+| grid | 253174 occupied cells, 2.8M entries, 66.9 MB, **max 2605 in one cell** |
+| solve | 57-72 ms per 2048-receiver slice (near 0.5 - 1.5) |
+| per bounce | 139 slices, so **8-10 seconds** |
+| reconstruct | 308 ms |
+
+The solve grows smoothly from `SGI_NEAR=0.5` to 1.5 with no cliff, so the U-list
+is not overflowing into the all-pairs fallback -- this is finding 48's fixed
+per-receiver cost again, now multiplied by 4.4x the density and a grid that no
+longer fits in cache.
+
+Cornell's numbers are unchanged where they should be: direct MAE 5.81, 30/30
+gates.
+
+
 ## Gate results
 
 `SGI_GATE=all SGI_NOGUI=1 ./40_surfel_fmm` — 30 assertions, all pass.

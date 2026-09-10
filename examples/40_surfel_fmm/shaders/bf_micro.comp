@@ -144,7 +144,19 @@ const uint kWG     = 128u;
 // clear. Quantization is 1.5e-5 against indirect radiances around 0.05.
 const float kFixed = 65536.0;
 
-shared uint lds_key[kMaxMS2];     // depth16 | index16
+// depth16 | index16, where the index is LOCAL to the U-list when there is one.
+//
+// A global index caps the set at 65535 surfels, which Sponza exceeds four times
+// over -- its bake wants 285594 and was truncated to 65535, leaving coverage at
+// 0.229 against gate 6's 1.0 (finding 49). The spec's own key is packEntry(depth,
+// j) with "j is LOCAL, 0..K-1" for exactly this reason: the U-list is at most
+// kMaxCand entries, so ten bits would do and sixteen is generous.
+//
+// The all-pairs path has no candidate array to be local to, so it still stores a
+// global index and still carries the cap. That path is the O(N^2) reference and
+// is unusable at those counts anyway; Solver::dispatch refuses it rather than
+// letting it alias winners onto the wrong surfel.
+shared uint lds_key[kMaxMS2];
 shared vec4 lds_plane[kMaxMS2];   // winner's supporting plane, (n.xyz, -dot(n, p))
 // Two coverage accumulators, because a bucket asks two different questions.
 //
@@ -324,6 +336,7 @@ void main() {
     // === phase A: resolve the depth winner per bucket =======================
     for (uint jj = tid; jj < ncand; jj += kWG) {
         const uint j = ulist ? lds_cand[jj] : jj;
+        const uint idx_local = jj;          // what the key stores; see lds_key
         if (j == P) continue;
 
         const vec4  cpr = s_pos_rad[j];
@@ -363,7 +376,7 @@ void main() {
         const int   pr    = min(int(ceil(kr + 0.5)), int(ms));
 
         const uint qd  = min(uint(depth * u_depth_scale), 65535u);
-        const uint key = (qd << 16) | (j & 0xFFFFu);
+        const uint key = (qd << 16) | (idx_local & 0xFFFFu);
 
         for (int y = max(0, c.y - pr); y <= min(int(ms) - 1, c.y + pr); ++y)
             for (int x = max(0, c.x - pr); x <= min(int(ms) - 1, c.x + pr); ++x)
@@ -385,7 +398,8 @@ void main() {
     for (uint b = tid; b < ms2; b += kWG) {
         const uint key = lds_key[b];
         if (key == kEmpty) { lds_plane[b] = vec4(0.0); continue; }
-        const uint jw = key & 0xFFFFu;
+        const uint jl = key & 0xFFFFu;
+        const uint jw = ulist ? lds_cand[jl] : jl;
         const vec3 pw = s_pos_rad[jw].xyz;
         const vec3 nw = surfel_normal(jw);
         lds_plane[b] = vec4(nw, -dot(nw, pw));
@@ -418,6 +432,7 @@ void main() {
     // === phase B: accumulate coverage and radiance on the winning surface ====
     for (uint jj = tid; jj < ncand; jj += kWG) {
         const uint j = ulist ? lds_cand[jj] : jj;
+        const uint idx_local = jj;          // what the key stores; see lds_key
         if (j == P) continue;
 
         const vec4  cpr = s_pos_rad[j];

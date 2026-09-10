@@ -34,7 +34,7 @@
 //   SGI_MODEL=path.glb      CornellBoxOriginal.glb; the references only match it
 //   SGI_SURFELS=30000       target count; the bake floors at one per triangle
 //   SGI_BUCKETS=16          microbuffer edge, 8 or 16
-//   SGI_BOUNCES=8           max sweeps; sweep k == k bounces under per-pixel NEE
+//   SGI_BOUNCES=3           max sweeps; sweep k == k bounces under per-pixel NEE
 //   SGI_SOLVE=n             pre-solve n sweeps, then hold (scripted shots)
 //   SGI_PAUSE=1             hold the solver from frame 0; with SGI_SOLVE=0 the
 //                           cache stays zero, which is how a direct-only shot
@@ -114,7 +114,7 @@ struct EnvOpts {
                                      // numeric comparison)
     uint32_t surfels = 30000;    // SGI_SURFELS
     uint32_t budget  = 2048;     // SGI_BUDGET   receivers per frame
-    uint32_t bounces = 8;        // SGI_BOUNCES  sweeps; 1 == direct only
+    uint32_t bounces = 3;        // SGI_BOUNCES  sweeps; 1 == direct only
     uint32_t buckets = 16;       // SGI_BUCKETS  microbuffer edge (8 or 16)
     int   method = 1;            // SGI_METHOD   0 = M1 radiance, 1 = M2 micro
     float sky = 0.0f;            // SGI_SKY
@@ -174,7 +174,7 @@ struct EnvOpts {
     // the cache and then the stop is doing its original job.
     float lsigma = 0.0f;         // SGI_LIGHT_SIGMA edge-stop width, 0 = off
     float lgrad = 0.5f;          // SGI_LIGHT_GRAD  trust in the visibility gradient, 0..1
-    int   filter = 6;            // SGI_FILTER   cache denoise iterations, 0 = off
+    int   filter = 2;            // SGI_FILTER   cache denoise iterations, 0 = off
     float fradius = 3.0f;        // SGI_FILTER_R denoise radius, in spacings
 };
 

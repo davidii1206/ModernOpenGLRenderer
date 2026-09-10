@@ -275,6 +275,25 @@ void Solver::dispatch(SurfelSet& set, const SolveConfig& cfg,
     // Emitter visibility is always written by the microbuffer solver: it is one
     // float per surfel and everything downstream that averages surfels together
     // needs it to avoid averaging across a shadow boundary.
+    // The all-pairs microbuffer stores a GLOBAL surfel index in its 16-bit key
+    // field, so above 65535 it would alias winners onto the wrong surfel and
+    // report a plausible wrong image. The U-list path stores a local index and
+    // has no such limit. Refuse rather than corrupt.
+    // 65536, not 65535: a 16-bit field addresses 0..65535, so a set of exactly
+    // 65536 is the largest one whose last index still fits. Gate 13's 32k rows
+    // build precisely that, and an off-by-one here refused them.
+    if (cfg.method == Method::Micro && set.count() > 65536u && cfg.near_radius <= 0.0f) {
+        static bool said = false;
+        if (!said) {
+            gllib::logf(gllib::LogLevel::error,
+                        "%u surfels with SGI_NEAR=0: the all-pairs microbuffer indexes "
+                        "winners in 16 bits and cannot address this set. Set SGI_NEAR > 0 "
+                        "to use the U-list path, or lower SGI_SURFELS.", set.count());
+            said = true;
+        }
+        return;
+    }
+
     if (cfg.method == Method::Micro && light_count_ != set.count()) {
         const std::vector<float> zero(set.count(), 0.0f);
         b_light_.data(zero.data(), zero.size() * sizeof(float));
