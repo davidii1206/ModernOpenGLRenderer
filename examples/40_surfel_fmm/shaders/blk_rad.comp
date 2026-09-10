@@ -1,0 +1,58 @@
+#version 460 core
+layout(local_size_x = 256) in;
+
+// ---------------------------------------------------------------------------
+// Order-0 multipole: the mean outgoing radiance of each 4x4x4 macro block.
+//
+// This is the smallest useful piece of an FMM. The far field's radiance has to
+// come from CELLS rather than from individual surfels, and finding 45 is the
+// measurement that says why: pairing per-surfel radiance with per-voxel
+// occlusion leaves the two disagreeing about where a surface ends, and no depth
+// window reconciles them. A march that stops at the first occupied block and
+// takes THAT BLOCK's radiance has no window to tune -- the cell you hit is the
+// surface you see.
+//
+// Order 0 means one radiance per block, with no directional variation, so a
+// block holding two faces of a corner reports their average whichever side you
+// look from. Section 1.2's order-2 SH is where that gets fixed; this is the
+// version that can be built and measured today.
+//
+// Fixed point because GLSL has no float atomicAdd in core. Indirect radiances
+// here are ~0.05 and a block holds a few dozen surfels, so the sum stays five
+// orders clear of 2^32 at kFixed = 65536.
+// ---------------------------------------------------------------------------
+
+#include "surfel.glsl"
+
+layout(std430, binding = 6)  readonly buffer Lout   { vec4 lout[]; };
+layout(std430, binding = 24)          buffer BlkRad { uint blk[]; };
+
+uniform uint  u_count;
+uniform uint  u_words;        // blocks * 4
+uniform vec3  u_grid_min;
+uniform ivec3 u_macro_res;
+uniform float u_macro_cell;
+uniform uint  u_clear;        // 1 = zero the buffer, 0 = accumulate
+
+const float kFixed = 65536.0;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+
+    if (u_clear != 0u) {
+        if (i < u_words) blk[i] = 0u;
+        return;
+    }
+    if (i >= u_count) return;
+
+    const ivec3 m = ivec3(floor((s_pos_rad[i].xyz - u_grid_min) / u_macro_cell));
+    if (any(lessThan(m, ivec3(0))) || any(greaterThanEqual(m, u_macro_res))) return;
+    const uint mb = uint(m.x) + uint(u_macro_res.x) *
+                    (uint(m.y) + uint(u_macro_res.y) * uint(m.z));
+
+    const vec3 L = lout[i].rgb;
+    atomicAdd(blk[mb * 4u + 0u], uint(max(L.r, 0.0) * kFixed + 0.5));
+    atomicAdd(blk[mb * 4u + 1u], uint(max(L.g, 0.0) * kFixed + 0.5));
+    atomicAdd(blk[mb * 4u + 2u], uint(max(L.b, 0.0) * kFixed + 0.5));
+    atomicAdd(blk[mb * 4u + 3u], 1u);
+}

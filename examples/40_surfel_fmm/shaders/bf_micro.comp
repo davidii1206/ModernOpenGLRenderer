@@ -78,7 +78,9 @@ layout(std430, binding = 17) buffer LightMax { uint light_max[]; };
 layout(std430, binding = 20) readonly buffer DirectIn { vec4 direct_e[]; };
 // The grid's coarse occupancy, one bit per 4x4x4 cell block. A binary
 // voxelization of the scene at ~4 spacings, already built for the NEE march.
-layout(std430, binding = 21) readonly buffer Macro { uint macro_bits[]; };
+layout(std430, binding = 21) readonly buffer Macro  { uint macro_bits[]; };
+// Order-0 multipole: sum(L_out) and a count per macro block. See blk_rad.comp.
+layout(std430, binding = 24) readonly buffer BlkRad { uint blk[]; };
 uniform uint u_store_light;
 // With NEE on, light_vis comes from the direct pass's bitmask (64 stratified
 // samples of the emitter, noise-free) instead of this kernel's emissive-coverage
@@ -110,7 +112,6 @@ uniform uint  u_far_occ;         // 1 = march the macro bitmask for a far horizo
 uniform vec3  u_grid_min;
 uniform ivec3 u_macro_res;
 uniform float u_macro_cell;      // world size of one macro block
-uniform float u_far_slack;       // depth window past the first hit, in macro blocks
 uniform float u_soft_eps;        // identical to bf_radiance.comp
 uniform uint  u_two_sided;       // 1 = force every surfel two-sided (diagnostic)
 uniform float u_depth_scale;     // 65535 / u_max_depth
@@ -160,11 +161,9 @@ shared uint lds_cov_emit[kMaxMS2];
 // one accumulator loses that -- a far surface behind a near one would average
 // into its radiance instead of being hidden by it, and there would be nowhere to
 // apply a far-field visibility term.
-shared uint lds_cov_far[kMaxMS2];
-// Distance along each bucket's direction to the first occupied macro block past
-// the near horizon: how far the far field can see before geometry is in the way.
-shared float lds_far_t[kMaxMS2];
-shared uint lds_rad_far[kMaxMS2 * 3u];
+// The far field's radiance per bucket: the mean outgoing radiance of the first
+// occupied macro block along the bucket's direction past the near horizon.
+shared vec3 lds_far_L[kMaxMS2];
 // Cross-thread reduction of the per-bucket integral, one slot per invocation.
 shared vec3  lds_red[kWG];
 shared float lds_vis[kWG];
@@ -178,8 +177,8 @@ bool sgi_macro_at(ivec3 m) {
     return (macro_bits[mb >> 5u] & (1u << (mb & 31u))) != 0u;
 }
 
-// Distance to the first occupied macro block along P + t*d, searching from
-// t_start outwards. Returns t_max if the ray leaves the grid or finds nothing.
+// Index of the first occupied macro block along P + t*d, searching from t_start
+// outwards. -1 if the ray leaves the grid or finds nothing.
 //
 // This is the far field's occluder, and it is deliberately coarse: one bit per
 // 4x4x4 cell block, ~4 spacings, no surfel data touched at all. Its cost is a
@@ -190,7 +189,12 @@ bool sgi_macro_at(ivec3 m) {
 // It starts at the NEAR HORIZON rather than at the receiver, because everything
 // inside that is the microbuffer's job and the receiver's own block is occupied
 // by its own surface.
-float sgi_far_horizon(vec3 P, vec3 d, float t_start, float t_max) {
+//
+// Returning the BLOCK rather than a distance is what removes the depth window
+// finding 45 could not tune: the block it stops at is the surface the bucket
+// sees, and its aggregate radiance is what the far field contributes. There is
+// nothing left to trade off.
+int sgi_far_block(vec3 P, vec3 d, float t_start, float t_max) {
     const float h = u_macro_cell;
     const vec3  p0 = P + d * t_start;
     const vec3  g  = (p0 - u_grid_min) / h;
@@ -206,8 +210,10 @@ float sgi_far_horizon(vec3 P, vec3 d, float t_start, float t_max) {
     float t = t_start;
     for (int i = 0; i < 96; ++i) {
         if (any(lessThan(c, ivec3(0))) || any(greaterThanEqual(c, u_macro_res)))
-            return t_max;
-        if (sgi_macro_at(c)) return t;
+            return -1;
+        if (sgi_macro_at(c))
+            return int(uint(c.x) + uint(u_macro_res.x) *
+                       (uint(c.y) + uint(u_macro_res.y) * uint(c.z)));
         if (tnext.x < tnext.y && tnext.x < tnext.z) {
             c.x += stp.x; t = t_start + tnext.x; tnext.x += tdelta.x;
         } else if (tnext.y < tnext.z) {
@@ -215,9 +221,9 @@ float sgi_far_horizon(vec3 P, vec3 d, float t_start, float t_max) {
         } else {
             c.z += stp.z; t = t_start + tnext.z; tnext.z += tdelta.z;
         }
-        if (t >= t_max) return t_max;
+        if (t >= t_max) return -1;
     }
-    return t_max;
+    return -1;
 }
 
 void main() {
@@ -245,10 +251,6 @@ void main() {
         lds_rad[b * 3u + 1u] = 0u;
         lds_rad[b * 3u + 2u] = 0u;
         lds_cov_emit[b] = 0u;
-        lds_cov_far[b] = 0u;
-        lds_rad_far[b * 3u + 0u] = 0u;
-        lds_rad_far[b * 3u + 1u] = 0u;
-        lds_rad_far[b * 3u + 2u] = 0u;
     }
     barrier();
 
@@ -328,26 +330,26 @@ void main() {
     }
     barrier();
 
-    // === the far field's own horizon, one DDA per bucket ====================
+    // === the far field, one DDA per bucket ==================================
     for (uint b = tid; b < ms2; b += kWG) {
-        lds_far_t[b] = 3.4e38;
+        lds_far_L[b] = vec3(0.0);
         if (u_far_occ == 0u || u_near <= 0.0) continue;
         const vec3 ld = bucket[b * 2u + 0u].xyz;          // tangent-frame direction
         const vec3 wd = normalize(T * ld.x + B * ld.y + nP * ld.z);
-        // Lift the origin a full macro block off the receiver's own plane
-        // before marching. A macro block is 4 cells -- 0.059 units here --
-        // which is WIDER than the near horizon, so a march started at the
-        // receiver hits the block its own surface occupies on the first test
-        // and reports everything beyond as blocked. That rendered the room
-        // black. Lifted, a grazing ray travels above its own plane's blocks
-        // instead of through them, and gains height as it goes because
-        // cosP > 0 for every bucket.
-        //
-        // The lift is perpendicular to the ray, so the t it returns is measured
-        // from a slightly different origin than the `dist` it is compared
-        // against. At this resolution that is far below a block.
-        const vec3 org = posP + nP * u_macro_cell;
-        lds_far_t[b] = sgi_far_horizon(org, wd, u_near, 3.4e38);
+        // Lift the origin a full macro block off the receiver's own plane before
+        // marching. A macro block is 4 cells -- wider than the near horizon --
+        // so a march started at the receiver hits the block its own surface
+        // occupies on the first test and reports everything beyond as blocked.
+        // That rendered the room black. Lifted, a grazing ray travels above its
+        // own plane's blocks and gains height as it goes, because cosP > 0 for
+        // every bucket.
+        const int mb = sgi_far_block(posP + nP * u_macro_cell, wd, u_near, 3.4e38);
+        if (mb < 0) continue;
+        const uint base = uint(mb) * 4u;
+        const float n = float(blk[base + 3u]);
+        if (n < 0.5) continue;
+        lds_far_L[b] = vec3(float(blk[base + 0u]), float(blk[base + 1u]),
+                            float(blk[base + 2u])) * (1.0 / (kFixed * n));
     }
     barrier();
 
@@ -420,29 +422,11 @@ void main() {
                 const float cov = scale * kw;
                 const uint  qcov = uint(cov * kFixed + 0.5);
 
-                // Past the occlusion horizon: radiance only, into its own
-                // accumulator, no coverage and no depth. It must be taken BEFORE
-                // the winner block below, which bails on an empty bucket -- and a
-                // bucket whose only geometry is far IS empty, because phase A
-                // skipped it. Putting this after that bail dropped every far
-                // candidate and rendered a black room, while looking like three
-                // different far-field formulas that all agreed.
-                if (d2 > near2) {
-                    // Behind the first thing the coarse march found: this surfel
-                    // is on the far side of a wall and must not be seen.
-                    //
-                    // Plus a block of slack, because the march returns where the
-                    // occupied block STARTS and the surfels that made it occupied
-                    // are inside it -- culling at the entry distance throws away
-                    // the very surface the march just found, which is most of the
-                    // room. A block is 4 cells, about two surfel layers.
-                    if (dist > lds_far_t[t] + u_far_slack * u_macro_cell) continue;
-                    atomicAdd(lds_cov_far[t], qcov);
-                    atomicAdd(lds_rad_far[t * 3u + 0u], uint(cov * Lj.r * kFixed + 0.5));
-                    atomicAdd(lds_rad_far[t * 3u + 1u], uint(cov * Lj.g * kFixed + 0.5));
-                    atomicAdd(lds_rad_far[t * 3u + 2u], uint(cov * Lj.b * kFixed + 0.5));
-                    continue;
-                }
+                // Past the occlusion horizon the surfel contributes nothing
+                // here. Its radiance reaches the receiver through its BLOCK, via
+                // the march above, and counting it twice is the same
+                // double-count the near/far split exists to avoid.
+                if (d2 > near2) continue;
 
                 bool front = true;
                 if (u_no_occlusion == 0u) {
@@ -556,35 +540,16 @@ void main() {
         // With no horizon set nothing is far, cov_far is zero, and this reduces
         // to mix(u_sky, L, fill) exactly, which is the assertion that keeps the
         // brute-force reference reproducible.
-        const float cov_far = float(lds_cov_far[b]) * (1.0 / kFixed);
-
-        // Section 5's blend, written out: the near field covers `fill` of the
-        // bucket and the far field is the radiance for the rest. Not composited
-        // by its own coverage -- the far field is a directional estimate, not a
-        // second layer, and in a closed room every direction the near field does
-        // not cover hits something. Weighting it by cov_far measured ratio 0.533
-        // / MAE 32.23 against 0.838 / 15.18.
+        // Section 5's blend: the near field covers `fill` of the bucket, the
+        // far field is the radiance for the rest. Both are radiances, so the
+        // bucket's contribution is the blend times INTEGRAL(cos dOmega).
         //
-        // With no horizon set nothing is far and this is mix(u_sky, L, fill)
-        // exactly, which is the assertion that keeps the reference reproducible.
+        // With no horizon set nothing is far, lds_far_L is zero, and this is
+        // mix(u_sky, L, fill) exactly -- the assertion that keeps the
+        // brute-force reference reproducible.
         vec3 Lin;
-        if (cov_far > 1e-6) {
-            // The far field is a SUMMED irradiance contribution, not an averaged
-            // radiance. lds_rad_far already holds SUM(cov * L), and a bucket's
-            // irradiance is that times wcos -- dividing by cov_far first turns
-            // it into the mean radiance of everything in the bucket, near wall
-            // and far wall and back faces alike, which measured ratio 0.533
-            // against 0.838 for not separating them at all. The FMM's far field
-            // is an expansion of radiant intensity for exactly this reason: it
-            // sums flux, it does not average radiance.
-            //
-            // Masked by whatever the near field covers. What it is NOT masked by
-            // yet is anything at far range, so a bucket that sees three surfaces
-            // counts all three -- that is the hole the occlusion pass fills.
-            const vec3 Efar = vec3(float(lds_rad_far[b * 3u + 0u]),
-                                   float(lds_rad_far[b * 3u + 1u]),
-                                   float(lds_rad_far[b * 3u + 2u])) * (1.0 / kFixed);
-            Lin = L * fill + Efar * (1.0 - fill);
+        if (u_far_occ != 0u && u_near > 0.0) {
+            Lin = L * fill + lds_far_L[b] * (1.0 - fill);
         } else {
             Lin = mix(u_sky, L, fill);
         }

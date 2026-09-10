@@ -52,7 +52,6 @@ struct SolveConfig {
     // far field can reach before something is in the way. Only meaningful with
     // near_radius set, since without a horizon nothing is far.
     bool far_occlusion = true;
-    float far_slack = 1.5f;        // depth window past the first hit, in macro blocks
 
     // Force EVERY surfel to emit from both faces. Diagnostic only; off.
     //
@@ -141,6 +140,7 @@ enum SolverBinding : uint32_t {
     kBindBucket = 7,
     kBindLightVis = 16, // float[N]     cosine-weighted emitter visibility
     kBindDirect   = 20, // vec4[N]      NEE direct irradiance
+    kBindBlkRad   = 24, // uint[blocks*4]  order-0 multipole: sum(L_out), count
     kBindLightMax = 17, // uint[1]      running max of the above, bit-cast float
 };
 
@@ -197,7 +197,7 @@ private:
                   uint32_t first, uint32_t slice, uint32_t frame);
     void end_sweep(SurfelSet& set, bool collect_stats);
 
-    Pipeline lout_prog_, radiance_, micro_, direct_;
+    Pipeline lout_prog_, radiance_, micro_, direct_, blk_prog_;
     std::unique_ptr<PassTimer> timer_;
 
     gl::Buffer b_lout_  {gl::BufferType::shader, gl::BufferUsage::dynamic_draw};
@@ -205,6 +205,9 @@ private:
     gl::Buffer b_light_ {gl::BufferType::shader, gl::BufferUsage::dynamic_draw};
     gl::Buffer b_light_max_{gl::BufferType::shader, gl::BufferUsage::dynamic_draw};
     gl::Buffer b_direct_{gl::BufferType::shader, gl::BufferUsage::dynamic_draw};
+    // Order-0 multipole, one (sum L_out, count) per macro block.
+    gl::Buffer b_blk_   {gl::BufferType::shader, gl::BufferUsage::dynamic_draw};
+    uint32_t   blk_words_ = 0;
     uint32_t   direct_count_ = 0;
     // The direct term depends only on geometry and emission, not on the sweep's
     // irradiance, so it is computed once per solve rather than once per sweep.

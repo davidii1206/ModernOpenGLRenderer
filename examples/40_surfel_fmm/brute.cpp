@@ -101,14 +101,17 @@ bool Solver::init() {
     radiance_  = Pipeline::compute("shaders/bf_radiance.comp");
     micro_     = Pipeline::compute("shaders/bf_micro.comp");
     direct_    = Pipeline::compute("shaders/nee_direct.comp");
+    blk_prog_  = Pipeline::compute("shaders/blk_rad.comp");
     timer_     = std::make_unique<PassTimer>("Solve");
-    return lout_prog_.valid() && radiance_.valid() && micro_.valid();
+    return lout_prog_.valid() && radiance_.valid() && micro_.valid() &&
+           blk_prog_.valid();
 }
 
 bool Solver::poll() {
     bool changed = lout_prog_.poll();
     changed |= radiance_.poll();
     changed |= micro_.poll();
+    changed |= blk_prog_.poll();
     return changed;
 }
 
@@ -162,6 +165,32 @@ void Solver::run_lout(SurfelSet& set, const SolveConfig& cfg) {
     lout_prog_.set("u_add_direct", (nee && cfg.nee_pixel) ? 1u : 0u);
     gl::dispatch_compute((set.count() + 255u) / 256u, 1, 1);
     gl::memory_barrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+    // The order-0 multipole rides on lout, so it is rebuilt exactly when lout
+    // is: once per sweep, one pass over the surfels. Two dispatches because a
+    // clear and an accumulate cannot share a barrier.
+    if (grid_ != nullptr && grid_->valid() && blk_prog_.valid()) {
+        const glm::ivec3 mr = grid_->macro_res();
+        const uint32_t words = uint32_t(mr.x) * uint32_t(mr.y) * uint32_t(mr.z) * 4u;
+        if (words != blk_words_) {
+            const std::vector<uint32_t> zero(words, 0u);
+            b_blk_.data(zero.data(), zero.size() * sizeof(uint32_t));
+            blk_words_ = words;
+        }
+        b_blk_.bind_base(kBindBlkRad);
+        blk_prog_.use();
+        blk_prog_.set("u_count", set.count());
+        blk_prog_.set("u_words", words);
+        blk_prog_.set("u_grid_min", grid_->min());
+        blk_prog_.set("u_macro_res", mr);
+        blk_prog_.set("u_macro_cell", grid_->cell() * 4.0f);
+        blk_prog_.set("u_clear", 1u);
+        gl::dispatch_compute((words + 255u) / 256u, 1, 1);
+        gl::memory_barrier(GL_SHADER_STORAGE_BARRIER_BIT);
+        blk_prog_.set("u_clear", 0u);
+        gl::dispatch_compute((set.count() + 255u) / 256u, 1, 1);
+        gl::memory_barrier(GL_SHADER_STORAGE_BARRIER_BIT);
+    }
 }
 
 // The direct term is a function of geometry and emission only -- it does not
@@ -292,7 +321,7 @@ void Solver::dispatch(SurfelSet& set, const SolveConfig& cfg,
             micro_.set("u_macro_res", grid_->macro_res());
             micro_.set("u_macro_cell", grid_->cell() * 4.0f);
             micro_.set("u_far_occ", cfg.far_occlusion ? 1u : 0u);
-            micro_.set("u_far_slack", cfg.far_slack);
+            b_blk_.bind_base(kBindBlkRad);
         } else {
             micro_.set("u_far_occ", 0u);
         }

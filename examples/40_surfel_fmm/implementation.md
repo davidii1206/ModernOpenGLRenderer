@@ -2583,6 +2583,57 @@ the far candidate loop entirely rather than making it cheaper, and it is the
 first real piece of the FMM rather than a stand-in for it.
 
 
+### Finding 46 — an order-0 multipole, and the far field stops needing a tuning knob
+
+Finding 45 ended on a diagnosis: far *radiance* came from individual surfels
+while far *occlusion* came from voxels, the two disagreed about where a surface
+ends, and no depth window reconciled them. The fix is to make both come from the
+same place.
+
+`blk_rad.comp` reduces `lout` into one mean outgoing radiance per 4x4x4 macro
+block -- an order-0 multipole -- rebuilt once per sweep alongside `lout`, one
+pass over the surfels, fixed point because core GLSL has no float atomicAdd. The
+per-bucket march now returns the **block** it stopped at rather than a distance,
+and that block's radiance is the far field for that bucket. There is nothing left
+to tune: the cell you hit is the surface you see. `SGI_FAR_SLACK` is gone.
+
+The far candidate loop in phase B is gone with it. A surfel past the horizon
+contributes nothing there -- its radiance reaches the receiver through its block.
+
+**At the FMM's own U-list horizon, `SGI_NEAR=1.5`:**
+
+| far-field model | ratio | MAE | band 5-15 |
+|---|---|---|---|
+| per-surfel, unoccluded | 1.043 | 12.92 | 21.53 |
+| per-surfel + best distance window | 0.869 | 14.66 | 5.80 |
+| **order-0 block radiance at the first hit** | **0.926** | **14.57** | **5.85** |
+| exact all-pairs | 0.949 | 12.94 | 10.62 |
+
+and the error keeps closing as the near field grows -- at `SGI_NEAR=25` it is
+ratio 0.928, MAE 13.36, band 10.43 against 10.62.
+
+Visually the indirect shadows, the colour bleeding and the contact darkening all
+survive, which none of the earlier far-field models managed. `SGI_NEAR=0` remains
+byte-identical to the brute-force reference, and 30/30 gates pass.
+
+**And it is faster: the solve goes 34.1 -> 20.3 ms per 2048-receiver slice**,
+with the all-pairs loop still *visiting* every far candidate and merely exiting
+early on it. The structural win -- visiting only the U-list -- is spec section 10
+step 3, and it now has somewhere for the rest of the light to come from, which is
+the thing it did not have before.
+
+**What is left, and it is the order.** Shadows at `SGI_NEAR=1.5` sit at 5.85
+against 10.62: too DARK, where the unoccluded model was too bright. Two suspects,
+both testable. A block reports one radiance whichever side you look at it from,
+so a block holding two faces of a corner averages them -- section 1.2's order-2
+`Ilm[9]` exists for exactly this. And the march stops at any block the ray
+touches, including one it only clips the corner of, which over-occludes; a cone
+rather than a ray, or a finer block, would soften it.
+
+Neither is a knob. Both are the next increment of the same structure, which is
+what says this is the right structure.
+
+
 ## Gate results
 
 `SGI_GATE=all SGI_NOGUI=1 ./40_surfel_fmm` — 30 assertions, all pass.
