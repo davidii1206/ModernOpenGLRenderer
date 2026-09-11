@@ -309,6 +309,7 @@ int main() {
 
     SurfelSet scene;
     scene.build(tris, env.surfels);
+    apply_base_color_textures(scene, tris, *model);
     const Bounds& sb = scene.bounds();
     gllib::logf(gllib::LogLevel::info,
                 "scene: %zu tris, area %.4f, bounds [%.2f %.2f %.2f]..[%.2f %.2f %.2f]",
@@ -381,6 +382,7 @@ int main() {
         model = std::move(next);
         tris  = std::move(next_tris);
         scene.build(tris, target_surfels);
+        apply_base_color_textures(scene, tris, *model);
         grid.build(scene, env.cell);
         emitters.build(tris);
         cuts.build(scene, tris);

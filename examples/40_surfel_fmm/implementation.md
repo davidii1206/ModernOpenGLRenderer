@@ -176,6 +176,32 @@ distance where it engages, which traces a visible ring; `d² → d² + ε·r²`
 (Christensen 2008) is smooth and agrees to within a percent everywhere the clamp
 was not active. `SolveConfig::soft_eps`.
 
+## Planned optimizations, not yet built
+
+Recorded from design intent so they are not lost. Neither is implemented; both
+are the author's, and the notes are what they need to be tested against rather
+than a design.
+
+**NEE only where the direct term is uncertain.** The per-pixel shadow march is
+the most expensive thing in the frame and it runs on every pixel, including the
+~87% whose visibility is locally flat (finding 39). Finding 43 gates that on the
+cache's `light_vis` bracket. The stronger version is to take the certainty from
+the INDIRECT microbuffers themselves -- a receiver whose buckets agree about the
+emitter does not need a per-pixel query at all -- and Cornell is the right place
+to test it, because its ground truth is exact and its penumbra is the only place
+the answer can differ.
+
+**Dynamic surfel streaming: solve only the surfels that matter.** The solve is
+O(receivers) and currently every surfel is a receiver every sweep, whether or not
+anything about it changed or is visible. Importance can be evaluated cheaply on a
+PROXY GRID rather than per surfel -- a coarse structure that says which regions
+deserve a budget this frame -- and the per-receiver budget already exists
+(`cfg.budget`) as the place to spend it. This is what makes a 1.4M-surfel Sponza
+tractable: finding 48 measured the cost as fixed per receiver, so the only lever
+that scales is having fewer of them per frame.
+
+Everything else lives in the findings below.
+
 ## Findings
 
 ### 1. Hemi-octahedral texels are NOT equal solid angle
@@ -3015,6 +3041,45 @@ structure where only the owner entry is now read by the shadow march.
 So the surfel count is a GUI control now, with the spacing and the grid size
 printed next to it, because it is a per-scene decision that cannot be defaulted:
 too low and the reconstruction draws cells, too high and the grid does not fit.
+
+
+### Finding 54 — base-colour textures, on both sides of the cache
+
+`gbuf.frag` said it plainly: "Cornell is untextured, so the material factors are
+the whole story." That was true, and it stopped being true the moment a second
+scene existed. Both the G-buffer and the surfel albedo read `base_color_factor`
+and nothing else, and Sponza's materials are white factors with all of the colour
+in the texture -- so the model rendered grey AND the bounce carried no colour at
+all. The indirect term was not merely wrong, it was incapable of being right.
+
+Both sides now sample it:
+
+* **The G-buffer** binds the material's base-colour texture and multiplies. This
+  is what the gather multiplies the cached irradiance by, so leaving it out made
+  a textured scene grey twice over -- once in the model, once in its bounce.
+* **The surfels** take it at bake time. `Tri` carries `uv[3]` and a material
+  index, the bake records each surfel's barycentric texcoord alongside its home
+  triangle, and `apply_base_color_textures` reads each used image back from the
+  GPU once and samples it per surfel. Nearest, wrapping, sRGB decoded -- a surfel
+  covers many texels at any sane density, so a bilinear tap would be lost in its
+  own footprint immediately.
+
+Sponza: **1387840 of 1387840 surfels textured from 25 images.** Cornell: 0 of
+29997 from 0 images, and its render is unchanged to the digit -- MAE 12.95, 30/30
+gates -- which is the assertion that this only adds what was missing.
+
+**How much colour the bounce actually carries**, as the mean per-pixel spread
+between the brightest and darkest channel of the indirect irradiance:
+
+| scene | spread | |
+|---|---|---|
+| Cornell | 55.3 | two saturated walls and one small light |
+| Sponza | 5.8 | white sky and sun on beige stone, with small banners |
+
+Before this it was zero on Sponza by construction, so the mechanism works; the
+magnitude is the scene's. Widening the exact near field from 1.5 to 6 spacings
+moves it 5.84 to 6.52, so the order-0 far field's block averaging is NOT what is
+muting it -- worth knowing, because that was the obvious suspect and it is wrong.
 
 
 ## Gate results

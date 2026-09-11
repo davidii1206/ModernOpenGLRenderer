@@ -1,10 +1,15 @@
 #include "surfels.hpp"
 
 #include <gllib/log.hpp>
+#include <gl/gl.hpp>
+#include <gfx/gfx.hpp>
+#include <glad/glad.h>
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <unordered_map>
+#include <memory>
 
 namespace sgi {
 
@@ -44,6 +49,10 @@ std::vector<Tri> extract_triangles(const gfx::Model& model) {
                 glm::vec3(c.position[0], c.position[1], c.position[2]),
             };
             for (int k = 0; k < 3; ++k) t.p[k] = glm::vec3(xf * glm::vec4(lp[k], 1.0f));
+            t.uv[0] = glm::vec2(a.texcoord[0], a.texcoord[1]);
+            t.uv[1] = glm::vec2(b.texcoord[0], b.texcoord[1]);
+            t.uv[2] = glm::vec2(c.texcoord[0], c.texcoord[1]);
+            t.material = mat;
 
             const glm::vec3 cr = glm::cross(t.p[1] - t.p[0], t.p[2] - t.p[0]);
             const float len = glm::length(cr);
@@ -175,7 +184,7 @@ void SurfelSet::build(const std::vector<Tri>& tris, uint32_t target_count, uint3
     const auto t0 = std::chrono::steady_clock::now();
 
     pos_rad_.clear(); normal_.clear(); albedo_.clear(); emission_.clear();
-    tri_of_.clear();
+    tri_of_.clear();  uv_of_.clear();
     bounds_ = Bounds{};
     emissive_count_ = 0;
     two_sided_count_ = 0;
@@ -237,6 +246,9 @@ void SurfelSet::build(const std::vector<Tri>& tris, uint32_t target_count, uint3
             const glm::vec3 p = t.p[0] + e1 * a + e2 * b;
             pos_rad_.push_back(glm::vec4(p, radius_));
             tri_of_.push_back(uint32_t(i));
+            // Same barycentric weights as the position, so the texcoord lands
+            // exactly where the surfel does.
+            uv_of_.push_back(t.uv[0] + (t.uv[1] - t.uv[0]) * a + (t.uv[2] - t.uv[0]) * b);
             normal_.push_back(n_nrm);
             albedo_.push_back(n_alb);
             emission_.push_back(n_emi);
@@ -279,7 +291,9 @@ void SurfelSet::build_explicit(const std::vector<glm::vec4>& pos_rad,
     count_ = uint32_t(pos_rad.size());
     pos_rad_ = pos_rad;
     normal_.resize(count_); albedo_.resize(count_); emission_.resize(count_);
-    tri_of_.clear();   // a hand-built set has no source mesh, so no cut planes
+    // A hand-built set has no source mesh, so no home triangle and no texcoord.
+    tri_of_.clear();
+    uv_of_.clear();
     bounds_ = Bounds{};
     emissive_count_ = 0;
     area_ = 0.0;
@@ -322,6 +336,17 @@ void SurfelSet::reset_irradiance() {
     b_irrad_prev_.clear(GL_RGBA32F, GL_RGBA, GL_FLOAT, zero);
 }
 
+void SurfelSet::set_albedos(const std::vector<glm::vec3>& albedos) {
+    if (albedos.size() != albedo_.size()) return;
+    for (std::size_t i = 0; i < albedo_.size(); ++i) {
+        // Keep the flag bits: they carry emissive and double-sided, which the
+        // texture has nothing to say about.
+        const uint32_t flags = albedo_[i] & 0xFF000000u;
+        albedo_[i] = (pack_rgb8(albedos[i], 0u) & 0x00FFFFFFu) | flags;
+    }
+    b_albedo_.data(albedo_.data(), albedo_.size() * sizeof(uint32_t));
+}
+
 void SurfelSet::bind() const {
     b_pos_rad_.bind_base(kBindPosRad);
     b_normal_.bind_base(kBindNormal);
@@ -351,6 +376,85 @@ std::vector<glm::vec4> SurfelSet::read_irradiance() const {
     glGetNamedBufferSubData(b_irrad_.handle(), 0,
                             GLsizeiptr(count_) * GLsizeiptr(sizeof(glm::vec4)), out.data());
     return out;
+}
+
+
+
+// --- base-colour textures ---------------------------------------------------
+
+namespace {
+
+// One base-colour texture, pulled back to the CPU. The bake is CPU-side and the
+// textures are not, so this is the seam.
+struct TexImage {
+    int w = 0, h = 0;
+    std::vector<unsigned char> rgba;
+    bool valid() const { return w > 0 && h > 0 && rgba.size() >= std::size_t(w) * h * 4; }
+
+    // Nearest, wrapping. A surfel covers many texels at any sane density, so
+    // filtering here buys nothing a bilinear tap would not immediately lose to
+    // the surfel's own footprint.
+    glm::vec3 sample(glm::vec2 uv) const {
+        const int x = int(std::floor(uv.x * float(w))) % w;
+        const int y = int(std::floor(uv.y * float(h))) % h;
+        const std::size_t o = (std::size_t((y < 0 ? y + h : y)) * std::size_t(w)
+                             + std::size_t(x < 0 ? x + w : x)) * 4u;
+        // glTF base colour is sRGB; the renderer works in linear.
+        auto lin = [](unsigned char c) {
+            const float v = float(c) / 255.0f;
+            return v <= 0.04045f ? v / 12.92f : std::pow((v + 0.055f) / 1.055f, 2.4f);
+        };
+        return glm::vec3(lin(rgba[o]), lin(rgba[o + 1]), lin(rgba[o + 2]));
+    }
+};
+
+TexImage read_texture(const gfx::Texture& t) {
+    TexImage img;
+    glGetTextureLevelParameteriv(t.handle(), 0, GL_TEXTURE_WIDTH, &img.w);
+    glGetTextureLevelParameteriv(t.handle(), 0, GL_TEXTURE_HEIGHT, &img.h);
+    if (img.w <= 0 || img.h <= 0) return img;
+    img.rgba.resize(std::size_t(img.w) * std::size_t(img.h) * 4u);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glGetTextureImage(t.handle(), 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                      GLsizei(img.rgba.size()), img.rgba.data());
+    return img;
+}
+
+} // namespace
+
+void apply_base_color_textures(SurfelSet& set, const std::vector<Tri>& tris,
+                               const gfx::Model& model) {
+    const std::vector<uint32_t>&  tri_of = set.tri_of();
+    const std::vector<glm::vec2>& uv_of  = set.uv_of();
+    if (tri_of.size() != set.count() || uv_of.size() != set.count()) return;
+
+    // Read each texture back at most once, and only the ones a material with
+    // geometry actually points at.
+    std::unordered_map<int, TexImage> cache;
+    std::vector<glm::vec3> albedos(set.count());
+    std::size_t textured = 0;
+
+    for (uint32_t i = 0; i < set.count(); ++i) {
+        const Tri& t = tris[tri_of[i]];
+        albedos[i] = t.albedo;
+        if (t.material < 0 || std::size_t(t.material) >= model.material_count()) continue;
+        const int tex = model.material_info(std::size_t(t.material)).base_color_tex;
+        if (tex < 0 || std::size_t(tex) >= model.texture_count()) continue;
+
+        auto it = cache.find(tex);
+        if (it == cache.end()) {
+            const std::shared_ptr<gfx::Texture>& gt = model.texture(std::size_t(tex));
+            it = cache.emplace(tex, gt ? read_texture(*gt) : TexImage{}).first;
+        }
+        if (!it->second.valid()) continue;
+        albedos[i] = t.albedo * it->second.sample(uv_of[i]);
+        ++textured;
+    }
+
+    set.set_albedos(albedos);
+    gllib::logf(gllib::LogLevel::info,
+                "base colour: %zu of %u surfels textured from %zu images",
+                textured, set.count(), cache.size());
 }
 
 } // namespace sgi

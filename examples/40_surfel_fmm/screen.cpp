@@ -95,6 +95,7 @@ void GeometryPass::render(const GBuffer& gb, const gfx::Model& model,
         glm::vec3 emi(0.0f);
         float rough = 1.0f, metal = 0.0f;
         bool two_sided = false;
+        int base_tex = -1;
         const int mat = model.mesh_material(i);
         if (mat >= 0 && std::size_t(mat) < model.material_count()) {
             const gfx::ModelMaterialInfo& m = model.material_info(std::size_t(mat));
@@ -103,7 +104,16 @@ void GeometryPass::render(const GBuffer& gb, const gfx::Model& model,
             rough = m.roughness_factor;
             metal = m.metallic_factor;
             two_sided = m.double_sided;
+            base_tex  = m.base_color_tex;
         }
+        // The G-buffer's albedo is what the gather multiplies the cached
+        // irradiance by, so an untextured one makes a textured scene grey twice
+        // over: once in the model and once in its bounce.
+        const bool has_tex = base_tex >= 0 &&
+                             std::size_t(base_tex) < model.texture_count() &&
+                             model.texture(std::size_t(base_tex)) != nullptr;
+        if (has_tex) model.texture(std::size_t(base_tex))->bind(0);
+        prog_.set("u_has_base_tex", has_tex ? 1u : 0u);
         prog_.set("u_base_color_factor", base);
         prog_.set("u_emissive_factor", emi);
         prog_.set("u_roughness_factor", rough);

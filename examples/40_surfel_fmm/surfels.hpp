@@ -50,12 +50,16 @@ struct Bounds {
 // whole of it -- no UVs, no texture read-back.
 struct Tri {
     glm::vec3 p[3]{};
+    glm::vec2 uv[3]{};               // base-colour texcoords, per vertex
     glm::vec3 n{0.0f, 1.0f, 0.0f};   // face normal
-    glm::vec3 albedo{0.0f};
+    glm::vec3 albedo{0.0f};          // base_color_factor; the texture multiplies it
     glm::vec3 emission{0.0f};        // emitted RADIANCE, strength already folded in
     float     area = 0.0f;
+    int       material = -1;         // index into the model's materials, or -1
     bool      double_sided = false;
 };
+
+
 
 // Applies model.mesh_transform(i) and nothing else. CornellBoxOriginal.glb's
 // single node carries a +90 degree X quaternion that takes the Z-up model to
@@ -137,6 +141,10 @@ public:
     // disc keeps, and there is nowhere else to recover it from once the bake has
     // flattened the set.
     const std::vector<uint32_t>&  tri_of() const { return tri_of_; }
+    // Barycentric texcoord of each surfel on its home triangle.
+    const std::vector<glm::vec2>& uv_of() const { return uv_of_; }
+    // Repack and re-upload the albedo array. Used by apply_base_color_textures.
+    void set_albedos(const std::vector<glm::vec3>& albedos);
 
     const std::vector<glm::vec4>& pos_rad() const { return pos_rad_; }
     const std::vector<uint32_t>&  normal() const { return normal_; }
@@ -159,6 +167,7 @@ private:
     uint32_t emissive_count_ = 0;
     uint32_t two_sided_count_ = 0;
     std::vector<uint32_t> tri_of_;
+    std::vector<glm::vec2> uv_of_;
     double   bake_seconds_ = 0.0;
     Bounds   bounds_;
 
@@ -174,5 +183,18 @@ private:
     gl::Buffer b_irrad_    {gl::BufferType::shader, gl::BufferUsage::dynamic_draw};
     gl::Buffer b_irrad_prev_{gl::BufferType::shader, gl::BufferUsage::dynamic_draw};
 };
+
+// Multiplies every surfel's albedo by its base-colour texture, sampled at the
+// surfel's own barycentric position.
+//
+// Without this a textured scene is untextured -- every surfel takes
+// base_color_factor alone, which for Sponza is white on almost every material
+// because the colour lives in the texture. The model renders grey and, worse,
+// the bounce carries no colour at all, so the indirect term cannot be judged.
+//
+// Separate from the bake because the bake is pure CPU geometry and the textures
+// are on the GPU: this reads them back once, which is why it takes a Model.
+void apply_base_color_textures(SurfelSet& set, const std::vector<Tri>& tris,
+                               const gfx::Model& model);
 
 } // namespace sgi
