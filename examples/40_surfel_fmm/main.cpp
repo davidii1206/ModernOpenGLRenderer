@@ -430,7 +430,7 @@ int main() {
     float grad_scale    = env.lgrad;
     bool  show_light    = env.showlight;
     int   mls_order     = env.mls;
-    bool  gather_debug  = false;
+    bool  gather_debug  = getenv("SGI_FALLBACK") != nullptr;
     int   filter_iters  = std::max(0, env.filter);
     float filter_radius = env.fradius;
 
