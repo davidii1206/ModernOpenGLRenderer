@@ -55,6 +55,9 @@
 //                           the FMM's U-list horizon (finding 44). Non-zero also
 //                           switches the solve to the U-list walk (finding 47)
 //   SGI_FAR_OCC=1           march the macro bitmask for the far field's radiance
+//   SGI_LOD=0               camera-distance LOD: three microbuffer resolutions
+//                           (ms, ms/2, ms/4) chosen by projected size, spec 6.1
+//   SGI_LOD_PX=1            projected size in px that still earns the top tier
 //   SGI_NEE_SKIP=0          skip the march where the cache's neighbours agree
 //                           the light is wholly visible or wholly blocked
 //   SGI_NEE_OCC=2.0         occluder radius scale, visibility only (finding 29)
@@ -161,6 +164,8 @@ struct EnvOpts {
     float neeskip = 0.0f;        // SGI_NEE_SKIP  cache-agreement margin, 0 = off
     float nearspac = 0.0f;       // SGI_NEAR      occlusion horizon in SPACINGS, 0 = unlimited
     bool  farocc = true;         // SGI_FAR_OCC   march the macro bitmask for the far field
+    bool  lod = false;           // SGI_LOD       camera-distance microbuffer tiers (6.1)
+    float lodpx = 1.0f;          // SGI_LOD_PX    projected px that still earns the top tier
     int   farorder = 1;          // SGI_FAR_ORDER SH bands in the far field: 0 or 1
     // Scripted camera, for scenes that have no reference view. "x,y,z".
     std::string eye, at;         // SGI_EYE / SGI_AT
@@ -252,6 +257,8 @@ EnvOpts read_env() {
     if (const char* v = getenv("SGI_BIAS"))     o.bias = float(atof(v));
     if (const char* v = getenv("SGI_NEAR"))     o.nearspac = float(atof(v));
     if (const char* v = getenv("SGI_FAR_OCC"))  o.farocc = atoi(v) != 0;
+    if (const char* v = getenv("SGI_LOD"))      o.lod = atoi(v) != 0;
+    if (const char* v = getenv("SGI_LOD_PX"))   o.lodpx = float(atof(v));
     if (const char* v = getenv("SGI_FAR_ORDER")) o.farorder = atoi(v);
     if (const char* v = getenv("SGI_EYE"))      o.eye = v;
     if (const char* v = getenv("SGI_AT"))       o.at = v;
@@ -484,6 +491,8 @@ int main() {
     cfg.nee_skip = env.neeskip;
     cfg.near_radius = env.nearspac > 0.0f ? env.nearspac * scene.spacing() : 0.0f;
     cfg.far_occlusion = env.farocc;
+    cfg.lod = env.lod;
+    cfg.lod_px = env.lodpx;
     cfg.far_order = env.farorder;
     cfg.nee_cuts = env.neecuts != 0;
     if (env.bias >= 0.0f) cfg.plane_bias = env.bias;
@@ -664,6 +673,12 @@ int main() {
             cfg.sun_half = cfg.sun_dist * theta * 0.8862269f;
             cfg.near_radius = near_spacings > 0.0f ? near_spacings * scene.spacing() : 0.0f;
         }
+
+        // Section 6.1's LOD reads the camera, so it has to be refreshed every
+        // frame rather than configured once.
+        cfg.cam_pos  = cam.position();
+        cfg.px_scale = 2.0f * std::tan(glm::radians(cam.fov()) * 0.5f) /
+                       float(std::max(1, window.framebuffer_height()));
 
         const glm::mat4 view_proj = cam.view_projection();
 

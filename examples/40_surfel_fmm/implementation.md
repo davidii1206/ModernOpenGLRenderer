@@ -3327,6 +3327,86 @@ memory this just freed. Worth doing only with the freed budget in hand, which is
 now the case.
 
 
+### Finding 59 — shared memory is a cliff to stay under, not a slope to climb
+
+Finding 48 measured the solve's cost as fixed per receiver and named shared
+memory and workgroup launches as the suspects. Shared memory is not it, and the
+measurement that says so is worth keeping because the first half of it looks
+exactly like the opposite conclusion.
+
+**Downward, occupancy matters enormously.** Add 8 KB of shared memory that
+nothing reads and the solve costs **1.52x** (Sponza, `SGI_NEAR=1.5`). Sweeping
+the padding finds a cliff between +1 KB (no change) and +2 KB (1.6x). The shader
+sits just under a step.
+
+**Upward, it buys nothing.** A probe that shrinks `lds_plane`, `lds_rad` and
+`lds_cov_emit` to a quarter each and masks the indices -- wrong results, right
+instruction count, 6 KB less shared memory -- runs **7% faster**. That is inside
+this GPU's run-to-run variance.
+
+Two real implementations confirmed it rather than just the probe:
+
+| | Sponza solve |
+|---|---|
+| baseline (14.3 KB) | 2.565 ms |
+| plane packed to 8 B/bucket (-2 KB) | 2.657 |
+| reduction as 4 atomics instead of a 128-slot tree (-2 KB, -7 barriers) | 2.493 / 1.807 fixed |
+
+The packed plane loses to the decode in the inner loop. The atomic reduction
+wins slightly on the full solve and loses badly (1.32 -> 1.81 ms) on the fixed
+part, because 128 threads hammering four shared addresses serialize; it also
+fails gate 3, whose linearity tolerance is 1e-6 and does not admit a Q16.16
+quantum. Both reverted.
+
+**What did come out of it is a bug in the plane test.** Quantizing the winner's
+normal to snorm16 octahedral while keeping the *exact* plane offset leaks 0.617
+through gate 9's opaque blocker. The 1e-4 of angular error is not the problem --
+pairing `n_quantized` with `d_exact` is, because the plane then no longer passes
+through the surfel it was built from. Recomputing `d = -dot(n_q, p)` from the
+decoded normal passes 30/30. Anything that ever stores this plane in fewer bits
+has to derive both halves from the same normal.
+
+### Finding 60 — section 6.1's LOD, and what it prices the bucket count at
+
+Built: `lod_tier.comp` classifies a slice by projected size, compacts each tier
+into its own list, and writes the three workgroup counts straight into an
+indirect command buffer so nothing is read back. Three bucket tables live end to
+end in one buffer -- a tier cannot borrow another's solid angles -- and the
+microbuffer takes its receiver from the list instead of from `u_first + r`.
+`SGI_LOD=1`, off by default, and off is unchanged: 30/30, and the non-LOD
+dispatch path is untouched.
+
+**The spec's threshold is a no-op at this scale.** `bucketsWanted = 64 *
+(surfelRadius / pixelSize)` demotes a surfel once it projects to under a pixel.
+At 1600x900 our surfels are 2-3 px across out to about 90 world units and Sponza
+is 30 across, so the first run put all 2048 receivers in the top tier and cost
+0.6 ms for the privilege. The threshold is therefore `SGI_LOD_PX`, in pixels,
+with the spec's 1 as its default.
+
+**Forcing the demotion prices the bucket count, and it is cheap:**
+
+| every receiver at | Sponza solve | buckets |
+|---|---|---|
+| 16x16 | 2.780 ms | 256 |
+| 8x8 | 2.594 | 64 |
+| 4x4 | 2.320 | 16 |
+
+**16x fewer buckets buys 17%.** That is the whole envelope of this optimization,
+before any quality is given up, and it settles where the per-receiver cost lives:
+not in per-bucket work, which is what §6.1 can address, and not in shared memory,
+which is finding 59. Finding 58's candidate cap bought 3.3x by cutting the
+candidate loop; that is the only structure that has responded.
+
+So the LOD ships off. It is spec step 9, it is correct, and it is the instrument
+that measured its own irrelevance -- which is worth more than the 17% would have
+been.
+
+**One trap it exposed.** `px_scale` is zero until a camera exists, and the gates
+run before one does. Zero divides into an infinite projected size, so every
+receiver classifies into tier 0 and the LOD silently becomes an expensive no-op
+that still passes every gate. The solver now refuses that case with a warning
+rather than reporting a tier histogram nobody should believe.
+
 ## Gate results
 
 `SGI_GATE=all SGI_NOGUI=1 ./40_surfel_fmm` — 30 assertions, all pass.
@@ -3451,12 +3531,22 @@ the atomics were already the bottleneck rather than the ALU.
 
 ## What is deliberately absent
 
-No sparse grid, no U/V interaction lists, no P2M/M2M/M2L/L2L, no `Lsh` trilinear
-interpolation, no temporal amortization, no LOD, no RGB9E5 irradiance, no
-per-frame tangent-frame jitter by default. Every one of those is spec §10 step 3
-or later, and every one of them is meant to be *asserted against what this
-example produces*. Adding any of them here would remove the thing they are
-supposed to be checked against.
+Written when this example was the brute-force reference and steps 3 and later
+were all still absent. Most of that list has since been built and measured, so
+what remains deliberately absent is:
+
+No V-list M2L and no L2L downsweep -- the far field is a per-block outgoing
+radiance that a visibility march samples (findings 45-46, 57), not a local
+expansion carried to the receiver. No `Lsh` trilinear interpolation, which
+follows from that and not from laziness: step 7 interpolates a local expansion,
+and interpolating what we have instead makes the image worse, twice measured
+(findings 56, 57). No per-cell dispatch, measured as having nothing to amortize
+here (finding 48). No temporal amortization. No RGB9E5 irradiance and no
+per-frame tangent-frame jitter by default.
+
+Built since: the sparse grid and the U-list walk (finding 47), an order-1
+multipole far field (findings 46, 57), and camera-distance LOD, which ships off
+because it measured a 17% ceiling (finding 60).
 
 ## Open
 

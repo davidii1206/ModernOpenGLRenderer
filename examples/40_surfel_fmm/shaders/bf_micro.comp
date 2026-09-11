@@ -47,7 +47,13 @@ layout(local_size_x = 128) in;
 layout(std430, binding = 4) writeonly buffer IrradDst { vec4 irrad_dst[]; };
 layout(std430, binding = 6) readonly  buffer Lout     { vec4 lout[]; };
 // bucket[2b+0] = (dir.xyz tangent frame, dw), bucket[2b+1] = (wcos, 0, 0, 0)
+//
+// Three tables live end to end -- one per LOD tier (section 6.1) -- because the
+// table is exact per resolution and a tier cannot share another's solid angles.
+// u_bucket_base picks one; it is 0 whenever LOD is off.
 layout(std430, binding = 7) readonly  buffer Buckets  { vec4 bucket[]; };
+// The tier's receiver list, compacted by lod_tier.comp.
+layout(std430, binding = 25) readonly buffer LodList  { uint lod_list[]; };
 
 // LIGHT VISIBILITY, one scalar per receiver. The cosine-weighted fraction of the
 // hemisphere covered by EMITTERS that this receiver can actually see:
@@ -102,6 +108,12 @@ uniform uint  u_count;
 uniform uint  u_first;
 uniform uint  u_slice;
 uniform uint  u_ms;              // microbuffer edge: 8 -> 64 buckets, 16 -> 256
+uniform uint  u_bucket_base;     // vec4 offset of this tier's bucket table
+// LOD: 0 takes receivers as the contiguous slice [u_first, u_first + u_slice),
+// 1 takes them from lod_list, which lod_tier.comp compacted per tier and whose
+// length arrived through the indirect dispatch rather than through u_slice.
+uniform uint  u_lod;
+uniform uint  u_lod_base;        // index of this tier's region in lod_list
 uniform float u_horizon;         // identical to bf_radiance.comp
 uniform float u_plane_bias;      // identical to bf_radiance.comp
 uniform float u_self_cos;        // identical to bf_radiance.comp
@@ -296,9 +308,13 @@ vec3 sgi_env(vec3 w) {
 void main() {
     const uint tid = gl_LocalInvocationID.x;
     const uint r   = gl_WorkGroupID.x;
-    if (r >= u_slice) return;                 // whole workgroup: barriers stay uniform
+    // Whole workgroup or none: barriers below have to stay uniform. Under LOD
+    // the workgroup count came from the compaction's own counter, so every
+    // launched group has a receiver and there is nothing to guard.
+    if (u_lod == 0u && r >= u_slice) return;
 
-    const uint P   = (u_first + r) % u_count;
+    const uint P   = u_lod != 0u ? lod_list[u_lod_base + r]
+                                 : (u_first + r) % u_count;
     const uint ms  = u_ms;
     const uint ms2 = ms * ms;
 
@@ -421,7 +437,7 @@ void main() {
 
         const vec3  local = vec3(dot(w, T), dot(w, B), cosP);
         const ivec2 c     = micro_texel(local, ms);
-        const float dwc   = bucket[(uint(c.y) * ms + uint(c.x)) * 2u].w;
+        const float dwc   = bucket[u_bucket_base + (uint(c.y) * ms + uint(c.x)) * 2u].w;
         const float kr    = max(micro_footprint(omega, dwc), 0.5);
         const int   pr    = min(int(ceil(kr + 0.5)), int(ms));
 
@@ -495,7 +511,7 @@ void main() {
 
         const vec3  local = vec3(dot(w, T), dot(w, B), cosP);
         const ivec2 c     = micro_texel(local, ms);
-        const float dwc   = bucket[(uint(c.y) * ms + uint(c.x)) * 2u].w;
+        const float dwc   = bucket[u_bucket_base + (uint(c.y) * ms + uint(c.x)) * 2u].w;
         const float kr    = max(micro_footprint(omega, dwc), 0.5);
         const int   pr    = min(int(ceil(kr + 0.5)), int(ms));
         const uint  qd    = min(uint(depth * u_depth_scale), 65535u);
@@ -630,7 +646,7 @@ void main() {
         // the room is closed and u_sky is zero, and total in Sponza, which has
         // no emissive surface at all and is lit by nothing else. It rendered
         // black.
-        const vec3 ld0 = bucket[b * 2u + 0u].xyz;         // tangent-frame direction
+        const vec3 ld0 = bucket[u_bucket_base + b * 2u + 0u].xyz;         // tangent-frame direction
         const vec3 wd  = normalize(T * ld0.x + B * ld0.y + nP * ld0.z);
         far_L = sgi_env(wd);
         if (u_far_occ == 0u || u_near <= 0.0) break;
@@ -691,9 +707,9 @@ void main() {
         break;
         } while (false);
 
-        const float wcos = bucket[b * 2u + 1u].x;   // INTEGRAL(cos dOmega) over the texel
+        const float wcos = bucket[u_bucket_base + b * 2u + 1u].x;   // INTEGRAL(cos dOmega) over the texel
         vis += clamp(float(lds_cov_emit[b]) * (1.0 / kFixed), 0.0, 1.0) * wcos;
-        const float dwb  = bucket[b * 2u + 0u].w;
+        const float dwb  = bucket[u_bucket_base + b * 2u + 0u].w;
 
         vec3  L    = vec3(0.0);
         float fill = 0.0;
@@ -735,7 +751,7 @@ void main() {
         if (u_far_occ != 0u && u_near > 0.0) {
             Lin = L * fill + far_L * (1.0 - fill);
         } else {
-            const vec3 ld = bucket[b * 2u + 0u].xyz;
+            const vec3 ld = bucket[u_bucket_base + b * 2u + 0u].xyz;
             Lin = mix(sgi_env(normalize(T * ld.x + B * ld.y + nP * ld.z)), L, fill);
         }
         if (u_debug_constant != 0u) Lin = vec3(u_debug_radiance);

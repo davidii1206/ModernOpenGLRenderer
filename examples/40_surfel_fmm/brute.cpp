@@ -100,15 +100,17 @@ bool Solver::init() {
     lout_prog_ = Pipeline::compute("shaders/bf_lout.comp");
     radiance_  = Pipeline::compute("shaders/bf_radiance.comp");
     micro_     = Pipeline::compute("shaders/bf_micro.comp");
+    lod_prog_  = Pipeline::compute("shaders/lod_tier.comp");
     direct_    = Pipeline::compute("shaders/nee_direct.comp");
     blk_prog_  = Pipeline::compute("shaders/blk_rad.comp");
     timer_     = std::make_unique<PassTimer>("Solve");
     return lout_prog_.valid() && radiance_.valid() && micro_.valid() &&
-           blk_prog_.valid();
+           blk_prog_.valid() && lod_prog_.valid();
 }
 
 bool Solver::poll() {
     bool changed = lout_prog_.poll();
+    changed |= lod_prog_.poll();
     changed |= radiance_.poll();
     changed |= micro_.poll();
     changed |= blk_prog_.poll();
@@ -123,16 +125,30 @@ void Solver::reset(SurfelSet& set) {
     snapshot_.clear();
 }
 
-void Solver::ensure_buffers(const SurfelSet& set, uint32_t ms) {
+void Solver::ensure_buffers(const SurfelSet& set, uint32_t ms, bool tiered) {
     if (lout_count_ != set.count()) {
         const std::vector<glm::vec4> zero(set.count(), glm::vec4(0.0f));
         b_lout_.data(zero.data(), zero.size() * sizeof(glm::vec4));
         lout_count_ = set.count();
     }
-    if (bucket_ms_ != ms) {
-        const std::vector<glm::vec4> tbl = build_bucket_table(ms);
+    if (bucket_ms_ != ms || bucket_tiered_ != tiered) {
+        // One table per LOD tier, end to end. Each is exact for its own
+        // resolution -- dw and wcos come from that texel's spherical corners --
+        // so a coarse tier cannot index into the fine table and read solid
+        // angles that belong to a quarter of its own texel.
+        const uint32_t edge[3] = {ms, std::max(4u, ms / 2u), std::max(4u, ms / 4u)};
+        const uint32_t tiers = tiered ? 3u : 1u;
+        std::vector<glm::vec4> tbl;
+        for (uint32_t t = 0; t < 3; ++t) {
+            bucket_edge_[t] = t < tiers ? edge[t] : ms;
+            bucket_off_[t]  = t < tiers ? uint32_t(tbl.size()) : 0u;
+            if (t >= tiers) continue;
+            const std::vector<glm::vec4> one = build_bucket_table(edge[t]);
+            tbl.insert(tbl.end(), one.begin(), one.end());
+        }
         b_bucket_.data(tbl.data(), tbl.size() * sizeof(glm::vec4));
         bucket_ms_ = ms;
+        bucket_tiered_ = tiered;
     }
 }
 
@@ -271,6 +287,59 @@ void Solver::run_direct(SurfelSet& set, const SolveConfig& cfg) {
     direct_cuts_ = int(cfg.nee_cuts);
 }
 
+// Spec section 6.1. Sort this slice's receivers into three microbuffer
+// resolutions by projected size and compact each tier into its own list.
+//
+// The workgroup counts are written by the shader's own atomics straight into an
+// indirect command buffer. Reading them back to the host would stall the
+// pipeline once per frame for three integers, which on this pass is a
+// significant fraction of what the LOD is trying to save.
+void Solver::classify_lod(SurfelSet& set, const SolveConfig& cfg,
+                          uint32_t first, uint32_t slice) {
+    if (lod_cap_ != slice) {
+        const std::vector<uint32_t> zero(std::size_t(slice) * 3u, 0u);
+        b_lod_list_.data(zero.data(), zero.size() * sizeof(uint32_t));
+        lod_cap_ = slice;
+    }
+    // (count, 1, 1) three times. Only the counts are reset; y and z are written
+    // every frame too because the whole command block is one upload either way.
+    const uint32_t cmd[9] = {0u, 1u, 1u, 0u, 1u, 1u, 0u, 1u, 1u};
+    b_lod_cmd_.data(cmd, sizeof(cmd));
+
+    b_lod_list_.bind_base(kBindLodList);
+    b_lod_cmd_.bind_base(kBindLodCmd);
+
+    lod_prog_.use();
+    lod_prog_.set("u_first", first);
+    lod_prog_.set("u_slice", slice);
+    lod_prog_.set("u_count", set.count());
+    lod_prog_.set("u_cap", lod_cap_);
+    lod_prog_.set("u_cam", cfg.cam_pos);
+    lod_prog_.set("u_px_scale", cfg.px_scale);
+    lod_prog_.set("u_ms", cfg.ms);
+    lod_prog_.set("u_lod_px", cfg.lod_px);
+    gl::dispatch_compute((slice + 255u) / 256u, 1, 1);
+    // The command buffer is read by the dispatcher, not by a shader, so the
+    // barrier has to name GL_COMMAND_BARRIER_BIT as well.
+    gl::memory_barrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_COMMAND_BARRIER_BIT);
+
+    // The tier split, once. A readback here is a full stall, so it happens on
+    // the first classified slice only -- but without it the LOD is invisible:
+    // an image that changes and a tier histogram nobody has seen is not a
+    // measurement, and a rule that puts everything in tier 0 looks exactly like
+    // a rule that works.
+    if (!lod_logged_) {
+        uint32_t cnt[9] = {};
+        glGetNamedBufferSubData(b_lod_cmd_.handle(), 0, sizeof(cnt), cnt);
+        gllib::logf(gllib::LogLevel::info,
+                    "lod tiers (%u receivers): %ux%u %u, %ux%u %u, %ux%u %u",
+                    slice, bucket_edge_[0], bucket_edge_[0], cnt[0],
+                    bucket_edge_[1], bucket_edge_[1], cnt[3],
+                    bucket_edge_[2], bucket_edge_[2], cnt[6]);
+        lod_logged_ = true;
+    }
+}
+
 void Solver::dispatch(SurfelSet& set, const SolveConfig& cfg,
                       uint32_t first, uint32_t slice, uint32_t frame) {
     if (slice == 0) return;
@@ -379,8 +448,46 @@ void Solver::dispatch(SurfelSet& set, const SolveConfig& cfg,
         micro_.set("u_frame", frame);
         micro_.set("u_debug_constant", cfg.debug_constant ? 1u : 0u);
         micro_.set("u_debug_radiance", cfg.debug_radiance);
-        // One WORKGROUP per receiver: the microbuffer has to live in LDS.
-        gl::dispatch_compute(slice, 1, 1);
+
+        // px_scale is 0 until a camera exists, and the gates run before one does
+        // (they build synthetic scenes with no view at all). Zero would divide
+        // into an infinite projected size and put every receiver in the top
+        // tier, which is silently the same image at a higher cost -- so refuse
+        // rather than pretend the LOD ran.
+        const bool lod = cfg.lod && cfg.px_scale > 0.0f;
+        if (cfg.lod && !lod) {
+            static bool said = false;
+            if (!said) {
+                gllib::logf(gllib::LogLevel::warn,
+                            "LOD asked for with no camera (px_scale = 0); "
+                            "solving every receiver at %ux%u", cfg.ms, cfg.ms);
+                said = true;
+            }
+        }
+
+        if (!lod) {
+            micro_.set("u_lod", 0u);
+            micro_.set("u_lod_base", 0u);
+            micro_.set("u_bucket_base", 0u);
+            // One WORKGROUP per receiver: the microbuffer has to live in LDS.
+            gl::dispatch_compute(slice, 1, 1);
+        } else {
+            classify_lod(set, cfg, first, slice);
+            // Three specialized dispatches, not one kernel branching on tier:
+            // section 6.1 is explicit that the branch costs more than the
+            // dispatches. The counts come from the compaction's own atomics
+            // through the indirect buffer, so nothing is read back.
+            glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, b_lod_cmd_.handle());
+            micro_.use();
+            micro_.set("u_lod", 1u);
+            for (uint32_t t = 0; t < 3; ++t) {
+                micro_.set("u_ms", bucket_edge_[t]);
+                micro_.set("u_bucket_base", bucket_off_[t]);
+                micro_.set("u_lod_base", t * lod_cap_);
+                gl::dispatch_compute_indirect(GLintptr(t * 3u * sizeof(uint32_t)));
+            }
+            glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, 0);
+        }
     }
 
     gl::memory_barrier(GL_SHADER_STORAGE_BARRIER_BIT);
@@ -427,7 +534,7 @@ void Solver::end_sweep(SurfelSet& set, bool collect_stats) {
 
 void Solver::step(SurfelSet& set, const SolveConfig& cfg, uint32_t frame, bool collect_stats) {
     if (set.count() == 0 || !cfg.running || converged(cfg)) { timer_->skip(); return; }
-    ensure_buffers(set, cfg.ms);
+    ensure_buffers(set, cfg.ms, cfg.lod);
 
     const uint32_t n = set.count();
     const uint32_t budget = std::max(1u, std::min(cfg.budget, n));
@@ -450,7 +557,7 @@ void Solver::step(SurfelSet& set, const SolveConfig& cfg, uint32_t frame, bool c
 
 void Solver::run_sweeps(SurfelSet& set, const SolveConfig& cfg, uint32_t n, uint32_t frame) {
     if (set.count() == 0 || n == 0) return;
-    ensure_buffers(set, cfg.ms);
+    ensure_buffers(set, cfg.ms, cfg.lod);
 
     for (uint32_t s = 0; s < n; ++s) {
         if (cursor_ != 0) {

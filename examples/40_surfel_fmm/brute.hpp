@@ -57,6 +57,18 @@ struct SolveConfig {
     // which is what separates a wall's lit face from its unlit one.
     int  far_order = 1;
 
+    // Camera-distance LOD, spec section 6.1. Receivers are classified into three
+    // microbuffer resolutions -- ms, ms/2, ms/4 -- by how large they project on
+    // screen, compacted per tier, and dispatched as three kernels. Off keeps one
+    // dispatch at `ms` and is bit-identical to before the tiers existed.
+    bool lod = false;
+    glm::vec3 cam_pos{0.0f};
+    // 2 * tan(fov/2) / screenHeight: world units per pixel at unit distance.
+    float px_scale = 0.0f;
+    // Projected size in pixels at which a receiver still gets the top tier.
+    // 1 is the spec's constant; larger demotes more aggressively.
+    float lod_px = 1.0f;
+
     // Force EVERY surfel to emit from both faces. Diagnostic only; off.
     //
     // This used to default to true, on the reasoning that Cycles' emission BSDF
@@ -169,6 +181,8 @@ enum SolverBinding : uint32_t {
     kBindLightVis = 16, // float[N]     cosine-weighted emitter visibility
     kBindDirect   = 20, // vec4[N]      NEE direct irradiance
     kBindBlkRad   = 24, // uint[blocks*4]  order-0 multipole: sum(L_out), count
+    kBindLodList  = 25, // uint[3*budget]  receivers compacted per LOD tier
+    kBindLodCmd   = 26, // uint[9]         three indirect dispatch commands
     kBindLightMax = 17, // uint[1]      running max of the above, bit-cast float
 };
 
@@ -217,15 +231,17 @@ public:
     const EmitterSet* emitters() const { return emitters_; }
 
 private:
-    void ensure_buffers(const SurfelSet& set, uint32_t ms);
+    void ensure_buffers(const SurfelSet& set, uint32_t ms, bool tiered);
     void run_lout(SurfelSet& set, const SolveConfig& cfg);
     void run_direct(SurfelSet& set, const SolveConfig& cfg);
     bool nee_active(const SolveConfig& cfg) const;
+    void classify_lod(SurfelSet& set, const SolveConfig& cfg,
+                      uint32_t first, uint32_t slice);
     void dispatch(SurfelSet& set, const SolveConfig& cfg,
                   uint32_t first, uint32_t slice, uint32_t frame);
     void end_sweep(SurfelSet& set, bool collect_stats);
 
-    Pipeline lout_prog_, radiance_, micro_, direct_, blk_prog_;
+    Pipeline lout_prog_, radiance_, micro_, direct_, blk_prog_, lod_prog_;
     std::unique_ptr<PassTimer> timer_;
 
     gl::Buffer b_lout_  {gl::BufferType::shader, gl::BufferUsage::dynamic_draw};
@@ -250,6 +266,14 @@ private:
     uint32_t   light_count_ = 0;
     uint32_t   lout_count_ = 0;
     uint32_t   bucket_ms_ = 0;
+    bool       bucket_tiered_ = false;
+    // vec4 offset of each tier's table inside b_bucket_, and its edge.
+    uint32_t   bucket_off_[3] = {0, 0, 0};
+    uint32_t   bucket_edge_[3] = {0, 0, 0};
+    gl::Buffer b_lod_list_{gl::BufferType::shader, gl::BufferUsage::dynamic_draw};
+    gl::Buffer b_lod_cmd_ {gl::BufferType::shader, gl::BufferUsage::dynamic_draw};
+    uint32_t   lod_cap_ = 0;
+    bool       lod_logged_ = false;
 
     uint32_t cursor_ = 0;
     uint32_t sweeps_ = 0;

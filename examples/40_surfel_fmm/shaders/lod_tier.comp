@@ -1,0 +1,88 @@
+#version 460 core
+layout(local_size_x = 256) in;
+
+// ---------------------------------------------------------------------------
+// Camera-distance LOD. Spec section 6.1.
+//
+// The microbuffer's angular resolution only has to match what the screen can
+// show. A surfel projecting to a quarter of a pixel has its entire hemisphere
+// smeared into that quarter pixel, so resolving it at 16x16 is 256 buckets of
+// work spent below the display's Nyquist rate. The spec's rule:
+//
+//     pixelSize     = 2 * tan(fov/2) * dist / screenHeight
+//     bucketsWanted = clamp(64 * (surfelRadius / pixelSize), 4, 64)
+//
+// quantized to three tiers. Finding 59 is why this is the lever: the solve's
+// per-receiver cost is fixed and it scales with BUCKET COUNT, and every attempt
+// to shrink it any other way -- shared memory, the reduction, the plane array --
+// measured flat or worse.
+//
+// This pass classifies a slice of receivers and COMPACTS each tier into its own
+// contiguous list, because the spec is explicit that branching on tier inside
+// one kernel destroys occupancy while three specialized dispatches do not. The
+// workgroup counts go straight into an indirect command buffer so the host never
+// has to read a counter back.
+//
+// DEVIATION: the spec assigns tier per CELL, because its dispatch is per cell
+// (section 4.1) and a cell's receivers share a camera distance. Finding 48
+// measured per-cell dispatch as having nothing to amortize at this receiver
+// count and it was never built, so the tier is per receiver here. That is
+// strictly finer, and it costs one indirection the per-cell version would not
+// need.
+//
+// Distance is to the camera POSITION, with no frustum test. A binary in/out
+// term would flip a surfel between 16 and 256 buckets as it crosses the frustum
+// edge, and its cached irradiance would visibly change quality at that moment;
+// distance alone is continuous, and offscreen surfels behind the camera are
+// demoted by the same rule as everything else.
+// ---------------------------------------------------------------------------
+
+#include "surfel.glsl"
+
+layout(std430, binding = 25) writeonly buffer LodList { uint lod_list[]; };
+layout(std430, binding = 26) buffer LodCmd  { uint lod_cmd[]; };   // 3 x (x, y, z)
+
+uniform uint  u_first;
+uniform uint  u_slice;
+uniform uint  u_count;
+uniform uint  u_cap;         // capacity of ONE tier's list, in receivers
+uniform vec3  u_cam;
+uniform float u_px_scale;    // 2 * tan(fov/2) / screenHeight
+uniform uint  u_ms;          // the top tier's edge; tiers are ms, ms/2, ms/4
+// Projected size, in pixels, at which a surfel still deserves the top tier. The
+// spec's constant is 1: full resolution for anything at least a pixel across.
+// That is a no-op at this scale -- Sponza's surfels are 2-3 px out to ~90 world
+// units and the scene is 30 across, so every receiver lands in tier 0 -- which
+// is why the threshold is a knob and not a 1.
+uniform float u_lod_px;
+
+void main() {
+    const uint r = gl_GlobalInvocationID.x;
+    if (r >= u_slice) return;
+
+    const uint  P = (u_first + r) % u_count;
+    const vec4  pr = s_pos_rad[P];
+    const float d  = max(distance(pr.xyz, u_cam), 1e-4);
+    const float px = max(u_px_scale * d, 1e-9);
+
+    // The spec's formula is written for a 64-bucket top tier: bucketsWanted is
+    // 64 * (radius/pixelSize), so the wanted fraction of the TOP tier is just
+    // radius/pixelSize. Ours is u_ms^2 buckets at the top, and edge = sqrt of
+    // the count, so the same rule in edge units is
+    //
+    //     edge = u_ms * sqrt(radius / pixelSize)
+    //
+    // -- a surfel one pixel across asks for the full buffer, and the demand
+    // falls as the square root of its projected size, not linearly.
+    const float edge = float(u_ms) * sqrt(pr.w / (px * max(u_lod_px, 1e-6)));
+
+    // Tier boundaries at the two halvings of the top edge.
+    const float e0 = float(u_ms);
+    const uint tier = edge >= e0 ? 0u : (edge >= e0 * 0.5 ? 1u : 2u);
+
+    const uint slot = atomicAdd(lod_cmd[tier * 3u], 1u);
+    // Cannot overflow: each receiver lands in exactly one tier and every list is
+    // sized for the whole slice. The guard is here so a mis-sized buffer clamps
+    // instead of writing out of bounds.
+    if (slot < u_cap) lod_list[tier * u_cap + slot] = P;
+}
