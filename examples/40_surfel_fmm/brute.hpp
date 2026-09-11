@@ -52,6 +52,10 @@ struct SolveConfig {
     // far field can reach before something is in the way. Only meaningful with
     // near_radius set, since without a horizon nothing is far.
     bool far_occlusion = true;
+    // Spherical-harmonic bands the far field evaluates. 0 is the direction-blind
+    // block mean this started as and reproduces it exactly; 1 adds the dipole,
+    // which is what separates a wall's lit face from its unlit one.
+    int  far_order = 1;
 
     // Force EVERY surfel to emit from both faces. Diagnostic only; off.
     //

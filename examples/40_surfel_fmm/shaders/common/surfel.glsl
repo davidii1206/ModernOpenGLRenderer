@@ -12,6 +12,10 @@
 //
 // Every read of cell_item must mask it off.
 const uint kCellOwner = 0x80000000u;
+
+// The far field's per-block multipole: four SH coefficients, each carrying three
+// radiance channels and one denominator. See blk_rad.comp.
+const uint kBlkWords = 16u;
 uint sgi_cell_index(uint e) { return e & ~kCellOwner; }
 
 // cell_sc.y carries two counts: the low 16 bits are all the entries in the cell,

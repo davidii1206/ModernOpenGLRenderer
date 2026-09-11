@@ -176,7 +176,7 @@ void Solver::run_lout(SurfelSet& set, const SolveConfig& cfg) {
     // clear and an accumulate cannot share a barrier.
     if (grid_ != nullptr && grid_->valid() && blk_prog_.valid()) {
         const glm::ivec3 mr = grid_->macro_res();
-        const uint32_t words = uint32_t(mr.x) * uint32_t(mr.y) * uint32_t(mr.z) * 4u;
+        const uint32_t words = uint32_t(mr.x) * uint32_t(mr.y) * uint32_t(mr.z) * 16u;
         if (words != blk_words_) {
             const std::vector<uint32_t> zero(words, 0u);
             b_blk_.data(zero.data(), zero.size() * sizeof(uint32_t));
@@ -353,6 +353,7 @@ void Solver::dispatch(SurfelSet& set, const SolveConfig& cfg,
             micro_.set("u_cell", grid_->cell());
             micro_.set("u_radius", set.radius());
             micro_.set("u_far_occ", cfg.far_occlusion ? 1u : 0u);
+            micro_.set("u_far_order", uint32_t(cfg.far_order));
             b_blk_.bind_base(kBindBlkRad);
         } else {
             micro_.set("u_far_occ", 0u);

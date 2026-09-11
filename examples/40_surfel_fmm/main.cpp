@@ -161,6 +161,7 @@ struct EnvOpts {
     float neeskip = 0.0f;        // SGI_NEE_SKIP  cache-agreement margin, 0 = off
     float nearspac = 0.0f;       // SGI_NEAR      occlusion horizon in SPACINGS, 0 = unlimited
     bool  farocc = true;         // SGI_FAR_OCC   march the macro bitmask for the far field
+    int   farorder = 1;          // SGI_FAR_ORDER SH bands in the far field: 0 or 1
     // Scripted camera, for scenes that have no reference view. "x,y,z".
     std::string eye, at;         // SGI_EYE / SGI_AT
     float neethick = 0.25f;      // SGI_NEE_THICK surfel slab half-thickness, in radii
@@ -251,6 +252,7 @@ EnvOpts read_env() {
     if (const char* v = getenv("SGI_BIAS"))     o.bias = float(atof(v));
     if (const char* v = getenv("SGI_NEAR"))     o.nearspac = float(atof(v));
     if (const char* v = getenv("SGI_FAR_OCC"))  o.farocc = atoi(v) != 0;
+    if (const char* v = getenv("SGI_FAR_ORDER")) o.farorder = atoi(v);
     if (const char* v = getenv("SGI_EYE"))      o.eye = v;
     if (const char* v = getenv("SGI_AT"))       o.at = v;
     if (const char* v = getenv("SGI_SOFT"))     o.soft = float(atof(v));
@@ -482,6 +484,7 @@ int main() {
     cfg.nee_skip = env.neeskip;
     cfg.near_radius = env.nearspac > 0.0f ? env.nearspac * scene.spacing() : 0.0f;
     cfg.far_occlusion = env.farocc;
+    cfg.far_order = env.farorder;
     cfg.nee_cuts = env.neecuts != 0;
     if (env.bias >= 0.0f) cfg.plane_bias = env.bias;
     if (env.soft >= 0.0f) cfg.soft_eps = env.soft;

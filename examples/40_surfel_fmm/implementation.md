@@ -3208,6 +3208,71 @@ order-2 far field, which is the next real piece of the FMM and is now motivated
 by a measurement rather than by the spec's say-so.
 
 
+### Finding 57 — an order-1 far field, and why step 7's fix does not transfer
+
+Finding 56 put the cache's noise in the far field and named the order-0 block
+mean as the cause: a block holds the lit inner face of a wall and its unlit outer
+face and reports their average, so the field is direction-blind.
+
+**So it has a direction now.** A Lambertian surfel of radiance `L` and normal `n`
+contributes `L * max(dot(n, w), 0)` to its block's intensity in direction `w`,
+and the clamped cosine lobe projects onto spherical harmonics with the standard
+convolution coefficients -- `pi` at band 0, `2pi/3` at band 1. So each block
+accumulates
+
+    N(w) = SUM_i L_i * max(dot(n_i, w), 0)
+    D(w) = SUM_i       max(dot(n_i, w), 0)
+
+as SH coefficients, and a receiver in direction `w` gets `N(w)/D(w)`: the
+radiance averaged over the surfels that actually face it, rather than over all of
+them. Sixteen signed ints a block -- twelve for `N` across three channels, four
+for `D` -- which is 16 MB for Sponza's macro grid against 4.
+
+**Band 0 alone is exactly the old mean**, since `N_00/D_00 = sum(L_i)/n`, so
+`SGI_FAR_ORDER=0` reproduces the previous implementation bit for bit rather than
+approximating it. That is what makes the comparison below a measurement instead
+of an argument:
+
+| | mean | seed-to-seed noise | solve |
+|---|---|---|---|
+| order 0 | 93.6 | 0.1067 | 9.35 ms |
+| **order 1** | 96.4 | **0.0981** | 9.67 ms |
+
+**Eight percent, for three percent of the solve.** Worth keeping and worth being
+disappointed by: the dipole was supposed to be the fix and it is a trim. Which
+relocates the residual -- if direction was only an eighth of it, most of the
+noise is the SPATIAL quantization of which block the march happens to stop in.
+
+**Which is what trilinear interpolation is for, and it fails here for a reason
+worth writing down.** Finding 56 tried it on the order-0 field and lost 40% of
+the scene's energy; the diagnosis then was that blending a direction-blind
+average compounds its error. With an SH to interpolate that objection is gone --
+empty blocks contribute zero to both `N` and `D`, so nothing needs renormalizing
+-- and it was tried again. Mean 96.4 -> 62.1. The same 40%.
+
+So the diagnosis was wrong and the real one is architectural. **Spec section 10
+step 7 interpolates the LOCAL EXPANSION at the receiver's cell** -- the incident
+field, which genuinely varies smoothly with where the receiver stands. **This
+samples the OUTGOING radiance of the block a visibility march stopped in**, and
+the blocks around that one are mostly surfaces the receiver cannot see: the far
+side of the same wall, the geometry behind it. Averaging them in mixes visible
+with invisible, and the scene goes dark. Step 7's fix does not transfer to a far
+field that is sampled by a march rather than downswept to a receiver.
+
+Reverted, twice now. The hit block alone.
+
+**What that leaves.** The spatial discontinuity is real and neither more SH bands
+nor interpolation addresses it. It is a consequence of resolving the far field by
+marching to a block: the answer is piecewise constant in the block grid by
+construction. Softening it needs either a finer structure near the hit, or the
+FMM's actual shape -- a local expansion carried to the receiver, where
+interpolation is meaningful. That is a larger change than this one and it is now
+the thing the measurement points at.
+
+Cornell is unaffected: its far field is off at the default horizon, GI MAE 12.95,
+30/30 gates.
+
+
 ## Gate results
 
 `SGI_GATE=all SGI_NOGUI=1 ./40_surfel_fmm` — 30 assertions, all pass.

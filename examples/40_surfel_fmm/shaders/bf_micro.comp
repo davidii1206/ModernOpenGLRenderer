@@ -79,8 +79,8 @@ layout(std430, binding = 20) readonly buffer DirectIn { vec4 direct_e[]; };
 // The grid's coarse occupancy, one bit per 4x4x4 cell block. A binary
 // voxelization of the scene at ~4 spacings, already built for the NEE march.
 layout(std430, binding = 21) readonly buffer Macro  { uint macro_bits[]; };
-// Order-0 multipole: sum(L_out) and a count per macro block. See blk_rad.comp.
-layout(std430, binding = 24) readonly buffer BlkRad { uint blk[]; };
+// The far field's per-block multipole, four SH coefficients. See blk_rad.comp.
+layout(std430, binding = 24) readonly buffer BlkSH { int blk[]; };
 // The grid, for the U-list walk. Same structures the NEE march uses: owner
 // entries first in each cell, and their count in the high half of sc.y.
 layout(std430, binding = 8)  readonly buffer CellSC { uvec2 cell_sc[]; };
@@ -116,6 +116,7 @@ uniform uint  u_far_occ;         // 1 = march the macro bitmask for a far horizo
 uniform vec3  u_grid_min;
 uniform ivec3 u_macro_res;
 uniform float u_macro_cell;      // world size of one macro block
+uniform uint  u_far_order;       // SH bands the far field evaluates: 0 or 1
 uniform ivec3 u_grid_res;
 uniform float u_cell;
 uniform float u_radius;          // the set's global surfel radius
@@ -465,21 +466,51 @@ void main() {
         float t_hit = 0.0;
         const int mb = sgi_far_block(posP + nP * u_macro_cell, wd, u_near, 3.4e38, t_hit);
         if (mb < 0) continue;                    // left the grid: sky
-        const uint base = uint(mb) * 4u;
-        const float n = float(blk[base + 3u]);
-        if (n < 0.5) continue;                   // block holds nothing: sky
-        // The hit block's value, NOT a blend across its neighbours. Trilinear
-        // interpolation is what spec section 10 step 7 prescribes for the
-        // cell-boundary discontinuity, and it was tried here: it lost 40% of the
-        // scene's energy and made the seed-to-seed noise worse, 0.107 to 0.171.
-        // Step 7 interpolates an order-2 SH, which carries direction. This is an
-        // order-0 average that is already direction-blind -- a block holds the
-        // lit inner face of a wall and its unlit outer face and reports their
-        // mean -- so blending it spatially compounds that error instead of
-        // fixing it. The error is directional, and only an order-2 far field
-        // addresses it.
-        lds_far_L[b] = vec3(float(blk[base + 0u]), float(blk[base + 1u]),
-                            float(blk[base + 2u])) * (1.0 / (kFixed * n));
+        // The block emits TOWARD the receiver, so evaluate at -wd.
+        //
+        // N(w)/D(w) is the outgoing radiance averaged over the surfels that face
+        // w, rather than over all of them -- which is the whole point. Band 0
+        // alone gives N_00/D_00 = sum(L)/n, exactly the order-0 mean this
+        // replaced, so u_far_order = 0 reproduces it bit for bit and the two can
+        // be compared without a second code path.
+        const vec3 ow = -wd;
+        float yy[4];
+        yy[0] = 0.2820947918;
+        yy[1] = 0.4886025119 * ow.y;
+        yy[2] = 0.4886025119 * ow.z;
+        yy[3] = 0.4886025119 * ow.x;
+
+        // The hit block alone. NOT blended across its neighbours, and this is
+        // the second time that has been measured: 40% of the scene's energy
+        // gone, with the order-0 field (finding 56) and again with the order-1
+        // one, mean 96.4 -> 62.1.
+        //
+        // The reason is not the field's order, it is what is being interpolated.
+        // Spec section 10 step 7 interpolates the LOCAL EXPANSION at the
+        // receiver's cell -- the incident field, which genuinely varies smoothly
+        // with where the receiver stands. This samples the OUTGOING radiance of
+        // the block a visibility march stopped in, and the blocks around that
+        // one are mostly surfaces the receiver cannot see: the far side of the
+        // same wall, the geometry behind it. Averaging them in mixes visible
+        // with invisible and darkens everything. Step 7's fix does not transfer
+        // to a far field that is sampled by a march rather than downswept to the
+        // receiver.
+        const uint base  = uint(mb) * kBlkWords;
+        const uint bands = u_far_order == 0u ? 1u : 4u;
+        vec3  num = vec3(0.0);
+        float den = 0.0;
+        for (uint k = 0u; k < bands; ++k) {
+            const float w = yy[k] * (1.0 / kFixed);
+            num += w * vec3(float(blk[base + k * 4u + 0u]),
+                            float(blk[base + k * 4u + 1u]),
+                            float(blk[base + k * 4u + 2u]));
+            den += w * float(blk[base + k * 4u + 3u]);
+        }
+        // A denominator at or below zero means nothing in this block faces the
+        // receiver -- the band-limited lobe can undershoot -- so the sky stands.
+        if (den < 1e-6) continue;
+        lds_far_L[b] = max(num / den, vec3(0.0));
+        continue;
     }
     barrier();
 
