@@ -3273,6 +3273,60 @@ Cornell is unaffected: its far field is off at the default horizon, GI MAE 12.95
 30/30 gates.
 
 
+### Finding 58 — the per-receiver cost was shared memory and an uncapped U-list
+
+Finding 48 measured the solve's cost as fixed per receiver -- an empty U-list
+still cost 2.7 ms per 2048 receivers -- and pointed at shared memory and
+workgroup launches rather than at candidate work. Two changes, both aimed there.
+
+**The far field had its own pass, its own array and its own barrier, and needed
+none of them.** It marched every bucket into `lds_far_L`, and the integrate read
+it back for the same bucket, in a loop with the same stride -- so the same thread
+owns bucket `b` in both, and phase B in between skips far candidates outright.
+Nothing depended on the separation. Folding the march into the integrate deletes
+4 KB of shared memory per workgroup and one barrier.
+
+**9.67 -> ~7.0 ms** on Sponza's solve, Cornell byte-identical.
+
+**Then the U-list cap, which on a big scene is not a size but a WORK LIMIT.**
+`kMaxCand` was 1024. Past 65536 surfels an overflowing U-list clamps to it rather
+than falling back to all-pairs (finding 51), and Sponza overflows constantly --
+one of its cells holds 2605 entries. So the cap is what each receiver actually
+processes:
+
+| `kMaxCand` | solve | mean |
+|---|---|---|
+| 1024 | 6.82 ms | 95.8 |
+| 512 | 4.66 | 96.9 |
+| **256** | **2.09** | 98.0 |
+| 128 | 2.22 | 99.1 |
+
+**3.3x.** The 2.3% brightening is the price and it is the honest kind: a dropped
+occluder is a shadow that does not happen. Below 128 it stops paying and keeps
+costing.
+
+Cornell's U-list is about thirty entries at the default horizon, so it never
+reaches the cap -- its render is byte-identical at every value, which is what
+says the two scenes are being traded off independently rather than one being
+tuned at the other's expense.
+
+**Together, on the solve:**
+
+| | Sponza | Cornell |
+|---|---|---|
+| before | 9.67 ms | ~2.4 ms |
+| after | **2.09 ms** | **1.57 ms** |
+
+30/30 gates, Cornell byte-identical, Sponza's seed-to-seed noise 0.0981 ->
+0.0950.
+
+**What this does not do** is touch the launch overhead finding 48 also named --
+2048 receivers is still 2048 workgroups. That is the remaining half of the idea,
+and it wants several receivers per workgroup, which trades against the shared
+memory this just freed. Worth doing only with the freed budget in hand, which is
+now the case.
+
+
 ## Gate results
 
 `SGI_GATE=all SGI_NOGUI=1 ./40_surfel_fmm` — 30 assertions, all pass.
