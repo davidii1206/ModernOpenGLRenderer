@@ -121,7 +121,13 @@ struct EnvOpts {
                                      // match CornellBoxOriginal.glb; anything else
                                      // is for testing the estimator, not for a
                                      // numeric comparison)
-    uint32_t surfels = 30000;    // SGI_SURFELS
+    uint32_t surfels = 30000;
+    // SGI_SURFELS
+    // Two bakes of the same scene at different seeds carry the same lighting, so
+    // whatever differs between them is sampling noise and nothing else. That is
+    // the only instrument here that can tell noise from real geometric detail,
+    // which every high-pass metric tried in this example has failed to do.
+    uint32_t seed = 12345u;      // SGI_SEED
     uint32_t budget  = 2048;     // SGI_BUDGET   receivers per frame
     uint32_t bounces = 3;        // SGI_BOUNCES  sweeps; 1 == direct only
     uint32_t buckets = 16;       // SGI_BUCKETS  microbuffer edge (8 or 16)
@@ -206,6 +212,7 @@ EnvOpts read_env() {
     if (const char* v = getenv("SGI_GATE"))     o.gate = v;
     if (const char* v = getenv("SGI_MODEL"))    o.model = v;
     if (const char* v = getenv("SGI_SURFELS"))  u32(v, o.surfels);
+    if (const char* v = getenv("SGI_SEED"))     u32(v, o.seed);
     if (const char* v = getenv("SGI_BUDGET"))   u32(v, o.budget);
     if (const char* v = getenv("SGI_BOUNCES"))  u32(v, o.bounces);
     if (const char* v = getenv("SGI_BUCKETS"))  u32(v, o.buckets);
@@ -311,7 +318,7 @@ int main() {
     }
 
     SurfelSet scene;
-    scene.build(tris, env.surfels);
+    scene.build(tris, env.surfels, env.seed);
     apply_base_color_textures(scene, tris, *model);
     const Bounds& sb = scene.bounds();
     gllib::logf(gllib::LogLevel::info,
@@ -384,7 +391,7 @@ int main() {
         }
         model = std::move(next);
         tris  = std::move(next_tris);
-        scene.build(tris, target_surfels);
+        scene.build(tris, target_surfels, env.seed);
         apply_base_color_textures(scene, tris, *model);
         grid.build(scene, env.cell);
         emitters.build(tris);

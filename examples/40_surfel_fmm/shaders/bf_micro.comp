@@ -229,7 +229,7 @@ bool sgi_macro_at(ivec3 m) {
 // finding 45 could not tune: the block it stops at is the surface the bucket
 // sees, and its aggregate radiance is what the far field contributes. There is
 // nothing left to trade off.
-int sgi_far_block(vec3 P, vec3 d, float t_start, float t_max) {
+int sgi_far_block(vec3 P, vec3 d, float t_start, float t_max, out float t_hit) {
     const float h = u_macro_cell;
     const vec3  p0 = P + d * t_start;
     const vec3  g  = (p0 - u_grid_min) / h;
@@ -246,9 +246,11 @@ int sgi_far_block(vec3 P, vec3 d, float t_start, float t_max) {
     for (int i = 0; i < 96; ++i) {
         if (any(lessThan(c, ivec3(0))) || any(greaterThanEqual(c, u_macro_res)))
             return -1;
-        if (sgi_macro_at(c))
+        if (sgi_macro_at(c)) {
+            t_hit = t;
             return int(uint(c.x) + uint(u_macro_res.x) *
                        (uint(c.y) + uint(u_macro_res.y) * uint(c.z)));
+        }
         if (tnext.x < tnext.y && tnext.x < tnext.z) {
             c.x += stp.x; t = t_start + tnext.x; tnext.x += tdelta.x;
         } else if (tnext.y < tnext.z) {
@@ -260,6 +262,8 @@ int sgi_far_block(vec3 P, vec3 d, float t_start, float t_max) {
     }
     return -1;
 }
+
+
 
 // What a bucket sees when it sees no geometry: a zenith-to-ground gradient with
 // the sun as a disc on top. `w` is a WORLD direction.
@@ -458,11 +462,22 @@ void main() {
         // That rendered the room black. Lifted, a grazing ray travels above its
         // own plane's blocks and gains height as it goes, because cosP > 0 for
         // every bucket.
-        const int mb = sgi_far_block(posP + nP * u_macro_cell, wd, u_near, 3.4e38);
+        float t_hit = 0.0;
+        const int mb = sgi_far_block(posP + nP * u_macro_cell, wd, u_near, 3.4e38, t_hit);
         if (mb < 0) continue;                    // left the grid: sky
         const uint base = uint(mb) * 4u;
         const float n = float(blk[base + 3u]);
         if (n < 0.5) continue;                   // block holds nothing: sky
+        // The hit block's value, NOT a blend across its neighbours. Trilinear
+        // interpolation is what spec section 10 step 7 prescribes for the
+        // cell-boundary discontinuity, and it was tried here: it lost 40% of the
+        // scene's energy and made the seed-to-seed noise worse, 0.107 to 0.171.
+        // Step 7 interpolates an order-2 SH, which carries direction. This is an
+        // order-0 average that is already direction-blind -- a block holds the
+        // lit inner face of a wall and its unlit outer face and reports their
+        // mean -- so blending it spatially compounds that error instead of
+        // fixing it. The error is directional, and only an order-2 far field
+        // addresses it.
         lds_far_L[b] = vec3(float(blk[base + 0u]), float(blk[base + 1u]),
                             float(blk[base + 2u])) * (1.0 / (kFixed * n));
     }

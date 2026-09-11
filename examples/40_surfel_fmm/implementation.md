@@ -3132,6 +3132,82 @@ Cornell has no sun and is unchanged to the digit: direct MAE 5.81, GI 12.95,
 30/30 gates.
 
 
+### Finding 56 — the noise is the far field, and step 7 does not fix an order-0 one
+
+"Basically just voronoi noise" needed an instrument before it needed a fix, and
+the obvious one is useless here. High-frequency energy after a low-pass reads
+**higher** at 1387840 surfels (7.43) than at 285594 (6.24), while looking far
+smoother, because a denser bake resolves real geometric detail and the metric
+cannot tell detail from noise. Finding 17 recorded that trap and this walked into
+it anyway.
+
+**The instrument that works is the bake seed.** Two bakes of the same scene at
+different seeds carry the same lighting, so everything they agree on cancels and
+what is left is sampling noise with no real feature in it. `SGI_SEED`.
+
+**What it says, on Sponza, as a fraction of the mean:**
+
+| | seed-to-seed noise |
+|---|---|
+| 285594 surfels | 0.107 |
+| 1387840 surfels | 0.093 |
+
+**Density is not the lever.** Nearly five times the surfels buys 13%, because the
+gather's radius is in SPACINGS -- it always averages about the same number of
+surfels, whatever the density. Density changes the noise's spatial scale, not its
+amplitude, which is exactly why the dense bake looks better without being
+quieter.
+
+**The far field is the lever:**
+
+| occlusion horizon | noise |
+|---|---|
+| 1.5 spacings (far field carries almost everything) | 0.107 |
+| 6 | 0.059 |
+| 25 | 0.045 |
+| far field off entirely | **0.038** |
+
+A macro block is four spacings across, and two neighbouring surfels whose marches
+stop in different blocks get different radiance. That is the patch scale, and it
+is where the noise lives.
+
+**Spec section 10 step 7 predicts this and prescribes trilinear interpolation:**
+"the delta is the cell-boundary discontinuity disappearing. If you skip this you
+will see a grid artifact and blame step 6." So it was built -- eight blocks
+around the hit, weights renormalized over the ones holding anything -- and it is
+**wrong here**, measurably:
+
+| | mean | noise |
+|---|---|---|
+| hit block only | 93.6 | 0.107 |
+| trilinear across neighbours | 55.3 | 0.171 |
+
+Forty percent of the scene's energy gone and the noise worse. The reason is what
+step 7 is interpolating: an order-2 SH, which carries direction. Ours is an
+order-0 average that is **already direction-blind** -- a block holds the lit inner
+face of a wall and its unlit outer face and reports their mean (finding 46) -- so
+blending it spatially compounds that error rather than removing it. The
+discontinuity is real, but its cause is directional and only an order-2 far field
+addresses it.
+
+Reverted. 30/30 gates, mean and noise back to 93.6 and 0.107.
+
+**What is available today**, measured, with reconstruct cost on Sponza:
+
+| | cost | noise |
+|---|---|---|
+| default: gather 1.5, denoise r 3 | 23.5 ms | 0.107 |
+| gather 4.0 | 33.9 ms | 0.066 |
+| denoise r 6 | 36.7 ms | 0.068 |
+| denoise r 9 | 55.1 ms | 0.053 |
+
+Both knobs buy noise as the square root of how many surfels get averaged and cost
+linearly in the same quantity, so neither dominates and neither is free. Widening
+the gather is the better of the two on this scene. The structural fix is the
+order-2 far field, which is the next real piece of the FMM and is now motivated
+by a measurement rather than by the spec's say-so.
+
+
 ## Gate results
 
 `SGI_GATE=all SGI_NOGUI=1 ./40_surfel_fmm` — 30 assertions, all pass.
