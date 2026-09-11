@@ -47,8 +47,9 @@
 //   SGI_SUN=0               sun radiance, added inside its disc
 //   SGI_SUN_ELEV=50         sun elevation in degrees
 //   SGI_SUN_AZIM=30         sun azimuth in degrees
-//   SGI_SUN_ANGLE=4         sun angular RADIUS in degrees; the microbuffer is
-//                           16x16, so a realistic 0.53 aliases into a bucket
+//   SGI_SUN_ANGLE=4         sun angular RADIUS in degrees
+//   SGI_SUN_NEE=1           NEE owns the sun (sharp shadow); 0 leaves it to the
+//                           microbuffer's environment, at 16x16 bucket resolution
 //   SGI_NEAR=0              occlusion horizon in SPACINGS; beyond it a surfel
 //                           lights but does not block. 0 = unlimited. Simulates
 //                           the FMM's U-list horizon (finding 44). Non-zero also
@@ -131,6 +132,7 @@ struct EnvOpts {
     float sunelev = 50.0f;       // SGI_SUN_ELEV   degrees above the horizon
     float sunazim = 30.0f;       // SGI_SUN_AZIM   degrees, 0 = +X toward +Z
     float sunangle = 4.0f;       // SGI_SUN_ANGLE  angular RADIUS in degrees
+    bool  sunnee = true;         // SGI_SUN_NEE    1 = NEE owns the sun (sharp shadow)
     float emissive = 1.0f;       // SGI_EMISSIVE
     int   view = 7;              // SGI_VIEW     display mode index
     // 1 = reference camera at 512^2 (pixel-aligned against the PNGs)
@@ -214,6 +216,7 @@ EnvOpts read_env() {
     if (const char* v = getenv("SGI_SUN_ELEV")) o.sunelev = float(atof(v));
     if (const char* v = getenv("SGI_SUN_AZIM")) o.sunazim = float(atof(v));
     if (const char* v = getenv("SGI_SUN_ANGLE")) o.sunangle = float(atof(v));
+    if (const char* v = getenv("SGI_SUN_NEE")) o.sunnee = atoi(v) != 0;
     if (const char* v = getenv("SGI_EMISSIVE")) o.emissive = float(atof(v));
     if (const char* v = getenv("SGI_VIEW"))     o.view = atoi(v);
     if (const char* v = getenv("SGI_GTCAM"))    o.gtcam = atoi(v);
@@ -452,6 +455,7 @@ int main() {
     // holes rather than as shadow.
     cfg.sky_ground = glm::vec3(env.skyground >= 0.0f ? env.skyground : 0.25f * env.sky);
     cfg.sun = glm::vec3(env.sun);
+    cfg.sun_nee = env.sunnee;
     {
         const float el = glm::radians(env.sunelev), az = glm::radians(env.sunazim);
         cfg.sun_dir = glm::normalize(glm::vec3(std::cos(el) * std::cos(az),
@@ -639,6 +643,15 @@ int main() {
                                                    std::sin(el),
                                                    std::cos(el) * std::sin(az)));
             cfg.sun_cos = std::cos(glm::radians(std::max(sun_angle, 0.05f)));
+            // NEE's stand-in rectangle: far enough to be outside the scene, and
+            // sized to the sun's own solid angle. A disc of angular radius t
+            // subtends pi*t^2 and a square of half-extent h at distance D
+            // subtends (2h)^2/D^2, so h = D*t*sqrt(pi)/2. Get this wrong and the
+            // sun changes brightness rather than shape, which reads as an
+            // exposure bug rather than a geometry one.
+            const float theta = glm::radians(std::max(sun_angle, 0.05f));
+            cfg.sun_dist = std::max(0.1f, 4.0f * scene.bounds().radius());
+            cfg.sun_half = cfg.sun_dist * theta * 0.8862269f;
             cfg.near_radius = near_spacings > 0.0f ? near_spacings * scene.spacing() : 0.0f;
         }
 
@@ -683,7 +696,8 @@ int main() {
         //
         //     Its own timer, and outside the pass above: PassTimer wraps a GL
         //     query object, and a query cannot be begun while another is active.
-        if (cfg.nee && cfg.nee_pixel) {
+        if (cfg.nee && cfg.nee_pixel &&
+            (emitters.count() > 0 || cfg.sun_is_nee_light())) {
             ScopedPass p(t_direct_px);
             direct_px.render(gbuf, scene, grid, emitters, cuts, cam,
                              gather.target(), gather.bracket(),
@@ -788,6 +802,11 @@ int main() {
                 ImGui::SliderFloat("Sun elevation", &sun_elev, 0.0f, 90.0f, "%.0f deg");
                 ImGui::SliderFloat("Sun azimuth", &sun_azim, -180.0f, 180.0f, "%.0f deg");
                 ImGui::SliderFloat("Sun radius", &sun_angle, 0.5f, 20.0f, "%.1f deg");
+                // Exactly one of the two must own the sun or it is counted
+                // twice. NEE traces it with the same 256-bit cone mask the
+                // emitter rectangles get, so its shadow is as sharp as theirs;
+                // the microbuffer's is 16x16 buckets wide.
+                ImGui::Checkbox("Sun through NEE (sharp shadow)", &cfg.sun_nee);
                 // Above 65536 surfels the all-pairs path cannot index its own
                 // winners, so a big scene NEEDS this non-zero. Sponza is 285594.
                 if (ImGui::SliderFloat("Near horizon", &near_spacings, 0.0f, 8.0f,

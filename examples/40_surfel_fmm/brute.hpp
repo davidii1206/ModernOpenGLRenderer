@@ -78,6 +78,16 @@ struct SolveConfig {
     glm::vec3 sun{0.0f};           // sun radiance, added inside its disc
     glm::vec3 sun_dir{0.0f, 1.0f, 0.0f};   // world direction TO the sun
     float     sun_cos = 0.999f;    // cos of the sun's angular radius
+    // Who owns the sun. NEE gives it a sharp shadow through the cone bitmask;
+    // the microbuffer gives it a 16x16-bucket one for free. Exactly one of them
+    // must have it, or it is counted twice.
+    bool      sun_nee = true;
+    // True when NEE has a sun to trace, whatever the emitter buffer holds.
+    bool sun_is_nee_light() const {
+        return sun_nee && (sun.r > 0.0f || sun.g > 0.0f || sun.b > 0.0f);
+    }
+    float     sun_dist = 0.0f;     // where NEE places its stand-in rectangle
+    float     sun_half = 0.0f;     // and that rectangle's half-extent
 
     float depth_tol_radii = 2.0f;  // distance from the winner's plane, in radii
     float normal_tol = 0.7f;       // cos of the largest normal disagreement kept

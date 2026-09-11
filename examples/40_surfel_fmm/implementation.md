@@ -3082,6 +3082,56 @@ moves it 5.84 to 6.52, so the order-0 far field's block averaging is NOT what is
 muting it -- worth knowing, because that was the obvious suspect and it is wrong.
 
 
+### Finding 55 — the sun as an NEE emitter, by writing it as a rectangle
+
+The sun was a bright disc in the microbuffer's environment (finding 52), which
+made its shadow free and 16x16 buckets wide. Sponza is lit by nothing else, so
+the sharpest term in the image was being resolved by the coarsest instrument in
+the renderer.
+
+**It is a rectangle now**, synthesized per receiver: a square placed `u_sun_dist`
+along the sun direction, facing back, sized so it subtends the same solid angle
+as the sun's disc. A disc of angular radius `t` subtends `pi*t^2`; a square of
+half-extent `h` at distance `D` subtends `(2h)^2/D^2`; equating them gives
+`h = D*t*sqrt(pi)/2`. Getting that wrong changes the sun's BRIGHTNESS and not its
+shape, so it would read as an exposure bug rather than a geometry one -- which is
+why the check below is on energy.
+
+Everything else is unchanged. The cone march, the oriented-ellipse occluder
+projection, the cut planes, the slab test and the 256-bit stratified mask all
+apply to the sun exactly as they do to Cornell's panel, because the sun is now
+the same kind of object. The estimator's per-emitter body was factored into
+`sgi_nee_emitter` so there is one copy of it rather than two.
+
+`SGI_SUN_NEE` picks the owner, and exactly one of them has it: the microbuffer's
+`u_sun` is forced to zero when NEE takes the sun, or it would be counted twice.
+
+**Energy agrees, which is the sizing check.** Mean image brightness over Sponza,
+identical camera and lighting, microbuffer sun against NEE sun: 16.9 / 16.8 in
+the arcade, 11.3 / 11.3 in a second view. **Shape does not agree, which is the
+point** -- the sun's visibility term over the courtyard floor shows individual
+column and planter shadows with hard edges.
+
+**What had to be unblocked.** Three separate guards refused the NEE path when the
+emitter BUFFER was empty -- `nee_active`, `Solver::run_direct` and
+`DirectPixelPass::render` -- and the sun is not in that buffer, it is built per
+receiver. So an outdoor scene, which is every scene with no emissive surface,
+read as "there is no direct light" and skipped the pass entirely. All three now
+ask whether there is a sun as well.
+
+**The cost is real and it is not a defect of the implementation.** Direct/px on
+Sponza at 1600x900 is **2091 ms**. A local panel's shadow ray is bounded by the
+distance to the panel; a directional light's is bounded by the SCENE, so every
+pixel marches the grid from itself to the far side of Sponza. That is inherent to
+a sun, and it belongs to the performance work rather than to this: the obvious
+lever is that a 1-degree sun fills its mask almost immediately, so the
+`sgi_mask_full` early-out should terminate these marches far sooner than it does
+at macro-block granularity.
+
+Cornell has no sun and is unchanged to the digit: direct MAE 5.81, GI 12.95,
+30/30 gates.
+
+
 ## Gate results
 
 `SGI_GATE=all SGI_NOGUI=1 ./40_surfel_fmm` — 30 assertions, all pass.

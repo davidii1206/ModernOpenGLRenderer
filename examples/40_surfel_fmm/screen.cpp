@@ -299,7 +299,10 @@ void DirectPixelPass::render(const GBuffer& gb, SurfelSet& set, const SurfelGrid
                              const gl::Texture& target, const gl::Texture& bracket,
                              int width, int height,
                              const SolveConfig& cfg, bool show_light) {
-    if (!prog_.valid() || set.count() == 0 || !grid.valid() || emitters.count() == 0) return;
+    if (!prog_.valid() || set.count() == 0 || !grid.valid()) return;
+    // The sun is not in the emitter buffer -- it is built per receiver -- so an
+    // empty buffer does not mean there is nothing to trace.
+    if (emitters.count() == 0 && !cfg.sun_is_nee_light()) return;
 
     set.bind();
     grid.bind();
@@ -330,6 +333,10 @@ void DirectPixelPass::render(const GBuffer& gb, SurfelSet& set, const SurfelGrid
     prog_.set("u_radius", set.radius());
     prog_.set("u_show_light", show_light ? 1u : 0u);
     prog_.set("u_skip", cfg.nee_skip);
+    prog_.set("u_sun_rad", cfg.sun_nee ? cfg.sun : glm::vec3(0.0f));
+    prog_.set("u_sun_dir", glm::normalize(cfg.sun_dir));
+    prog_.set("u_sun_dist", cfg.sun_dist);
+    prog_.set("u_sun_half", cfg.sun_half);
 
     gl::dispatch_compute(uint32_t((width + 7) / 8), uint32_t((height + 7) / 8), 1);
     glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);

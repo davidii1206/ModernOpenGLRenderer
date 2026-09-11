@@ -40,6 +40,19 @@ layout(std430, binding = 21) readonly buffer Macro    { uint  macro_bits[]; };
 layout(std430, binding = 23) readonly buffer MacroCell{ uvec2 macro_cell[]; };
 
 uniform uint  u_emitters;
+// The sun, as a directional light. Zero radiance disables it.
+//
+// It is handled here rather than as a bright disc in the microbuffer's
+// environment because that is the only way its shadow gets to be sharp: the
+// microbuffer resolves 16x16 buckets over a hemisphere, so a sun small enough to
+// be a sun lands in one of them and casts a bucket-shaped shadow. Everything
+// this file already does for a rectangle -- the cone march, the occluder
+// projection, the 256-bit stratified mask -- applies unchanged once the sun is
+// written AS a rectangle.
+uniform vec3  u_sun_rad;    // radiance inside the disc; 0 = no sun
+uniform vec3  u_sun_dir;    // world direction TO the sun, normalized
+uniform float u_sun_dist;   // how far away to place the stand-in rectangle
+uniform float u_sun_half;   // its half-extent, sized to the sun's solid angle
 uniform vec3  u_grid_min;
 uniform ivec3 u_grid_res;
 uniform ivec3 u_macro_res;
@@ -270,6 +283,71 @@ SgiMask sgi_trace_mask(vec3 P, vec3 p_surf, vec3 nP, SgiEmitter e, uint self,
 // The direct irradiance at a receiver, and the fraction of the light's ENERGY it
 // can see. `radius` is the receiver's own surfel radius (a pixel borrows the
 // set's global one) and only sets the bias and the self-surface tolerance.
+// One emitter's contribution, accumulated into the running sums. Factored out so
+// the sun can be an emitter without the estimator having two copies of itself.
+void sgi_nee_emitter(vec3 p, vec3 p_surf, vec3 nP, float radius, uint self,
+                     SgiEmitter e, inout vec3 sum, inout float vis_acc,
+                     inout float vis_w)
+{
+    // Receiver must face the light and the light must face the receiver.
+    const vec3 to_c = e.centre - p;
+    if (dot(to_c, nP) <= 0.0) return;
+    if (dot(-to_c, e.normal) <= 0.0) return;
+
+    const SgiMask mask = sgi_trace_mask(p, p_surf, nP, e, self, radius);
+    const vec3  Le   = vec3(e.rad_r, e.rad_g, e.rad_b);
+    const float dA   = e.area / float(kBitsN);
+
+    vec3 acc = vec3(0.0);
+    float unocc = 0.0, seen = 0.0;
+    for (uint b = 0u; b < kBitsN; ++b) {
+        const vec2 uv = sgi_bit_uv(b % kBitsEdge, b / kBitsEdge);
+        const vec3 X  = e.centre + e.half_u * uv.x + e.half_v * uv.y;
+        const vec3 d  = X - p;
+        const float d2 = dot(d, d);
+        if (d2 < 1e-12) continue;
+        const float inv = inversesqrt(d2);
+        const vec3  w   = d * inv;
+        const float cr  = dot(nP, w);
+        const float ce  = dot(e.normal, -w);
+        if (cr <= 0.0 || ce <= 0.0) continue;
+
+        const float term = cr * ce * dA / d2;
+        unocc += term;                                  // for the visibility ratio
+        if (sgi_mask_test(mask, b)) continue;            // occluded
+        acc  += Le * term;
+        seen += term;
+    }
+    sum += acc;
+    // Energy-weighted visibility, so the scalar reported downstream reflects
+    // how much LIGHT is visible rather than how many bits are clear.
+    vis_acc += seen;
+    vis_w   += unocc;
+}
+
+// The sun written as a rectangle: a square placed u_sun_dist away along the sun
+// direction, sized so it subtends the SAME SOLID ANGLE as the sun's disc.
+//
+// A disc of angular radius t subtends pi*t^2; a square of half-extent h at
+// distance D subtends (2h)^2/D^2. Equating them gives h = D*t*sqrt(pi)/2, which
+// the host computes. Getting that wrong changes the sun's brightness rather than
+// its shape, so it would look like an exposure bug.
+//
+// The rectangle is per RECEIVER -- it has to be, since a directional light has no
+// position -- which costs nothing: it is four vectors built in registers.
+SgiEmitter sgi_sun_emitter(vec3 p) {
+    SgiEmitter e;
+    vec3 t, b;
+    sgi_onb(u_sun_dir, t, b);
+    e.centre = p + u_sun_dir * u_sun_dist;
+    e.half_u = t * u_sun_half;
+    e.half_v = b * u_sun_half;
+    e.normal = -u_sun_dir;
+    e.area   = 4.0 * u_sun_half * u_sun_half;
+    e.rad_r = u_sun_rad.r; e.rad_g = u_sun_rad.g; e.rad_b = u_sun_rad.b;
+    return e;
+}
+
 void sgi_nee_direct(vec3 p_surf, vec3 nP, float radius, uint self,
                     out vec3 E, out float vis)
 {
@@ -279,43 +357,15 @@ void sgi_nee_direct(vec3 p_surf, vec3 nP, float radius, uint self,
     float vis_acc = 0.0, vis_w = 0.0;
 
     for (uint ei = 0u; ei < u_emitters; ++ei) {
-        const SgiEmitter e = sgi_emitter(emitters[ei * 4u + 0u], emitters[ei * 4u + 1u],
-                                         emitters[ei * 4u + 2u], emitters[ei * 4u + 3u]);
-        // Receiver must face the light and the light must face the receiver.
-        const vec3 to_c = e.centre - p;
-        if (dot(to_c, nP) <= 0.0) continue;
-        if (dot(-to_c, e.normal) <= 0.0) continue;
-
-        const SgiMask mask = sgi_trace_mask(p, p_surf, nP, e, self, radius);
-        const vec3  Le   = vec3(e.rad_r, e.rad_g, e.rad_b);
-        const float dA   = e.area / float(kBitsN);
-
-        vec3 acc = vec3(0.0);
-        float unocc = 0.0, seen = 0.0;
-        for (uint b = 0u; b < kBitsN; ++b) {
-            const vec2 uv = sgi_bit_uv(b % kBitsEdge, b / kBitsEdge);
-            const vec3 X  = e.centre + e.half_u * uv.x + e.half_v * uv.y;
-            const vec3 d  = X - p;
-            const float d2 = dot(d, d);
-            if (d2 < 1e-12) continue;
-            const float inv = inversesqrt(d2);
-            const vec3  w   = d * inv;
-            const float cr  = dot(nP, w);
-            const float ce  = dot(e.normal, -w);
-            if (cr <= 0.0 || ce <= 0.0) continue;
-
-            const float term = cr * ce * dA / d2;
-            unocc += term;                                  // for the visibility ratio
-            if (sgi_mask_test(mask, b)) continue;            // occluded
-            acc  += Le * term;
-            seen += term;
-        }
-        sum += acc;
-        // Energy-weighted visibility, so the scalar reported downstream reflects
-        // how much LIGHT is visible rather than how many bits are clear.
-        vis_acc += seen;
-        vis_w   += unocc;
+        sgi_nee_emitter(p, p_surf, nP, radius, self,
+                        sgi_emitter(emitters[ei * 4u + 0u], emitters[ei * 4u + 1u],
+                                    emitters[ei * 4u + 2u], emitters[ei * 4u + 3u]),
+                        sum, vis_acc, vis_w);
     }
+
+    if (dot(u_sun_rad, u_sun_rad) > 0.0)
+        sgi_nee_emitter(p, p_surf, nP, radius, self, sgi_sun_emitter(p),
+                        sum, vis_acc, vis_w);
 
     E = sum;
     // Noise-free by construction: 256 stratified samples of the emitter with no

@@ -147,8 +147,13 @@ void Solver::bucket_sums(uint32_t ms, double& sum_dw, double& sum_wcos) {
 }
 
 bool Solver::nee_active(const SolveConfig& cfg) const {
-    return cfg.nee && emitters_ != nullptr && emitters_->count() > 0 &&
-           grid_ != nullptr && grid_->valid();
+    // The sun counts as an emitter here even though it is not IN the emitter
+    // buffer: it is synthesized per receiver (see nee.glsl). A scene with no
+    // emissive surface and a sun -- which is every outdoor scene -- would
+    // otherwise take the NEE path's guard as "there is no direct light" and skip
+    // the pass entirely.
+    return cfg.nee && grid_ != nullptr && grid_->valid() &&
+           ((emitters_ != nullptr && emitters_->count() > 0) || cfg.sun_is_nee_light());
 }
 
 void Solver::run_lout(SurfelSet& set, const SolveConfig& cfg) {
@@ -199,7 +204,8 @@ void Solver::run_lout(SurfelSet& set, const SolveConfig& cfg) {
 void Solver::run_direct(SurfelSet& set, const SolveConfig& cfg) {
     if (!cfg.nee) return;
     if (!direct_.valid() || grid_ == nullptr || emitters_ == nullptr) return;
-    if (emitters_->count() == 0 || !grid_->valid()) return;
+    if (!grid_->valid()) return;
+    if (emitters_->count() == 0 && !cfg.sun_is_nee_light()) return;
 
     if (direct_count_ != set.count()) {
         const std::vector<glm::vec4> zero(set.count(), glm::vec4(0.0f));
@@ -243,6 +249,10 @@ void Solver::run_direct(SurfelSet& set, const SolveConfig& cfg) {
     direct_.set("u_thick", cfg.nee_thick);
     direct_.set("u_bias", cfg.nee_bias);
     direct_.set("u_self_cos", cfg.nee_self_cos);
+    direct_.set("u_sun_rad", cfg.sun_nee ? cfg.sun : glm::vec3(0.0f));
+    direct_.set("u_sun_dir", glm::normalize(cfg.sun_dir));
+    direct_.set("u_sun_dist", cfg.sun_dist);
+    direct_.set("u_sun_half", cfg.sun_half);
     direct_.set("u_self_tol", cfg.nee_self_tol);
     direct_.set("u_occ", cfg.nee_occ);
     // No cut buffer attached (the analytic gates build their sets by hand and
@@ -357,7 +367,7 @@ void Solver::dispatch(SurfelSet& set, const SolveConfig& cfg,
         micro_.set("u_normal_tol", cfg.normal_tol);
         micro_.set("u_sky", cfg.sky);
         micro_.set("u_sky_ground", cfg.sky_ground);
-        micro_.set("u_sun", cfg.sun);
+        micro_.set("u_sun", cfg.sun_nee ? glm::vec3(0.0f) : cfg.sun);
         micro_.set("u_sun_dir", glm::normalize(cfg.sun_dir));
         micro_.set("u_sun_cos", cfg.sun_cos);
         micro_.set("u_store_light", 1u);
