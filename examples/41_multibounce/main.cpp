@@ -1,0 +1,622 @@
+// ---------------------------------------------------------------------------
+// Example 41 — multi-bounce G-buffer GI, brute-force reference
+//
+// multi-bounce-gbuffer.md, variant A (the recursive N^3 formulation), with every
+// acceleration in the document deliberately left out.
+//
+// The idea being tested: for each shading point in the camera's G-buffer, put a
+// secondary camera there, point it along the normal, and RASTERIZE the scene
+// from it. The resulting tiny image is the incoming radiance over that point's
+// hemisphere; integrate it and you have that point's indirect lighting, with
+// off-screen and back-facing geometry included -- which is what separates this
+// from screen-space GI. Do it again at the hit points and you have another
+// bounce.
+//
+// What this example is:
+//
+//   - one secondary camera per GI-grid pixel (doc section 4.1's "full-resolution
+//     naive version ... a correctness reference, not a shipping configuration")
+//   - a hemi-octahedral target (4.3) rasterized in compute, one workgroup per
+//     camera, visibility resolved by atomicMin in shared memory (5.3)
+//   - the full-resolution mesh: every camera loops every triangle, no culling,
+//     no LOD, no cluster DAG, no work list (5.2, 5.4 are what this measures)
+//   - recursion to MBG_BOUNCES levels with the resolution ladder and tile
+//     clustering of 6.2, terminating in direct lighting only (6.1)
+//
+// What it is NOT: variant B. There is no radiance cache and nothing reads last
+// frame's output, so a completed sweep is correct on its own terms rather than
+// converging toward correct -- which is the property that makes it usable as the
+// reference variant B gets validated against (7.4, 8.2 milestone 7).
+//
+// The external gate is the same pair of path-traced images example 40 uses, at
+// the same camera:
+//   CornellBoxGroundTruthDirectLighting.png   MBG_BOUNCES=1
+//   CornellBoxOriginalGroundTruth.png         MBG_BOUNCES=3 and up
+//
+// Run from this target's build directory: the model, shaders/ and both reference
+// PNGs are resolved relative to the working directory.
+//
+// Every knob is an env var as well as an ImGui control, so a measurement can be
+// scripted. The ones that matter, with defaults:
+//
+//   MBG_GATE=all            run the analytic gates and exit
+//   MBG_MODEL=path.glb      CornellBoxOriginal.glb; the references only match it
+//   MBG_BOUNCES=3           camera levels; 1 == direct only
+//   MBG_SCALE=4             GI grid = framebuffer / scale; 1 == one camera/pixel
+//   MBG_BUDGET=4096         level-1 cameras per frame
+//   MBG_RES=32              level-1 target edge; MBG_RES2/3/4 for deeper levels
+//   MBG_BLOCK=8             spawn tile edge; 1 == a child per texel
+//   MBG_GTCAM=0|1|2         free | reference camera at 512^2 | at 1600x900
+//   MBG_SOLVE=n             complete n sweeps before the first present, then hold
+//   MBG_COMPARE=0|1         print RMSE against the reference after the solve
+//   MBG_BENCH=n             n frames, print per-pass timings, exit
+//   MBG_SHOT=path.png       write the final frame
+//   MBG_NOGUI=1             no ImGui -- required for a clean screenshot
+// ---------------------------------------------------------------------------
+
+#include "gpu_util.hpp"
+#include "scene.hpp"
+#include "screen.hpp"
+#include "solver.hpp"
+#include "validate.hpp"
+
+#include <gl/gl.hpp>
+#include <gfx/gfx.hpp>
+#include <gllib/log.hpp>
+#include <imgui.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <memory>
+#include <string>
+#include <vector>
+
+using namespace mbg;
+
+namespace {
+
+constexpr const char* kModelPath = "CornellBoxOriginal.glb";
+
+// Camera matched to the two path-traced references. Derived in example 40 from
+// the reference images themselves (the back wall spans 57.3% of the frame at row
+// 256, and the walls are 2.02 units apart); copied here unchanged so the two
+// examples' screenshots are pixel-comparable to each other as well as to the
+// references. Native glb units: floor y = 0, ceiling y = 1.99, back wall
+// z = -1.04, opening toward +z.
+constexpr glm::vec3 kGtEye{0.004f, 0.999f, 3.864f};
+constexpr glm::vec3 kGtTarget{0.004f, 0.999f, 0.0f};
+constexpr float     kGtFovY = 38.75f;
+constexpr int       kGtRes  = 512;
+
+const char* const kTonemapNames[] = {"ACES", "Reinhard", "Clamp", "Filmic"};
+
+struct EnvOpts {
+    std::string gate;
+    std::string model = kModelPath;
+    SolveConfig cfg;
+    int   gtcam = 0;
+    int   view = 7;
+    int   gt_index = 1;
+    uint32_t solve = 0;
+    int   bench = 0;
+    bool  shot = false;
+    std::string shot_path;
+    bool  nogui = false;
+    bool  compare = false;
+    int   tonemap = 0;
+    float exposure = 1.0f;
+    bool  paused = false;
+};
+
+EnvOpts read_env() {
+    EnvOpts o;
+    auto u32 = [](const char* v, uint32_t& dst) { dst = uint32_t(std::max(0, atoi(v))); };
+    if (const char* v = getenv("MBG_GATE"))     o.gate = v;
+    if (const char* v = getenv("MBG_MODEL"))    o.model = v;
+    if (const char* v = getenv("MBG_BOUNCES"))  u32(v, o.cfg.bounces);
+    if (const char* v = getenv("MBG_SCALE"))    u32(v, o.cfg.scale);
+    if (const char* v = getenv("MBG_BUDGET"))   u32(v, o.cfg.budget);
+    if (const char* v = getenv("MBG_RES"))      u32(v, o.cfg.res[0]);
+    if (const char* v = getenv("MBG_RES2"))     u32(v, o.cfg.res[1]);
+    if (const char* v = getenv("MBG_RES3"))     u32(v, o.cfg.res[2]);
+    if (const char* v = getenv("MBG_RES4"))     u32(v, o.cfg.res[3]);
+    if (const char* v = getenv("MBG_BLOCK"))    u32(v, o.cfg.block[0]);
+    if (const char* v = getenv("MBG_BLOCK2"))   u32(v, o.cfg.block[1]);
+    if (const char* v = getenv("MBG_BLOCK3"))   u32(v, o.cfg.block[2]);
+    if (const char* v = getenv("MBG_BIAS"))     o.cfg.bias = float(atof(v));
+    if (const char* v = getenv("MBG_SKY"))      o.cfg.sky = glm::vec3(float(atof(v)));
+    if (const char* v = getenv("MBG_EMISSIVE")) o.cfg.emissive = float(atof(v));
+    if (const char* v = getenv("MBG_TWOSIDED")) o.cfg.two_sided = atoi(v) != 0;
+    if (const char* v = getenv("MBG_PLANE"))    o.cfg.plane_tol = float(atof(v));
+    if (const char* v = getenv("MBG_GTCAM"))    o.gtcam = atoi(v);
+    if (const char* v = getenv("MBG_VIEW"))     o.view = atoi(v);
+    if (const char* v = getenv("MBG_REF"))      o.gt_index = atoi(v);
+    if (const char* v = getenv("MBG_SOLVE"))    u32(v, o.solve);
+    if (const char* v = getenv("MBG_BENCH"))    o.bench = atoi(v);
+    if (const char* v = getenv("MBG_SHOT"))     { o.shot = true; o.shot_path = v; }
+    if (const char* v = getenv("MBG_NOGUI"))    o.nogui = atoi(v) != 0;
+    if (const char* v = getenv("MBG_COMPARE"))  o.compare = atoi(v) != 0;
+    if (const char* v = getenv("MBG_TONEMAP"))  o.tonemap = atoi(v);
+    if (const char* v = getenv("MBG_EXPOSURE")) o.exposure = float(atof(v));
+    if (const char* v = getenv("MBG_PAUSE"))    o.paused = atoi(v) != 0;
+    return o;
+}
+
+// Percentiles over the steady-state tail. The MINIMUM of the tail is the least
+// clock-perturbed sample, so it is the number to compare across runs; the spread
+// says how noisy the machine was.
+void report_bench(std::vector<double> ms) {
+    if (ms.empty()) return;
+    ms.erase(ms.begin(), ms.begin() + ms.size() / 3);
+    if (ms.empty()) return;
+    std::sort(ms.begin(), ms.end());
+    auto pct = [&](double p) { return ms[std::size_t(p * double(ms.size() - 1))]; };
+    printf("[bench] n=%zu  min=%.3f  p10=%.3f  p50=%.3f  p90=%.3f ms\n",
+           ms.size(), ms.front(), pct(0.10), pct(0.50), pct(0.90));
+}
+
+// Numeric comparison against a reference PNG, in DISPLAY space.
+//
+// Both are already tonemapped -- the references by Blender, ours by display.frag
+// -- so this compares what a viewer sees. It is the honest place to compare and
+// also the lossy one: none of our tone curves is AgX, so a few percent of the
+// error reported here is the curve rather than the transport. Example 40
+// documents the same gap. Sizes must match, which is what MBG_GTCAM=1 is for.
+void compare_to_reference(const References& refs, int gt_index, int w, int h) {
+    const gfx::Texture& ref = gt_index == 0 ? refs.direct : refs.full;
+    const bool have = gt_index == 0 ? refs.have_direct : refs.have_full;
+    if (!have) { gllib::log(gllib::LogLevel::warn, "compare: reference not loaded"); return; }
+    if (ref.width() != w || ref.height() != h) {
+        gllib::logf(gllib::LogLevel::warn,
+                    "compare: reference is %dx%d but the framebuffer is %dx%d "
+                    "-- run with MBG_GTCAM=1", ref.width(), ref.height(), w, h);
+        return;
+    }
+
+    std::vector<unsigned char> ours(std::size_t(w) * h * 4);
+    std::vector<unsigned char> theirs(std::size_t(w) * h * 4);
+    glReadBuffer(GL_BACK);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, ours.data());
+    glGetTextureImage(ref.handle(), 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                      GLsizei(theirs.size()), theirs.data());
+
+    // glReadPixels is bottom-up, stb_image loaded the PNG top-down.
+    double se = 0.0, ae = 0.0, peak = 0.0;
+    std::size_t n = 0;
+    for (int y = 0; y < h; ++y) {
+        const unsigned char* a = &ours[std::size_t(y) * w * 4];
+        const unsigned char* b = &theirs[std::size_t(h - 1 - y) * w * 4];
+        for (int x = 0; x < w * 4; ++x) {
+            if ((x & 3) == 3) continue;                 // alpha
+            const double d = (double(a[x]) - double(b[x])) / 255.0;
+            se += d * d;
+            ae += std::abs(d);
+            peak = std::max(peak, std::abs(d));
+            ++n;
+        }
+    }
+    const double rmse = std::sqrt(se / double(std::max<std::size_t>(1, n)));
+    printf("[compare] vs %s: RMSE %.4f  MAE %.4f  peak %.4f  (display space, 0..1)\n",
+           gt_index == 0 ? "CornellBoxGroundTruthDirectLighting.png"
+                         : "CornellBoxOriginalGroundTruth.png",
+           rmse, ae / double(std::max<std::size_t>(1, n)), peak);
+}
+
+} // namespace
+
+int main() {
+    gllib::log_to_stderr(gllib::LogLevel::info);
+    const EnvOpts env = read_env();
+
+    gfx::WindowDesc wd;
+    wd.title = "41 — multi-bounce G-buffer, brute force";
+    // The reference PNGs are 512x512. Matching the framebuffer exactly makes the
+    // split, the diff and MBG_COMPARE pixel-aligned against them.
+    wd.width  = env.gtcam == 1 ? kGtRes : 1600;
+    wd.height = env.gtcam == 1 ? kGtRes : 900;
+    wd.vsync = false;
+    wd.debug = true;
+    gfx::Window window(wd);
+    window.vsync(false);
+    gl::enable_debug_output(false);
+
+    gfx::ImGuiOverlay gui;
+    if (!env.nogui) gui.init(window);
+
+    // --- Scene ---------------------------------------------------------------
+
+    auto model = std::make_unique<gfx::Model>();
+    if (!model->load(env.model.c_str())) {
+        gllib::logf(gllib::LogLevel::error, "failed to load '%s'", env.model.c_str());
+        return 1;
+    }
+
+    const std::vector<Tri> tris = extract_triangles(*model);
+    if (tris.empty()) {
+        gllib::log(gllib::LogLevel::error, "no triangles extracted");
+        return 1;
+    }
+    Scene scene;
+    if (!scene.build(tris)) return 1;
+
+    const Bounds& sb = scene.bounds();
+    gllib::logf(gllib::LogLevel::info,
+                "scene: %u tris (%u emissive), area %.4f, "
+                "bounds [%.2f %.2f %.2f]..[%.2f %.2f %.2f], diagonal %.3f",
+                scene.count(), scene.emissive_count(), scene.area(),
+                sb.mn.x, sb.mn.y, sb.mn.z, sb.mx.x, sb.mx.y, sb.mx.z, sb.diagonal());
+
+    // --- Passes --------------------------------------------------------------
+
+    GBuffer gbuf;
+    gbuf.create(window.framebuffer_width(), window.framebuffer_height());
+
+    GeometryPass geometry;
+    DisplayPass display;
+    Solver solver;
+    if (!geometry.init() || !display.init() || !solver.init()) {
+        gllib::log(gllib::LogLevel::error, "shader initialisation failed");
+        return 1;
+    }
+
+    References refs;
+    refs.load();
+
+    SolveConfig cfg = env.cfg;
+    // The camera sits ON a surface, so its own triangle passes through the
+    // origin of its hemisphere. Scale the push-off with the scene rather than
+    // hard-coding a number that is fine for a 2 m Cornell box and catastrophic
+    // for a 200 m one.
+    if (getenv("MBG_BIAS") == nullptr) cfg.bias = sb.diagonal() * 2.5e-4f;
+    if (getenv("MBG_PLANE") == nullptr) cfg.plane_tol = sb.diagonal() * 0.01f;
+    cfg.running = !env.paused;
+
+    {
+        Quadrature q;
+        q.build(cfg.res[0]);
+        gllib::logf(gllib::LogLevel::info,
+                    "quadrature %ux%u: sum(dOmega) = %.7f (2pi = %.7f), "
+                    "sum(cos dOmega) = %.7f (pi = %.7f)",
+                    cfg.res[0], cfg.res[0], q.sum_omega, 2.0 * 3.14159265358979,
+                    q.sum_cos, 3.14159265358979);
+    }
+
+    // --- Gates ---------------------------------------------------------------
+    //
+    // They need a GL context but not a frame, so they run here and the process
+    // exits. A PI error is invisible in an image and consistent across near and
+    // far, so it can only be caught against an analytic answer.
+    if (!env.gate.empty()) {
+        const bool ok = run_gates(env.gate, solver, cfg, scene, tris);
+        if (!env.nogui) gui.shutdown();
+        return ok ? 0 : 1;
+    }
+
+    // --- Camera --------------------------------------------------------------
+
+    gfx::Camera cam;
+    const float radius = std::max(0.1f, sb.radius());
+    cam.perspective(env.gtcam != 0 ? kGtFovY : 45.0f,
+                    float(window.framebuffer_width()) /
+                        float(std::max(1, window.framebuffer_height())),
+                    radius * 0.002f, radius * 20.0f);
+    if (env.gtcam != 0) {
+        cam.look_at(kGtEye, kGtTarget);
+    } else {
+        cam.look_at(sb.center() + glm::vec3(0.0f, 0.0f, radius * 2.2f), sb.center());
+    }
+
+    solver.configure(cfg, gbuf.width, gbuf.height);
+    gllib::logf(gllib::LogLevel::info,
+                "GI grid %dx%d (%u cameras/sweep), %u level(s), %.1f MB of camera state",
+                solver.gi_size().x, solver.gi_size().y, solver.gi_pixels(),
+                solver.levels(), double(solver.bytes()) / (1024.0 * 1024.0));
+    for (uint32_t l = 0; l < solver.levels(); ++l) {
+        const LevelInfo& li = solver.level(l);
+        gllib::logf(gllib::LogLevel::info,
+                    "  level %u: %ux%u target, tile %u -> %u children, "
+                    "%u cameras/chunk", l + 1, li.res, li.res, li.block, li.children,
+                    li.cameras);
+    }
+
+    // --- Timers --------------------------------------------------------------
+
+    PassTimer t_frame("Frame", false);
+    PassTimer t_gbuf("G-buffer");
+    PassTimer t_display("Display");
+    PassTimer t_imgui("ImGui");
+    PassTimer* const timers[] = {&t_frame, &t_gbuf, &t_display, &t_imgui};
+    PassTimer* const solver_timers[] = {&solver.t_place(), &solver.t_raster(0),
+                                        &solver.t_raster(1), &solver.t_raster(2),
+                                        &solver.t_raster(3), &solver.t_gather(),
+                                        &solver.t_upsample()};
+
+    // --- State ---------------------------------------------------------------
+
+    int view_mode = env.view;
+    int gt_index = std::clamp(env.gt_index, 0, 1);
+    int tonemap = std::clamp(env.tonemap, 0, 3);
+    float exposure = env.exposure;
+    float irradiance_gain = 1.0f;
+    float diff_gain = 4.0f;
+    float split_x = 0.5f;
+    bool captured = false;
+    bool compare_done = false;
+    int frame_index = 0;
+    bool shot_done = false;
+    double last_time = window.time();
+    double window_accum = 0.0;
+    std::vector<double> bench_ms;
+    glm::mat4 last_view_proj = cam.view_projection();
+
+    // Scripted shots want a finished sweep, not a progressive one -- and then
+    // they want it to STOP, so that however many frames the shot takes, the image
+    // is exactly the requested solve and not that plus whatever the budget got
+    // through afterwards.
+    uint32_t presolve = env.solve;
+
+    while (!window.should_close()) {
+        const double now = window.time();
+        const double frame_ms = (now - last_time) * 1000.0;
+        const float dt = float(std::min(now - last_time, 0.1));
+        last_time = now;
+        // Wall clock, not the CPU span of the loop: with vsync off and no sync
+        // point the CPU runs far ahead and would report submission cost.
+        if (frame_index > 0) t_frame.submit_external(frame_ms);
+
+        window.poll_events();
+
+        const int fw = window.framebuffer_width();
+        const int fh = window.framebuffer_height();
+        if (fw > 0 && fh > 0 && (fw != gbuf.width || fh != gbuf.height)) {
+            gbuf.create(fw, fh);
+            cam.set_aspect(float(fw) / float(fh));
+        }
+
+        camera_control(window, cam, dt, !env.nogui && !gui.wants_mouse(), captured);
+
+        geometry.poll();
+        display.poll();
+        solver.poll();
+
+        const glm::mat4 view_proj = cam.view_projection();
+        // Every camera in the solve is placed from THIS frame's G-buffer, so a
+        // moved camera invalidates the whole sweep rather than part of it. The
+        // image keeps its old contents while the new sweep fills in -- stale
+        // lighting on moving geometry, which is honest for a reference renderer
+        // and is the one place this variant behaves like a progressive one.
+        if (view_proj != last_view_proj) {
+            solver.restart();
+            last_view_proj = view_proj;
+        }
+
+        // 1. Primary G-buffer, the one hardware raster pass (doc section 5.5).
+        {
+            ScopedPass p(t_gbuf);
+            geometry.render(gbuf, *model, view_proj);
+        }
+
+        // 2. One chunk of the recursive solve.
+        solver.configure(cfg, gbuf.width, gbuf.height);
+        if (presolve > 0) {
+            // Run whole sweeps up front. Each sweep is ceil(pixels/budget) chunks.
+            const uint32_t chunks =
+                (solver.gi_pixels() + solver.level(0).cameras - 1) / solver.level(0).cameras;
+            SolveConfig run = cfg;
+            run.running = true;
+            solver.restart();
+            // glFinish on both sides, so this measures the solve rather than how
+            // long it took to SUBMIT the solve. This is the honest cost number
+            // for the technique: one complete sweep is one finished image, where
+            // a frame is an arbitrary slice of one.
+            glFinish();
+            const double t0 = window.time();
+            for (uint32_t s = 0; s < presolve; ++s)
+                for (uint32_t c = 0; c < chunks; ++c) solver.step(gbuf, cam, scene, run);
+            glFinish();
+            const double sweep_ms = (window.time() - t0) * 1000.0 / double(presolve);
+            gllib::logf(gllib::LogLevel::info,
+                        "pre-solved %u sweep(s), holding", presolve);
+            printf("[sweep] %.1f ms per sweep  (%u chunks, %.0f cameras, %.4g texels, "
+                   "%.4g triangle-rasters)\n",
+                   sweep_ms, chunks, solver.sweep_cameras(), solver.sweep_texels(),
+                   solver.sweep_cameras() * double(scene.count()));
+            presolve = 0;
+            cfg.running = false;
+        } else {
+            solver.step(gbuf, cam, scene, cfg);
+        }
+        solver.upsample(gbuf, cam, cfg);
+
+        // 3. Display.
+        {
+            ScopedPass p(t_display);
+            DisplayPass::Params dp;
+            dp.view_mode = view_mode;
+            dp.exposure = exposure;
+            dp.irradiance_gain = irradiance_gain;
+            dp.diff_gain = diff_gain;
+            dp.split_x = split_x;
+            dp.gt_index = gt_index;
+            dp.tonemap = tonemap;
+            dp.inv_view_proj = glm::inverse(view_proj);
+            dp.scene_min = sb.mn;
+            dp.scene_extent = glm::max(sb.extent(), glm::vec3(1e-4f));
+            display.render(gbuf, solver.target(), refs, dp);
+        }
+
+        // 4. UI.
+        if (env.nogui) {
+            t_imgui.skip();
+        } else {
+            t_imgui.begin();
+            gui.begin_frame();
+            ImGui::SetNextWindowSize(ImVec2(430, 700), ImGuiCond_FirstUseEver);
+            ImGui::Begin("41 — multi-bounce G-buffer");
+
+            ImGui::Text("%.1f FPS  (%.2f ms)", frame_ms > 0.0 ? 1000.0 / frame_ms : 0.0,
+                        t_frame.disp_cpu());
+
+            if (ImGui::CollapsingHeader("Solve", ImGuiTreeNodeFlags_DefaultOpen)) {
+                int b = int(cfg.bounces);
+                if (ImGui::SliderInt("Bounces (camera levels)", &b, 1, int(kMaxLevels)))
+                    cfg.bounces = uint32_t(b);
+                int sc = int(cfg.scale);
+                if (ImGui::SliderInt("GI scale (1 = per pixel)", &sc, 1, 16))
+                    cfg.scale = uint32_t(sc);
+                int bu = int(cfg.budget);
+                if (ImGui::SliderInt("Budget (cameras/frame)", &bu, 64, 65536))
+                    cfg.budget = uint32_t(bu);
+                for (uint32_t l = 0; l < cfg.bounces; ++l) {
+                    char lbl[32];
+                    snprintf(lbl, sizeof lbl, "L%u target", l + 1);
+                    int r = int(cfg.res[l]);
+                    if (ImGui::SliderInt(lbl, &r, 2, 32)) cfg.res[l] = uint32_t(r);
+                    if (l + 1 < cfg.bounces) {
+                        snprintf(lbl, sizeof lbl, "L%u spawn tile", l + 1);
+                        int k = int(cfg.block[l]);
+                        if (ImGui::SliderInt(lbl, &k, 1, 16)) cfg.block[l] = uint32_t(k);
+                    }
+                }
+                ImGui::Checkbox("Running", &cfg.running);
+                ImGui::SameLine();
+                if (ImGui::Button("Restart sweep")) solver.restart();
+                ImGui::SameLine();
+                if (ImGui::Button("Clear")) { solver.clear_image(); solver.restart(); }
+                ImGui::Text("sweep %u   cursor %u / %u", solver.sweeps(), solver.cursor(),
+                            solver.gi_pixels());
+                ImGui::Text("cameras this chunk %.0f   texels %.3g",
+                            solver.chunk_cameras(), solver.chunk_texels());
+                ImGui::Text("camera state %.1f MB", double(solver.bytes()) / (1024.0 * 1024.0));
+            }
+
+            if (ImGui::CollapsingHeader("Transport", ImGuiTreeNodeFlags_DefaultOpen)) {
+                ImGui::SliderFloat("Emissive scale", &cfg.emissive, 0.0f, 8.0f);
+                ImGui::SliderFloat("Sky", &cfg.sky.x, 0.0f, 4.0f);
+                cfg.sky.y = cfg.sky.z = cfg.sky.x;
+                ImGui::SliderFloat("Camera bias", &cfg.bias, 0.0f,
+                                   sb.diagonal() * 0.01f, "%.5f");
+                ImGui::SliderFloat("Upsample plane tol", &cfg.plane_tol, 0.0f,
+                                   sb.diagonal() * 0.1f, "%.4f");
+                ImGui::Checkbox("Force two-sided emitters", &cfg.two_sided);
+            }
+
+            if (ImGui::CollapsingHeader("View", ImGuiTreeNodeFlags_DefaultOpen)) {
+                int n = 0;
+                const char* const* names = DisplayPass::view_mode_names(n);
+                ImGui::Combo("Mode", &view_mode, names, n);
+                ImGui::Combo("Tonemap", &tonemap, kTonemapNames, 4);
+                ImGui::Combo("Reference", &gt_index, "Direct\0Full GI\0");
+                ImGui::SliderFloat("Exposure", &exposure, 0.05f, 8.0f);
+                ImGui::SliderFloat("Irradiance gain", &irradiance_gain, 0.05f, 20.0f);
+                ImGui::SliderFloat("Diff gain", &diff_gain, 0.5f, 32.0f);
+                ImGui::SliderFloat("Split x", &split_x, 0.0f, 1.0f);
+                if (ImGui::Button("Reference camera")) {
+                    cam.perspective(kGtFovY, cam.aspect(), cam.near_clip(), cam.far_clip());
+                    cam.look_at(kGtEye, kGtTarget);
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Compare now"))
+                    compare_to_reference(refs, gt_index, gbuf.width, gbuf.height);
+            }
+
+            if (ImGui::CollapsingHeader("Levels", ImGuiTreeNodeFlags_DefaultOpen)) {
+                for (uint32_t l = 0; l < solver.levels(); ++l) {
+                    const LevelInfo& li = solver.level(l);
+                    ImGui::Text("L%u  %2ux%-2u  tile %u  x%-4u  %8u cameras  %6.3f ms",
+                                l + 1, li.res, li.res, li.block, li.children, li.cameras,
+                                solver.t_raster(l).disp_gpu());
+                }
+                ImGui::Text("%u triangles, all of them, per camera", scene.count());
+            }
+
+            if (ImGui::CollapsingHeader("Timing", ImGuiTreeNodeFlags_DefaultOpen)) {
+                ImGui::Text("Frame    %6.2f ms", t_frame.disp_cpu());
+                for (PassTimer* t : timers) {
+                    if (!t->gpu()) continue;
+                    ImGui::Text("%-8s %6.3f ms", t->name(), t->disp_gpu());
+                }
+                for (PassTimer* t : solver_timers)
+                    ImGui::Text("%-8s %6.3f ms", t->name(), t->disp_gpu());
+            }
+
+            ImGui::End();
+            gui.render();
+            t_imgui.end();
+        }
+
+        // BEFORE the swap. glfwSwapBuffers leaves the back buffer's contents
+        // undefined, so reading it afterwards returns whatever the driver left
+        // there -- i.e. a screenshot, or a comparison, that silently lies.
+        const bool last_frame =
+            env.bench > 0 ? frame_index + 1 >= env.bench : window.should_close();
+        if (env.compare && !compare_done && (last_frame || solver.sweeps() > 0)) {
+            compare_to_reference(refs, gt_index, gbuf.width, gbuf.height);
+            compare_done = true;
+        }
+        if (env.shot && !shot_done && last_frame) {
+            shot_done = gfx::screenshot(env.shot_path.c_str());
+            gllib::logf(shot_done ? gllib::LogLevel::info : gllib::LogLevel::error,
+                        "%s %s", shot_done ? "wrote" : "FAILED to write",
+                        env.shot_path.c_str());
+        }
+
+        window.swap_buffers();
+
+        for (PassTimer* t : timers) t->readback();
+        for (PassTimer* t : solver_timers) t->readback();
+        // Startup frames (shader compilation, the driver's clock ramp) are wildly
+        // slower than steady state and would otherwise dominate the first
+        // displayed average, which is the only one a short run shows.
+        if (frame_index < 30) {
+            for (PassTimer* t : timers) t->flush_window();
+            for (PassTimer* t : solver_timers) t->flush_window();
+            window_accum = 0.0;
+        }
+        window_accum += frame_ms;
+        if (window_accum >= 500.0) {
+            for (PassTimer* t : timers) t->flush_window();
+            for (PassTimer* t : solver_timers) t->flush_window();
+            window_accum = 0.0;
+        }
+
+        ++frame_index;
+
+        if (env.bench > 0) {
+            bench_ms.push_back(frame_ms);
+            if (frame_index >= env.bench) break;
+        }
+    }
+
+    if (env.shot && !shot_done)
+        gllib::logf(gllib::LogLevel::warn, "no screenshot written to %s",
+                    env.shot_path.c_str());
+    if (env.bench > 0) {
+        report_bench(std::move(bench_ms));
+        printf("[bench] GPU per pass (avg ms):\n");
+        double total = 0.0;
+        for (PassTimer* t : timers) {
+            if (!t->gpu()) continue;
+            printf("    %-16s %7.3f\n", t->name(), t->avg_gpu());
+            total += t->avg_gpu();
+        }
+        for (PassTimer* t : solver_timers) {
+            printf("    %-16s %7.3f\n", t->name(), t->avg_gpu());
+            total += t->avg_gpu();
+        }
+        printf("    %-16s %7.3f\n", "GPU TOTAL", total);
+        printf("[bench] %u bounces, GI %dx%d, budget %u, targets",
+               solver.levels(), solver.gi_size().x, solver.gi_size().y,
+               solver.level(0).cameras);
+        for (uint32_t l = 0; l < solver.levels(); ++l)
+            printf(" %ux%u", solver.level(l).res, solver.level(l).res);
+        printf(", %.0f cameras and %.3g texels per chunk\n",
+               solver.chunk_cameras(), solver.chunk_texels());
+    }
+
+    if (!env.nogui) gui.shutdown();
+    return 0;
+}

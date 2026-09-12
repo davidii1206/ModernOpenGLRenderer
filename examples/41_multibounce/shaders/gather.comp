@@ -1,0 +1,55 @@
+#version 460 core
+layout(local_size_x = 64) in;
+
+// ---------------------------------------------------------------------------
+// Close one level of the recursion: add the children's irradiance into their
+// parent's, and (for level 1) scatter the result into the GI image.
+//
+//     E_parent = E_direct + SUM over tiles of ( albedo-weighted mass * E_child / PI )
+//
+// The /PI is the one in L_out = L_e + albedo * E / PI and this is the ONLY place
+// in the example where it appears -- doc-adjacent example 40 makes the same
+// point in shaders/common/brdf.glsl, and for the same reason: a missing or
+// doubled PI is consistent across near and far, so no internal cross-check
+// catches it and only a reference image does.
+//
+// The albedo and the quadrature weights were already folded into child_w by the
+// spawn (raster.comp), so this kernel is a small fixed loop with no scene access
+// at all. Levels resolve deepest-first: level L is terminal, then L-1 reads it,
+// down to level 1.
+// ---------------------------------------------------------------------------
+
+#include "scene.glsl"
+
+layout(std430, binding = 3) buffer          MbgIrrad  { vec4 irradiance[]; };
+layout(std430, binding = 5) readonly buffer MbgChildW { vec4 child_w[]; };
+layout(std430, binding = 6) readonly buffer MbgChildE { vec4 child_e[]; };
+
+layout(binding = 0, rgba32f) uniform image2D u_gi;
+
+uniform uint  u_cam_count;
+uniform uint  u_children;    // per camera; 0 on a terminal level or a 1-bounce run
+uniform uint  u_write;       // 1 = this is level 1: scatter into the GI image
+uniform uint  u_cursor;      // GI pixel index of camera 0 of this chunk
+uniform ivec2 u_gi_size;
+
+void main() {
+    uint cam = gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 64u + gl_GlobalInvocationID.x;
+    if (cam >= u_cam_count) return;
+
+    vec3 E = irradiance[cam].xyz;
+    for (uint b = 0u; b < u_children; ++b) {
+        uint slot = cam * u_children + b;
+        vec4 w = child_w[slot];
+        if (w.w == 0.0) continue;
+        E += w.xyz * child_e[slot].xyz * 0.31830988618379;
+    }
+    irradiance[cam] = vec4(E, 1.0);
+
+    if (u_write != 0u) {
+        uint pix = u_cursor + cam;
+        if (pix < uint(u_gi_size.x * u_gi_size.y))
+            imageStore(u_gi, ivec2(int(pix) % u_gi_size.x, int(pix) / u_gi_size.x),
+                       vec4(E, 1.0));
+    }
+}

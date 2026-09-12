@@ -1,0 +1,307 @@
+#version 460 core
+layout(local_size_x = 64) in;
+
+// ---------------------------------------------------------------------------
+// One secondary camera per workgroup: rasterize the scene into a hemi-octahedral
+// visibility buffer in shared memory, integrate the emitted radiance it sees,
+// and spawn the next level's cameras.
+//
+// This is design doc sections 4.3, 4.4 and 5.3 with every acceleration removed.
+// There is no cluster DAG, no LOD, no culling and no work list: every camera
+// loops every triangle in the scene (section 5.4's vertex amortization has
+// nothing to amortize when the whole mesh is 32 triangles). What IS here is the
+// part that has to be right before any of that can be measured:
+//
+//   - the LDS visibility buffer with a packed atomicMin resolve (section 5.3);
+//   - clipping at the octahedral folds, without which large triangles project
+//     wrong (see hemi.glsl);
+//   - an integrated, not point-sampled, quadrature weight (section 4.4).
+//
+// THE SHARED-MEMORY TRICK IS THE WHOLE POINT OF ONE WORKGROUP PER CAMERA.
+// Section 5.3: a 32x32 target at 32 bits/texel is 4 KB, so the entire depth
+// buffer lives in shared memory and the depth resolve is a shared atomicMin --
+// an order of magnitude cheaper than a global one -- with a single write-out at
+// the end. Here there is not even a write-out: the integration and the spawn
+// both consume the buffer in place, so the visibility buffer never reaches
+// global memory at all. That is a real saving over what the doc describes: at
+// the default schedule the level-2 buffers would be 1.1 GB/frame of traffic.
+//
+// The cost of that choice is one workgroup per camera regardless of how few
+// triangles there are, so at Cornell's 32 triangles and 64 threads half the
+// workgroup idles through the raster loop. That is a property of the reference
+// configuration, not of the method -- see implementation.md's numbers.
+// ---------------------------------------------------------------------------
+
+#include "scene.glsl"
+#include "hemi.glsl"
+
+layout(std430, binding = 0) readonly  buffer MbgTris     { MbgTri tris[]; };
+layout(std430, binding = 1) readonly  buffer MbgCams     { MbgCam cams[]; };
+layout(std430, binding = 2) readonly  buffer MbgQuad     { vec4   quad[]; };
+layout(std430, binding = 3) writeonly buffer MbgIrrad    { vec4   irradiance[]; };
+layout(std430, binding = 4) writeonly buffer MbgChildCam { MbgCam child_cam[]; };
+layout(std430, binding = 5) writeonly buffer MbgChildW   { vec4   child_w[]; };
+// Gates only: a copy of the shared visibility buffer, so the compute rasterizer
+// can be diffed texel for texel against a CPU ray-cast oracle (doc section 8.2
+// milestone 3). Never bound during a frame -- the whole point of the LDS buffer
+// is that visibility does not reach global memory.
+layout(std430, binding = 7) writeonly buffer MbgVisOut  { uint   vis_out[]; };
+
+uniform uint  u_cam_count;
+uniform uint  u_tri_count;
+uniform uint  u_res;          // target edge, texels
+uniform uint  u_block;        // spawn block edge; 0 = terminal level, no children
+uniform float u_bias;         // camera offset along its own normal, world units
+uniform float u_inv_far;      // 1 / far, for the packed depth key
+uniform vec3  u_sky;          // radiance of an uncovered texel
+uniform float u_emissive;     // emissive scale
+uniform uint  u_two_sided;    // force every triangle to emit from both faces
+uniform uint  u_dump;         // 1 = also write the visibility buffer out (gates)
+
+// 32x32 is the doc's near-camera tier and the largest this example allows.
+#define MBG_MAX_TEXELS 1024
+shared uint s_vis[MBG_MAX_TEXELS];
+shared vec4 s_red[64];
+
+vec3 g_P, g_T, g_B, g_N;      // the camera, set once per workgroup
+
+vec3 mbg_to_local(vec3 w) { return vec3(dot(w, g_T), dot(w, g_B), dot(w, g_N)); }
+vec3 mbg_to_world(vec3 l) { return g_T * l.x + g_B * l.y + g_N * l.z; }
+
+// Fill one straight-edged triangle of the projected polygon.
+//
+// Depth is EVALUATED, not interpolated: for the texel's direction w and the
+// triangle's plane (pn, pc) in camera-local coordinates the hit parameter is
+// exactly pc / dot(pn, w). That is the same cost as setting up an interpolant
+// and it removes a whole class of precision question from a reference renderer.
+void mbg_fill(vec2 A, vec2 B, vec2 C, vec3 pn, float pc, uint ti) {
+    float area2 = (B.x - A.x) * (C.y - A.y) - (B.y - A.y) * (C.x - A.x);
+    if (abs(area2) < 1e-14) return;
+    float s = area2 < 0.0 ? -1.0 : 1.0;   // orientation, so one test works for both
+
+    // THE FOLD TOLERANCE. A texel centre can land EXACTLY on an octahedral fold:
+    // at an even target edge, texel (i,i) and texel (i, res-1-i) have t.x or t.y
+    // identically zero. A triangle spanning that fold is split there into two
+    // pieces whose shared edge passes exactly through the centre, so both edge
+    // functions evaluate to zero plus float noise -- and if both pieces round the
+    // wrong way, the texel is left empty and the camera sees a hole in a solid
+    // wall.
+    //
+    // Measured before this tolerance existed: 3 empty texels in 65536 over 64
+    // Cornell cameras, every one of them on a fold (the oracle gate prints them
+    // with MBG_GATE_VERBOSE=1). Small, but it is a hole in a visibility buffer,
+    // and the same geometry at a different orientation is free to make it a
+    // bigger one.
+    //
+    // The fix is to let the two pieces OVERLAP by a hair instead of risking a
+    // gap between them. atomicMin makes double coverage free -- both pieces
+    // compute the same depth from the same plane -- so the asymmetry is entirely
+    // in our favour. The tolerance scales with the piece's own area because the
+    // edge functions are products of pixel coordinates and their noise floor
+    // scales the same way.
+    float eps = 1e-5 * abs(area2) + 1e-6;
+
+    vec2 lo = min(A, min(B, C));
+    vec2 hi = max(A, max(B, C));
+    int res = int(u_res);
+    int x0 = clamp(int(floor(lo.x)), 0, res - 1);
+    int x1 = clamp(int(ceil (hi.x)), 0, res - 1);
+    int y0 = clamp(int(floor(lo.y)), 0, res - 1);
+    int y1 = clamp(int(ceil (hi.y)), 0, res - 1);
+
+    for (int y = y0; y <= y1; ++y) {
+        for (int x = x0; x <= x1; ++x) {
+            vec2 p = vec2(float(x) + 0.5, float(y) + 0.5);
+            // Inclusive on every edge, with the fold tolerance above. Shared
+            // edges between fan triangles, and between the four quadrant pieces
+            // of one triangle, are therefore covered twice -- which atomicMin
+            // resolves to the same value. A top-left rule would avoid the double
+            // write and open a one-texel crack instead, and a crack in a
+            // visibility buffer is a light leak.
+            float w0 = ((C.x - B.x) * (p.y - B.y) - (C.y - B.y) * (p.x - B.x)) * s;
+            float w1 = ((A.x - C.x) * (p.y - C.y) - (A.y - C.y) * (p.x - C.x)) * s;
+            float w2 = ((B.x - A.x) * (p.y - A.y) - (B.y - A.y) * (p.x - A.x)) * s;
+            if (w0 < -eps || w1 < -eps || w2 < -eps) continue;
+
+            vec3 w = mbg_px_to_dir(p, u_res);
+            float denom = dot(pn, w);
+            if (abs(denom) < 1e-20) continue;
+            float t = pc / denom;
+            if (t <= 0.0) continue;                    // behind the camera
+            atomicMin(s_vis[uint(y) * u_res + uint(x)],
+                      mbg_pack_key(t * length(w), u_inv_far, ti));
+        }
+    }
+}
+
+void mbg_raster_tri(uint ti) {
+    MbgTri tr = tris[ti];
+
+    vec3 v[MBG_CLIP_MAX];
+    v[0] = mbg_to_local(tr.p0.xyz - g_P);
+    v[1] = mbg_to_local(tr.p1.xyz - g_P);
+    v[2] = mbg_to_local(tr.p2.xyz - g_P);
+
+    vec3  pn = mbg_to_local(tr.n.xyz);   // rotation only: still unit, still the plane normal
+    float pc = dot(pn, v[0]);
+
+    // The horizon. The camera sits ON a surface, so its own triangle passes
+    // through the origin; u_bias has already pushed the origin off that plane,
+    // and this clip then removes it entirely along with everything below.
+    vec3 hemi[MBG_CLIP_MAX];
+    int nh = mbg_clip_plane(v, 3, vec3(0.0, 0.0, 1.0), hemi);
+    if (nh < 3) return;
+
+    for (int q = 0; q < 4; ++q) {
+        float sx = (q & 1) == 0 ? 1.0 : -1.0;
+        float sy = (q & 2) == 0 ? 1.0 : -1.0;
+
+        vec3 cx[MBG_CLIP_MAX];
+        int nx = mbg_clip_plane(hemi, nh, vec3(sx, 0.0, 0.0), cx);
+        if (nx < 3) continue;
+        vec3 cy[MBG_CLIP_MAX];
+        int ny = mbg_clip_plane(cx, nx, vec3(0.0, sy, 0.0), cy);
+        if (ny < 3) continue;
+
+        vec2 px[MBG_CLIP_MAX];
+        bool ok = true;
+        for (int i = 0; i < ny; ++i) {
+            float L;
+            vec2 e = mbg_project(cy[i], sx, sy, L);
+            // L <= 0 means the vertex is at or behind the centre of projection,
+            // i.e. the geometry touches the camera origin. u_bias exists so this
+            // does not happen; dropping the piece is the safe failure.
+            if (!(L > 1e-12)) { ok = false; break; }
+            px[i] = mbg_square_to_px(e, u_res);
+        }
+        if (!ok) continue;
+
+        for (int k = 1; k + 1 < ny; ++k) mbg_fill(px[0], px[k], px[k + 1], pn, pc, ti);
+    }
+}
+
+void main() {
+    uint cam = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+
+    // Uniform across the workgroup, so the early-outs below never split a
+    // barrier: every invocation of a workgroup takes the same branch.
+    if (cam >= u_cam_count) return;
+
+    uint bpr    = u_block > 0u ? u_res / u_block : 0u;
+    uint nblock = bpr * bpr;
+
+    MbgCam c = cams[cam];
+    if (c.pos.w == 0.0) {
+        // Inactive slot (a background pixel, or a block that saw nothing). Its
+        // outputs still have to be written: indices are fixed by the schedule,
+        // so a skipped slot would be read as last chunk's data.
+        if (tid == 0u) irradiance[cam] = vec4(0.0);
+        if (u_dump != 0u) {
+            uint texels0 = u_res * u_res;
+            for (uint i = tid; i < texels0; i += 64u) vis_out[cam * texels0 + i] = MBG_EMPTY;
+        }
+        for (uint b = tid; b < nblock; b += 64u) {
+            child_w[cam * nblock + b] = vec4(0.0);
+            child_cam[cam * nblock + b].pos = vec4(0.0);
+            child_cam[cam * nblock + b].nrm = vec4(0.0);
+        }
+        return;
+    }
+
+    g_N = normalize(c.nrm.xyz);
+    mbg_onb(g_N, g_T, g_B);
+    g_P = c.pos.xyz + g_N * u_bias;
+
+    uint texels = u_res * u_res;
+    for (uint i = tid; i < texels; i += 64u) s_vis[i] = MBG_EMPTY;
+    barrier();
+    memoryBarrierShared();
+
+    for (uint t = tid; t < u_tri_count; t += 64u) mbg_raster_tri(t);
+    barrier();
+    memoryBarrierShared();
+
+    if (u_dump != 0u)
+        for (uint i = tid; i < texels; i += 64u) vis_out[cam * texels + i] = s_vis[i];
+
+    // --- Integrate the directly emitted radiance -----------------------------
+    //
+    // L_out at a hit texel is L_e + albedo * E / PI. Only the L_e half is known
+    // here; the albedo half needs this texel's own gather, which is what the
+    // spawned child camera below is for, and gather.comp adds it once that
+    // camera has run. A terminal level has no children and stops at L_e, which
+    // is section 6.1's "bounce 3 terminates with direct lighting only".
+    vec3 acc = vec3(0.0);
+    for (uint i = tid; i < texels; i += 64u) {
+        uint key = s_vis[i];
+        vec4 q = quad[i];
+        if (key == MBG_EMPTY) { acc += u_sky * q.w; continue; }
+        MbgTri tr = tris[mbg_key_tri(key)];
+        bool front = dot(tr.n.xyz, mbg_to_world(q.xyz)) < 0.0;
+        if (front || tr.n.w != 0.0 || u_two_sided != 0u)
+            acc += tr.emission.xyz * u_emissive * q.w;
+    }
+
+    s_red[tid] = vec4(acc, 0.0);
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (tid < s) s_red[tid] += s_red[tid + s];
+        barrier();
+    }
+    if (tid == 0u) irradiance[cam] = vec4(s_red[0].xyz, 1.0);
+
+    if (u_block == 0u) return;
+
+    // --- Spawn the next level ------------------------------------------------
+    //
+    // One child camera per u_block x u_block tile of this camera's target, placed
+    // at the tile's most central covered texel and carrying that whole tile's
+    // albedo-weighted quadrature mass. This is doc section 6.2's two cheapest
+    // levers at once: resolution falloff (the child's own target is smaller) and
+    // clustering at depth (one gather answers for a tile of directions). Both
+    // trade the same thing -- the child's irradiance is reused across directions
+    // whose hit points differ -- and the error is attenuated by one albedo
+    // multiply before it reaches the eye. MBG_BLOCK=1 disables the clustering and
+    // spawns per texel, which is the unabridged N^3 recursion.
+    for (uint b = tid; b < nblock; b += 64u) {
+        uint bx = (b % bpr) * u_block;
+        uint by = (b / bpr) * u_block;
+        vec2 ctr = vec2(float(bx), float(by)) + vec2(float(u_block) * 0.5);
+
+        vec3  wsum  = vec3(0.0);
+        float bestd = 1e30;
+        uint  besti = MBG_EMPTY;
+        for (uint yy = 0u; yy < u_block; ++yy) {
+            for (uint xx = 0u; xx < u_block; ++xx) {
+                uint idx = (by + yy) * u_res + (bx + xx);
+                uint key = s_vis[idx];
+                if (key == MBG_EMPTY) continue;
+                wsum += quad[idx].w * tris[mbg_key_tri(key)].albedo.xyz;
+                vec2 d = vec2(float(bx + xx), float(by + yy)) + vec2(0.5) - ctr;
+                float dd = dot(d, d);
+                if (dd < bestd) { bestd = dd; besti = idx; }
+            }
+        }
+
+        uint slot = cam * nblock + b;
+        vec3 hit = vec3(0.0), hn = vec3(0.0);
+        float alive = 0.0;
+        if (besti != MBG_EMPTY) {
+            MbgTri tr = tris[mbg_key_tri(s_vis[besti])];
+            vec3 dir = mbg_to_world(quad[besti].xyz);
+            float denom = dot(tr.n.xyz, dir);
+            if (abs(denom) > 1e-12) {
+                hit = g_P + dir * (dot(tr.n.xyz, tr.p0.xyz - g_P) / denom);
+                // Face the child's hemisphere back toward this camera. A
+                // single-sided triangle seen from behind would otherwise gather
+                // into the wall.
+                hn = denom < 0.0 ? tr.n.xyz : -tr.n.xyz;
+                alive = 1.0;
+            }
+        }
+        child_w[slot] = vec4(alive != 0.0 ? wsum : vec3(0.0), alive);
+        child_cam[slot].pos = vec4(hit, alive);
+        child_cam[slot].nrm = vec4(hn, 0.0);
+    }
+}

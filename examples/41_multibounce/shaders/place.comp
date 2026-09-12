@@ -1,0 +1,62 @@
+#version 460 core
+layout(local_size_x = 64) in;
+
+// ---------------------------------------------------------------------------
+// Level-1 camera placement: one secondary camera per G-buffer pixel of the GI
+// grid, oriented along that pixel's normal. Doc section 4.1.
+//
+// This is the "full-resolution naive version ... a correctness reference, not a
+// shipping configuration" at MBG_SCALE=1, and a plain 1/N point-sampled grid
+// above that. What it deliberately is NOT is section 4.1's actual proposal:
+// there is no clustering by position and normal, no world-space radius cap and
+// no per-frame jitter. Clustering is the reuse assumption that section 4.2 calls
+// "the main risk" and section 8.1 gates before anything else gets built; this
+// example is the thing that experiment would measure AGAINST, so it has to be
+// the version with reuse radius zero.
+//
+// Point sampling rather than averaging the block is deliberate too: an averaged
+// position and normal across a depth discontinuity describes a surface that is
+// not there, and the camera placed on it gathers from inside geometry.
+// ---------------------------------------------------------------------------
+
+#include "scene.glsl"
+#include "gbuffer.glsl"
+
+layout(std430, binding = 1) writeonly buffer MbgCamsOut { MbgCam cams_out[]; };
+
+layout(binding = 0) uniform sampler2D u_albedo;
+layout(binding = 1) uniform sampler2D u_normal;
+layout(binding = 3) uniform sampler2D u_depth;
+
+uniform uint  u_cam_count;
+uniform uint  u_cursor;
+uniform ivec2 u_gi_size;
+uniform ivec2 u_size;        // full framebuffer resolution
+uniform uint  u_scale;
+uniform mat4  u_inv_view_proj;
+
+void main() {
+    uint i = gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 64u + gl_GlobalInvocationID.x;
+    if (i >= u_cam_count) return;
+
+    uint pix = u_cursor + i;
+    vec4 pos = vec4(0.0);
+    vec4 nrm = vec4(0.0);
+
+    if (pix < uint(u_gi_size.x * u_gi_size.y)) {
+        ivec2 g = ivec2(int(pix) % u_gi_size.x, int(pix) / u_gi_size.x);
+        ivec2 s = min(g * int(u_scale) + int(u_scale) / 2, u_size - 1);
+        // Alpha is the geometry flag, not depth != 1: a G-buffer pixel on the far
+        // plane is still geometry if something was drawn there.
+        if (texelFetch(u_albedo, s, 0).a > 0.5) {
+            vec4 n = texelFetch(u_normal, s, 0);
+            float d = texelFetch(u_depth, s, 0).r;
+            vec2 uv = (vec2(s) + 0.5) / vec2(u_size);
+            pos = vec4(world_from_depth(d, uv, u_inv_view_proj), 1.0);
+            nrm = vec4(normalize(n.xyz), 0.0);
+        }
+    }
+
+    cams_out[i].pos = pos;
+    cams_out[i].nrm = nrm;
+}
