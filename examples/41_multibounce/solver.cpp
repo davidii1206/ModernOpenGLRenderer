@@ -344,6 +344,10 @@ void Solver::direct_pixel(const GBuffer& gb, const gfx::Camera& cam, const Scene
     // Its own quadrature table: this pass's hemisphere need not be the same size
     // as the GI grid's, and the table is what carries the texel weights the
     // visibility ratio is built from.
+    // The light view is its own projection with its own solid-angle weights
+    // computed in the shader, so it needs no quadrature table -- but the
+    // hemisphere table stays bound because scene.glsl declares quad[] for every
+    // pass that includes it.
     const uint32_t res = std::clamp(cfg.direct_res, 2u, 32u);
     if (direct_quad_.res != res) direct_quad_.build(res);
     direct_px_.use();
@@ -355,7 +359,7 @@ void Solver::direct_pixel(const GBuffer& gb, const gfx::Camera& cam, const Scene
     direct_px_.set("u_inv_view_proj", glm::inverse(cam.view_projection()));
     direct_px_.set("u_tri_count", scene.count());
     direct_px_.set("u_emitters", scene.emitter_count());
-    direct_px_.set("u_res", res);
+    direct_px_.set("u_lv_res", res);
     direct_px_.set("u_inv_far", 1.0f / std::max(1e-4f, scene.bounds().diagonal() * 1.5f));
     direct_px_.set("u_two_sided", cfg.two_sided ? 1u : 0u);
     direct_px_.set("u_bias", cfg.bias);

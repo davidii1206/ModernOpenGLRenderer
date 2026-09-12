@@ -43,7 +43,7 @@ reload sees it.
 | `MBG_NEE=0\|1` | evaluate the direct term analytically instead of taking it from the raster (default 1). **The single most important setting for image quality**; see finding 2 |
 | `MBG_TENT=0\|1` | spread each texel's mass over the four nearest spawn tiles (default 1) |
 | `MBG_DIRECT_PIXEL=0\|1` | rasterize a hemisphere **per pixel** for the image's direct term instead of taking it from the GI grid (default 1); see finding 11 |
-| `MBG_DIRECT_RES=n` | that pass's own hemisphere target edge (default 32) |
+| `MBG_DIRECT_RES=n` | edge of that pass's per-emitter light view (default 16); see finding 13 |
 | `MBG_SKY=f` | radiance of an uncovered texel. **0.05 is needed to reproduce the full-GI reference**; see finding 5 |
 | `MBG_EMISSIVE=f` | emissive scale |
 | `MBG_BIAS=f` | camera offset along its own normal, world units (default = 2.5e-4 × scene diagonal) |
@@ -96,9 +96,11 @@ Shaders: `place.comp` (camera placement), `raster.comp` (the software rasterizer
 the integration and the spawn), `gather.comp` (fold the children in),
 `upsample.comp` (GI grid → full res), `direct_pixel.comp` (the image's direct
 term, per pixel), plus the G-buffer and display raster pairs. `shaders/common/`
-carries `hemi.glsl` (the map, the clipper, the packed key), `emitter.glsl` (the
-analytic magnitude and the ray-triangle test, shared by both direct paths so they
-cannot drift), `scene.glsl` (structs, bindings, ONB), and `oct.glsl`,
+carries `hemi.glsl` (the map, the clipper, the packed key), `raster.glsl` (the
+hemisphere rasterizer and its visibility ratio, shared by every pass that needs
+to know what a point can see), `lightview.glsl` (the per-emitter frustum and its
+rasterizer), `emitter.glsl` (the analytic magnitude, shared by both direct paths
+so they cannot drift), `scene.glsl` (structs, bindings, ONB), and `oct.glsl`,
 `gbuffer.glsl`, `brdf.glsl`, `tonemap.glsl` from example 40 — `tonemap.glsl` with
 an AgX curve added (finding 10).
 
@@ -211,8 +213,8 @@ direct with 16 visibility samples, tent weights on.
 
 | | RMSE | roughness vs reference | cameras/sweep | sweep |
 |---|---|---|---|---|
-| 1 bounce vs the direct reference | **0.0439** | 1.02× | 1.6e4 + 262k direct | 0.40 s + 7.4 s direct |
-| 3 bounces vs the full-GI reference (sky 0.05) | **0.0533** | 1.21× | 1.3e6 + 262k direct | 12 s + 7.4 s direct |
+| 1 bounce vs the direct reference | **0.0431** | 0.91× | 1.6e4 + 262k direct | 0.40 s + 16 s direct |
+| 3 bounces vs the full-GI reference (sky 0.05) | **0.0532** | 1.17× | 1.3e6 + 262k direct | 17 s + 16 s direct |
 
 The direct pass is per frame rather than per sweep, and it is a hemisphere per
 pixel — 262k workgroups at 512×512, against the 16k the GI grid runs. That is the
@@ -562,17 +564,10 @@ still computes its own direct term, because the transport reads it) and the GI
 grid then carries the **indirect residual alone** (`gather.comp`'s `u_split`), so
 nothing is counted twice.
 
-| | RMSE | roughness | direct pass |
-|---|---|---|---|
-| direct from the GI grid | 0.0474 | 0.69× | — |
-| direct per pixel, 8×8 target | 0.0517 | 1.29× | 2.7 s |
-| direct per pixel, 16×16 | 0.0458 | 1.46× | 3.7 s |
-| **direct per pixel, 32×32** | **0.0439** | **1.02×** | 7.4 s |
-
-The per-pixel pass's own target sets how many texels the emitter covers, and so
-how many levels its visible fraction can take. At 8×8 the Cornell panel is close
-to sub-texel from much of the room and the ratio degrades to the one-texel
-fallback over large areas.
+| | RMSE | roughness |
+|---|---|---|
+| direct from the GI grid | 0.0474 | 0.69× |
+| **direct per pixel** | **0.0431** | **0.91×** |
 
 The roughness figure is the interesting one. 0.61× said the image was *smoother
 than the converged path trace* — detail lost to the upsample, which is not a
@@ -633,6 +628,55 @@ Two details the gates and the roughness metric forced out:
 There is now exactly one visibility mechanism in this renderer — rasterize, let
 the depth sort decide, read the winner — and every pass shares it through
 `common/raster.glsl`.
+
+### 13. Point the resolution at the light, not at the sky
+
+The per-pixel receiver of finding 11 fixed *where* the direct term is sampled and
+left *how well* it resolves the light alone, and the second one is just as
+visible. Visibility off the hemisphere buffer is a ratio of texel masses, so its
+precision is however many texels the emitter covers:
+
+| receiver | panel's solid angle | texels of a 32×32 hemisphere |
+|---|---|---|
+| short box top | 2.84% of the hemisphere | 29 |
+| floor centre | 0.71% | 7 |
+| floor far corner | 0.36% | 4 |
+
+Four to seven distinguishable values across a penumbra is not a soft shadow with
+a coarse ramp — it is a hard line with a couple of steps in it, and below one
+texel it is a hard line with none. A Cornell box is made of exactly the long soft
+penumbrae that shows up in: the room's top edges and the boxes' shadows.
+
+Raising the hemisphere's resolution is the wrong lever. 128×128 would put 64 KB
+in shared memory to resolve a light occupying 1% of it, and the LDS buffer that
+makes the whole technique affordable is the thing being spent.
+
+The right lever is to point the resolution **at the light**. `direct_pixel.comp`
+now fits a perspective frustum to each emitter, rasterizes the emitter alone and
+then the whole scene into it, and takes the same ratio off those two buffers. At
+a 16×16 target the emitter covers ~256 texels instead of ~5. Same rasterizer,
+same atomicMin, same read-the-winner rule — the texels simply point somewhere
+more useful, and triangles that miss the frustum are rejected by their bounding
+box and cost nothing.
+
+| | RMSE | roughness | direct pass |
+|---|---|---|---|
+| hemisphere visibility, 32×32 | 0.0439 | 1.02× | 7.4 s |
+| **light view, 16×16** | **0.0431** | **0.91×** | 16 s |
+| light view, 8×8 | 0.0430 | 0.91× | 5.7 s |
+| light view, 4×4 | 0.0431 | 0.92× | 2.8 s |
+
+RMSE barely moves — the penumbra is a small fraction of the image and finding 9
+applies — but the shadows go from stepped to smooth. The resolution ladder is
+nearly flat because the frustum is *fitted*: even 4×4 spends 16 samples on the
+light, against the 4-7 a 32×32 hemisphere manages. The default is 16 because this
+is a reference; 8 is free and indistinguishable on this scene.
+
+The limitation is the frustum: an emitter spanning more than about a hemisphere
+from the receiver has no bounded one, and `lv_setup` gives up and calls the light
+unoccluded. That is right for a panel and wrong for a receiver sitting inside a
+glowing box — which is what the hemisphere path, still used by every secondary
+camera, is there for.
 
 ## What this does not answer
 

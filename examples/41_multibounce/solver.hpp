@@ -80,7 +80,10 @@ struct SolveConfig {
     // Same rasterizer and same depth sort as everywhere else; only the receiver
     // changes. The solve is unchanged; only what the image reads changes.
     bool      direct_pixel = true;
-    uint32_t  direct_res = 32;     // that pass's own hemisphere target edge
+    // Edge of the per-pixel pass's light view. 16 puts ~256 texels on the
+    // emitter, against the 4-29 a 32x32 hemisphere manages -- see
+    // common/lightview.glsl.
+    uint32_t  direct_res = 16;
     // Spread each texel's albedo mass across the four nearest spawn tiles
     // instead of assigning it to one. Removes the tile discontinuity; costs a
     // wider scan of shared memory and nothing else.

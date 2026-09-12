@@ -2,39 +2,47 @@
 layout(local_size_x = 64) in;
 
 // ---------------------------------------------------------------------------
-// The direct term, one hemisphere per PIXEL.
+// The direct term, one light view per PIXEL per emitter.
 //
-// Same rasterizer, same depth sort, same visibility ratio as the secondary
-// cameras use -- the only thing that changes is the receiver. That is the whole
-// point: the GI grid answers for an MBG_SCALE x MBG_SCALE block of pixels, 4x4 by
-// default, and a shadow boundary reconstructed from receivers that far apart and
-// then bilaterally upsampled is soft no matter how good the upsample is. Nyquist,
-// not a filtering failure. Direct lighting is where it shows, because it carries
-// the sharpest edges in the image.
+// Two things were wrong with taking the image's direct term off the GI grid, and
+// they are independent:
 //
-// So this pass gives the direct term its own receiver. One workgroup per pixel,
-// its own hemisphere rasterized from the G-buffer point, visibility from the
-// atomicMin winner exactly as everywhere else in this renderer. The penumbra is
-// resolved by how many texels the emitter covers; the shadow BOUNDARY is
-// resolved per pixel, which is what was missing.
+//   RECEIVER DENSITY. The grid answers for an MBG_SCALE x MBG_SCALE block of
+//   pixels, 4x4 by default, and a shadow boundary reconstructed from receivers
+//   that far apart and then bilaterally upsampled is soft however good the
+//   upsample is. Nyquist, not a filtering failure. Fixed by giving the direct
+//   term its own receiver: one per pixel.
 //
-// The solve is untouched -- every secondary camera still computes its own direct
-// term, because the bounce transport reads it. This only changes what the image
-// reads, and the GI grid then carries the indirect residual alone (gather.comp's
-// u_split) so nothing is counted twice.
+//   ANGULAR RESOLUTION ON THE LIGHT. Visibility off a hemisphere buffer is a
+//   ratio of texel masses, so its precision is however many texels the emitter
+//   covers -- 4 to 29 for Cornell's panel at a 32x32 target. Five or so
+//   distinguishable values across a penumbra is a hard line with steps in it,
+//   which is what the room's top edges and the box shadows showed. Fixed by
+//   pointing the resolution at the light: see common/lightview.glsl.
 //
-// COST is a hemisphere per pixel, i.e. the doc's own section 4.1 reference
-// configuration, but for one level and with no children. At 512x512 that is 262k
-// workgroups against the 16k the GI grid runs -- and it buys the one term that
-// cannot be interpolated. MBG_DIRECT_RES trades the penumbra's smoothness for it.
+// So this pass does not rasterize a hemisphere at all. Per emitter it fits a
+// frustum to that emitter, rasterizes the emitter alone and then the whole scene
+// into it, and takes the visible fraction from the two. Same rasterizer, same
+// atomicMin depth sort, same read-the-winner rule -- the texels just point at the
+// light instead of at the sky.
+//
+// The solve is untouched: every secondary camera still computes its own direct
+// term off its hemisphere, because the bounce transport reads it and a soft
+// answer is fine there. This changes only what the IMAGE reads, and the GI grid
+// then carries the indirect residual alone (gather.comp's u_split). The
+// subtraction stays self-consistent because it subtracts the camera's own direct
+// term, whatever estimator produced it.
+//
+// ADDS INTO the upsampled target: it holds irradiance E directly, so this is a
+// read-modify-write and needs no second full-resolution texture.
 // ---------------------------------------------------------------------------
 
 #include "scene.glsl"
-#include "raster.glsl"
 #include "emitter.glsl"
+#include "lightview.glsl"
 #include "gbuffer.glsl"
 
-layout(std430, binding = 8) readonly buffer MbgEmit { uint   emitters[]; };
+layout(std430, binding = 8) readonly buffer MbgEmit { uint emitters[]; };
 
 layout(binding = 0) uniform sampler2D u_albedo;
 layout(binding = 1) uniform sampler2D u_normal;
@@ -46,10 +54,12 @@ uniform ivec2 u_size;
 uniform mat4  u_inv_view_proj;
 uniform uint  u_tri_count;
 uniform uint  u_emitters;
+uniform uint  u_lv_res;        // light-view target edge
 uniform uint  u_two_sided;
 uniform float u_bias;
 uniform float u_emissive;
 
+shared vec4 s_lvred[64];
 
 void main() {
     uint pix = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
@@ -61,53 +71,59 @@ void main() {
 
     vec3  N = normalize(texelFetch(u_normal, p, 0).xyz);
     float d = texelFetch(u_depth, p, 0).r;
-    mbg_set_receiver(world_from_depth(d, (vec2(p) + 0.5) / vec2(u_size), u_inv_view_proj),
-                     N, u_bias);
+    vec3  P = world_from_depth(d, (vec2(p) + 0.5) / vec2(u_size), u_inv_view_proj) +
+              N * u_bias;
 
-    uint texels = u_res * u_res;
-
-    // Emitters alone, then everything: the denominator and the numerator of the
-    // visibility ratio, both off the same grid.
-    mbg_clear_vis(tid, 64u);
-    barrier();
-    memoryBarrierShared();
-    for (uint i = tid; i < u_emitters; i += 64u) mbg_raster_tri(emitters[i]);
-    barrier();
-    memoryBarrierShared();
-    for (uint i = tid; i < texels; i += 64u) s_emit[i] = s_vis[i];
-    barrier();
-    memoryBarrierShared();
-
-    mbg_clear_vis(tid, 64u);
-    barrier();
-    memoryBarrierShared();
-    for (uint t = tid; t < u_tri_count; t += 64u) mbg_raster_tri(t);
-    barrier();
-    memoryBarrierShared();
-
+    uint texels = u_lv_res * u_lv_res;
     vec3 E = vec3(0.0);
+
+    // Uniform loop bound, so the barriers inside it are safe.
     for (uint e = 0u; e < u_emitters; ++e) {
         uint ti = emitters[e];
-        vec3 mag = mbg_emitter_unshadowed(g_P, g_N, tris[ti], u_two_sided != 0u,
-                                          2.0 * u_bias, u_emissive);
-        bool lit = dot(mag, vec3(1.0)) > 0.0;
+        MbgTri tr = tris[ti];
 
-        s_red2[tid] = vec4(lit ? mbg_emitter_mass(ti, tid, texels, 64u) : vec2(0.0),
-                           0.0, 0.0);
+        // The magnitude is exact and needs no buffer at all; only the fraction
+        // below is estimated. Skip the whole light view when there is nothing to
+        // scale -- an emitter below the horizon or turned away.
+        vec3 mag = mbg_emitter_unshadowed(P, N, tr, u_two_sided != 0u, 2.0 * u_bias,
+                                          u_emissive);
+        bool lit = dot(mag, vec3(1.0)) > 0.0 && lv_setup(P, N, tr);
+
+        if (lit) {
+            for (uint i = tid; i < texels; i += 64u) {
+                s_lv[i] = MBG_EMPTY;
+                s_lv_e[i] = MBG_EMPTY;
+            }
+            barrier();
+            memoryBarrierShared();
+
+            // The emitter alone: the denominator, i.e. where it would reach.
+            lv_raster_tri(ti, u_lv_res, u_inv_far, true);
+            // Everything: the numerator, i.e. what actually got there.
+            for (uint t = tid; t < u_tri_count; t += 64u)
+                lv_raster_tri(t, u_lv_res, u_inv_far, false);
+            barrier();
+            memoryBarrierShared();
+        }
+
+        s_lvred[tid] = vec4(lit ? lv_mass(u_lv_res, N, tid, texels, 64u) : vec2(0.0),
+                            0.0, 0.0);
         barrier();
         for (uint r = 32u; r > 0u; r >>= 1u) {
-            if (tid < r) s_red2[tid] += s_red2[tid + r];
+            if (tid < r) s_lvred[tid] += s_lvred[tid + r];
             barrier();
         }
+
         if (lit) {
-            vec2 m = s_red2[0].xy;
-            float vis;
-            if (m.y > 1e-9) {
-                vis = clamp(m.x / m.y, 0.0, 1.0);
-            } else {
-                vis = mbg_emitter_fallback(tris[ti], u_res, u_inv_far);
-            }
-            E += mag * vis;
+            vec2 m = s_lvred[0].xy;
+            // No denominator means the frustum caught none of the emitter, which
+            // after lv_setup succeeded can only be a sliver below the horizon.
+            E += mag * (m.y > 1e-12 ? clamp(m.x / m.y, 0.0, 1.0) : 1.0);
+        } else if (dot(mag, vec3(1.0)) > 0.0) {
+            // lv_setup gave up: the emitter spans too much of the sky for a
+            // bounded frustum. Unoccluded is the right answer for a receiver
+            // that close to a light of that size.
+            E += mag;
         }
         barrier();
     }

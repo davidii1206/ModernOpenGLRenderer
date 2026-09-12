@@ -111,6 +111,10 @@ int mbg_clip_plane(vec3 src[MBG_CLIP_MAX], int n, vec3 pn, out vec3 dst[MBG_CLIP
 // fully determined by the atomic and the image is bit-reproducible across runs.
 #define MBG_EMPTY 0xFFFFFFFFu
 
+// Every pass that packs a key needs the same far distance, so it is declared
+// with the key rather than in one of the rasterizers.
+uniform float u_inv_far;
+
 uint mbg_pack_key(float dist, float inv_far, uint tri) {
     uint d = uint(clamp(dist * inv_far, 0.0, 1.0) * 65535.0 + 0.5);
     return (d << 16) | (tri & 0xFFFFu);
