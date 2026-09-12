@@ -240,8 +240,11 @@ void Solver::raster_level(uint32_t l, uint32_t count, const Scene& scene,
 
 void Solver::run_levels(uint32_t chunk, const Scene& scene, const SolveConfig& cfg,
                         bool write_image) {
-    const bool split = write_image && cfg.direct_pixel && cfg.nee &&
-                       scene.emitter_count() > 0;
+    // The GI image carries the residual whenever the direct term is not coming
+    // from it -- because a per-pixel pass will add it back, or because
+    // indirect_only wants it left out altogether.
+    const bool split = write_image && cfg.nee && scene.emitter_count() > 0 &&
+                       (cfg.direct_pixel || cfg.indirect_only);
     // Rasterize shallowest first: a level's cameras are spawned by the level
     // above it, so level l+1's camera buffer is written by level l's raster.
     uint32_t counts[kMaxLevels] = {chunk, 0, 0, 0};
@@ -336,7 +339,7 @@ std::vector<uint32_t> Solver::raster_visibility(const Scene& scene, const SolveC
 void Solver::direct_pixel(const GBuffer& gb, const gfx::Camera& cam, const Scene& scene,
                           const SolveConfig& cfg) {
     if (!allocated_ || !direct_px_.valid() || !cfg.direct_pixel || !cfg.nee ||
-        scene.emitter_count() == 0) {
+        cfg.indirect_only || scene.emitter_count() == 0) {
         t_direct_.skip();
         return;
     }

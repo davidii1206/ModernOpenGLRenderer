@@ -50,7 +50,8 @@
 //   MBG_TENT=1              spread each texel's mass over the 4 nearest tiles
 //   MBG_DIRECT_PIXEL=1      rasterize a hemisphere per pixel for the image's
 //                           direct term, not one per GI-grid camera
-//   MBG_DIRECT_RES=32       that pass's own hemisphere target edge
+//   MBG_DIRECT_RES=16       edge of that pass's per-emitter light view
+//   MBG_INDIRECT_ONLY=1     composite the bounce term alone, for inspecting it
 //   MBG_SCALE=4             GI grid = framebuffer / scale; 1 == one camera/pixel
 //   MBG_BUDGET=4096         level-1 cameras per frame
 //   MBG_RES=32              level-1 target edge; MBG_RES2/3/4 for deeper levels
@@ -157,6 +158,7 @@ EnvOpts read_env() {
     if (const char* v = getenv("MBG_TENT"))     o.cfg.tent = atoi(v) != 0;
     if (const char* v = getenv("MBG_DIRECT_PIXEL")) o.cfg.direct_pixel = atoi(v) != 0;
     if (const char* v = getenv("MBG_DIRECT_RES")) u32(v, o.cfg.direct_res);
+    if (const char* v = getenv("MBG_INDIRECT_ONLY")) o.cfg.indirect_only = atoi(v) != 0;
     if (const char* v = getenv("MBG_PLANE"))    o.cfg.plane_tol = float(atof(v));
     if (const char* v = getenv("MBG_GTCAM"))    o.gtcam = atoi(v);
     if (const char* v = getenv("MBG_VIEW"))     o.view = atoi(v);
@@ -602,6 +604,7 @@ int main() {
                 ImGui::Checkbox("Force two-sided emitters", &cfg.two_sided);
                 ImGui::Checkbox("Analytic direct term", &cfg.nee);
                 ImGui::Checkbox("Tent-weighted spawn tiles", &cfg.tent);
+                ImGui::Checkbox("Indirect only (diagnostic)", &cfg.indirect_only);
                 ImGui::Checkbox("Direct term per pixel", &cfg.direct_pixel);
                 if (cfg.direct_pixel) {
                     int dr = int(cfg.direct_res);

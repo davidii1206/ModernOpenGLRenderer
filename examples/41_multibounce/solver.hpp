@@ -84,6 +84,11 @@ struct SolveConfig {
     // emitter, against the 4-29 a 32x32 hemisphere manages -- see
     // common/lightview.glsl.
     uint32_t  direct_res = 16;
+    // Composite nothing but the indirect residual: the solve runs exactly as it
+    // does normally and the per-pixel direct pass is skipped, so the image is
+    // the bounce term alone. A diagnostic, not a rendering mode -- the indirect
+    // is usually 10x dimmer than the direct and invisible underneath it.
+    bool      indirect_only = false;
     // Spread each texel's albedo mass across the four nearest spawn tiles
     // instead of assigning it to one. Removes the tile discontinuity; costs a
     // wider scan of shared memory and nothing else.
