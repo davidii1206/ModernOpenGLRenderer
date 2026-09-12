@@ -34,6 +34,7 @@ layout(local_size_x = 64) in;
 
 #include "scene.glsl"
 #include "hemi.glsl"
+#include "emitter.glsl"
 
 layout(std430, binding = 0) readonly  buffer MbgTris     { MbgTri tris[]; };
 layout(std430, binding = 1) readonly  buffer MbgCams     { MbgCam cams[]; };
@@ -214,97 +215,6 @@ void mbg_raster_tri(uint ti) {
 // of the image with a smooth ramp across penumbrae -- which is exactly the error
 // budget an area light wants. The hemisphere resolve then skips L_e on these
 // triangles (emission.w), so nothing is counted twice.
-vec2 mbg_hammersley(uint i, uint n) {
-    uint b = (i << 16u) | (i >> 16u);
-    b = ((b & 0x55555555u) << 1u) | ((b & 0xAAAAAAAAu) >> 1u);
-    b = ((b & 0x33333333u) << 2u) | ((b & 0xCCCCCCCCu) >> 2u);
-    b = ((b & 0x0F0F0F0Fu) << 4u) | ((b & 0xF0F0F0F0u) >> 4u);
-    b = ((b & 0x00FF00FFu) << 8u) | ((b & 0xFF00FF00u) >> 8u);
-    return vec2((float(i) + 0.5) / float(n), float(b) * 2.3283064365386963e-10);
-}
-
-// Moller-Trumbore against one triangle, two-sided -- the rasterizer does not
-// cull either. Used only by the shadow test, on the single triangle the
-// visibility buffer already named as the nearest thing in that direction, so
-// this is a confirmation and not a search.
-bool mbg_ray_tri(vec3 o, vec3 d, MbgTri tr, out float t) {
-    vec3 e1 = tr.p1.xyz - tr.p0.xyz;
-    vec3 e2 = tr.p2.xyz - tr.p0.xyz;
-    vec3 pv = cross(d, e2);
-    float det = dot(e1, pv);
-    if (abs(det) < 1e-20) return false;
-    float inv = 1.0 / det;
-    vec3 tv = o - tr.p0.xyz;
-    float u = dot(tv, pv) * inv;
-    if (u < 0.0 || u > 1.0) return false;
-    vec3 qv = cross(tv, e1);
-    float v = dot(d, qv) * inv;
-    if (v < 0.0 || u + v > 1.0) return false;
-    t = dot(e2, qv) * inv;
-    return t > 0.0;
-}
-
-vec3 mbg_emitter_unshadowed(vec3 pos, vec3 nrm, uint ei) {
-    MbgTri tr = tris[emitters[ei]];
-
-    vec3 v[MBG_CLIP_MAX];
-    v[0] = tr.p0.xyz - pos;
-    v[1] = tr.p1.xyz - pos;
-    v[2] = tr.p2.xyz - pos;
-
-    // Which face is turned toward the receiver, and how far off its plane the
-    // receiver is. h > 0 means in front of the emitting face.
-    float h = -dot(tr.n.xyz, v[0]);
-    if (h < 0.0 && tr.n.w == 0.0 && u_two_sided == 0u) return vec3(0.0);
-
-    // COPLANAR RECEIVERS CONTRIBUTE NOTHING, AND THE FORMULA DOES NOT KNOW THAT.
-    //
-    // An emitter whose plane contains the receiver is edge-on: measure zero, no
-    // irradiance. But on the sphere that polygon degenerates to a great circle,
-    // and if the receiver's projection falls INSIDE the triangle the three edge
-    // terms all take the same sign and the sum comes out at 2*PI -- so the
-    // formula reports a full hemisphere of the emitter's radiance instead of
-    // nothing.
-    //
-    // It is not a rounding error, it is the worst possible answer, and it lands
-    // exactly where it hurts most: every hit point on the panel itself, and
-    // every child camera a tile places there. At the panel's emitted radiance of
-    // 17 that single term dominates its whole tile, which is where the panel-
-    // shaped bright blobs in this example's earlier images came from. The
-    // `series` gate caught it as a 29% energy overshoot at two levels.
-    //
-    // The threshold is the camera bias, because that is exactly how far off its
-    // surface this example places a receiver: anything closer than that is on
-    // the emitter, not near it. A genuinely coplanar surface -- Cornell's
-    // ceiling, which the panel is flush with -- receives nothing from it, which
-    // is the physically correct answer and not an approximation.
-    //
-    // BOTH CONDITIONS ARE REQUIRED. Rejecting on the height alone also throws
-    // away emitters that merely PASS THROUGH the receiver while standing
-    // perpendicular to it -- a wall meeting a floor, or any hit point that lands
-    // on a box edge -- and those cover half the receiver's hemisphere, not none
-    // of it. The texeldir gate caught exactly that: hit points landing on the
-    // gate box's edges read half their true irradiance, and because a symmetric
-    // box puts many texel centres precisely on its own edges, that was 12% of
-    // the whole hemisphere at an 8x8 target.
-    if (abs(h) < 2.0 * u_bias && abs(dot(tr.n.xyz, nrm)) > 0.9) return vec3(0.0);
-
-    vec3 c[MBG_CLIP_MAX];
-    int n = mbg_clip_plane(v, 3, nrm, c);
-    if (n < 3) return vec3(0.0);
-
-    float sum = 0.0;
-    for (int i = 0; i < n; ++i) {
-        vec3 a = normalize(c[i]);
-        vec3 b = normalize(c[i + 1 == n ? 0 : i + 1]);
-        vec3 x = cross(a, b);
-        float len = length(x);
-        if (len < 1e-9) continue;
-        sum += acos(clamp(dot(a, b), -1.0, 1.0)) * dot(nrm, x / len);
-    }
-    return tr.emission.xyz * u_emissive * (0.5 * abs(sum));
-}
-
 // The fraction of emitter `ei` that this camera can actually see, weighted by
 // each sample's own contribution (cos_r * cos_e / d^2) so the answer is the
 // fraction of ENERGY that gets through rather than the fraction of area.
@@ -448,7 +358,9 @@ void main() {
                     vec3 hn = hden < 0.0 ? ht.n.xyz : -ht.n.xyz;
                     vec3 e = vec3(0.0);
                     for (uint em = 0u; em < u_emitters; ++em)
-                        e += mbg_emitter_unshadowed(hp, hn, em);
+                        e += mbg_emitter_unshadowed(hp, hn, tris[emitters[em]],
+                                                    u_two_sided != 0u, 2.0 * u_bias,
+                                                    u_emissive);
                     v = dot(e, vec3(1.0 / 3.0));
                 }
             }
@@ -484,7 +396,8 @@ void main() {
     vec3  direct = vec3(0.0);
     float unshadowed = 0.0;
     for (uint e = tid; e < u_emitters; e += 64u) {
-        vec3 u = mbg_emitter_unshadowed(g_P, g_N, e);
+        vec3 u = mbg_emitter_unshadowed(g_P, g_N, tris[emitters[e]],
+                                        u_two_sided != 0u, 2.0 * u_bias, u_emissive);
         direct += u * mbg_emitter_visibility(e);
         unshadowed += dot(u, vec3(1.0));
     }
@@ -617,7 +530,9 @@ void main() {
                     vec3 hn = hden < 0.0 ? ht.n.xyz : -ht.n.xyz;
                     vec3 e_dir = vec3(0.0);
                     for (uint em = 0u; em < u_emitters; ++em)
-                        e_dir += mbg_emitter_unshadowed(hp, hn, em);
+                        e_dir += mbg_emitter_unshadowed(hp, hn, tris[emitters[em]],
+                                                        u_two_sided != 0u, 2.0 * u_bias,
+                                                        u_emissive);
                     wdir += mass * e_dir;
                 }
 

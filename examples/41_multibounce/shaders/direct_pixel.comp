@@ -1,0 +1,121 @@
+#version 460 core
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// ---------------------------------------------------------------------------
+// The direct term, one thread per PIXEL.
+//
+// Same estimator as the one in raster.comp -- literally the same magnitude
+// function, from common/emitter.glsl -- with the receiver taken from the
+// G-buffer instead of from a secondary camera. That is the whole difference,
+// and it is the difference that matters, because the GI grid is the resolution
+// limit:
+//
+//   * a secondary camera answers for a whole MBG_SCALE x MBG_SCALE block of
+//     pixels, 4x4 by default. A shadow boundary reconstructed from receivers
+//     that far apart and then bilaterally upsampled is soft no matter how good
+//     the upsample is. That is Nyquist, not a filtering failure, and direct
+//     lighting is where it shows: it carries the sharpest edges in the image.
+//   * a per-pixel receiver has no such limit. The boundary is resolved at the
+//     resolution of the OCCLUDER representation -- here the triangles
+//     themselves, exactly -- and of the light stratification, both far finer
+//     than the receiver spacing.
+//
+// The solve is untouched: every secondary camera still computes its own direct
+// term, because the bounce transport needs it. This only changes what the IMAGE
+// reads. The GI grid then has to carry the indirect residual alone or the direct
+// term would be counted twice, which is what gather.comp's u_split does.
+//
+// Indirect stays interpolated from the GI grid, which is the right place for it:
+// it is low frequency and 16x cheaper there.
+//
+// VISIBILITY IS RAY CAST, and that is not a retreat from the technique. Doc
+// section 3 puts direct lighting outside the GI pass on purpose ("direct
+// lighting stays a separate conventional pass"), and a conventional pass is
+// free to use whatever resolves a shadow best -- example 40's equivalent tests
+// against surfel discs, a real engine would use a shadow map. Every claim this
+// example makes about rasterized transport is about the hemisphere cameras,
+// which are untouched by this file. The cast is brute force over every triangle
+// for the same reason nothing else here has an acceleration structure.
+//
+// ADDS INTO the upsampled target rather than writing its own: the target holds
+// irradiance E directly, so the direct term composites with a read-modify-write
+// and needs no second full-resolution texture.
+// ---------------------------------------------------------------------------
+
+#include "scene.glsl"
+#include "emitter.glsl"
+#include "gbuffer.glsl"
+
+layout(std430, binding = 0) readonly buffer MbgTris { MbgTri tris[]; };
+layout(std430, binding = 8) readonly buffer MbgEmit { uint   emitters[]; };
+
+layout(binding = 0) uniform sampler2D u_albedo;
+layout(binding = 1) uniform sampler2D u_normal;
+layout(binding = 3) uniform sampler2D u_depth;
+
+layout(binding = 1, rgba32f) uniform image2D u_target;   // full resolution, (E, 1)
+
+uniform ivec2 u_size;
+uniform mat4  u_inv_view_proj;
+uniform uint  u_tri_count;
+uniform uint  u_emitters;
+uniform uint  u_shadow;        // shadow rays per emitter
+uniform uint  u_two_sided;
+uniform float u_bias;
+uniform float u_emissive;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= u_size.x || p.y >= u_size.y) return;
+    if (u_emitters == 0u) return;
+    if (texelFetch(u_albedo, p, 0).a <= 0.5) return;
+
+    vec3  N = normalize(texelFetch(u_normal, p, 0).xyz);
+    float d = texelFetch(u_depth, p, 0).r;
+    vec3  P = world_from_depth(d, (vec2(p) + 0.5) / vec2(u_size), u_inv_view_proj) +
+              N * u_bias;
+
+    vec3 E = vec3(0.0);
+    for (uint e = 0u; e < u_emitters; ++e) {
+        MbgTri tr = tris[emitters[e]];
+        vec3 mag = mbg_emitter_unshadowed(P, N, tr, u_two_sided != 0u, 2.0 * u_bias,
+                                          u_emissive);
+        if (dot(mag, vec3(1.0)) <= 0.0) continue;     // below the horizon, or its back
+
+        // Contribution-weighted visibility, as in raster.comp: the fraction of
+        // ENERGY that gets through, not the fraction of area. The magnitude above
+        // is exact, so this ratio is the only sampled quantity in the whole
+        // direct term.
+        float num = 0.0, den = 0.0;
+        uint S = max(1u, u_shadow);
+        for (uint s = 0u; s < S; ++s) {
+            vec2 uv = mbg_hammersley(s, S);
+            if (uv.x + uv.y > 1.0) uv = vec2(1.0) - uv;       // square -> triangle
+            vec3 q = tr.p0.xyz + (tr.p1.xyz - tr.p0.xyz) * uv.x +
+                                 (tr.p2.xyz - tr.p0.xyz) * uv.y;
+            vec3 sd = q - P;
+            float dist = length(sd);
+            if (dist < 1e-9) continue;
+            vec3 dir = sd / dist;
+            float cr = dot(N, dir);
+            if (cr <= 0.0) continue;
+            float f = cr * abs(dot(tr.n.xyz, dir)) / (dist * dist);
+            den += f;
+
+            // The emitter itself sits at t == dist, and a coplanar neighbour
+            // (the panel's other half) at the same place, so the test is on
+            // strictly nearer hits.
+            float lim = dist * (1.0 - 1e-3);
+            bool blocked = false;
+            for (uint t = 0u; t < u_tri_count && !blocked; ++t) {
+                float th;
+                if (mbg_ray_tri(P, dir, tris[t], th) && th < lim) blocked = true;
+            }
+            if (!blocked) num += f;
+        }
+        if (den > 0.0) E += mag * (num / den);
+    }
+
+    vec4 cur = imageLoad(u_target, p);
+    imageStore(u_target, p, vec4(cur.rgb + E, 1.0));
+}

@@ -44,6 +44,8 @@ reload sees it.
 | `MBG_SHADOW=n` | visibility samples per emitter per camera (default 16) |
 | `MBG_SHADOW_BIAS=f` | relative depth bias for the visibility test (default 2e-3) |
 | `MBG_TENT=0\|1` | spread each texel's mass over the four nearest spawn tiles (default 1) |
+| `MBG_DIRECT_PIXEL=0\|1` | evaluate the **image's** direct term per pixel with shadow rays instead of taking it from the GI grid (default 1); see finding 11 |
+| `MBG_SHADOW_PIXEL=n` | shadow rays per emitter for that pass (default 16) |
 | `MBG_SKY=f` | radiance of an uncovered texel. **0.05 is needed to reproduce the full-GI reference**; see finding 5 |
 | `MBG_EMISSIVE=f` | emissive scale |
 | `MBG_BIAS=f` | camera offset along its own normal, world units (default = 2.5e-4 × scene diagonal) |
@@ -69,7 +71,7 @@ reload sees it.
 | 4.3 | Hemi-octahedral hemisphere map, one square target, one pass | ✅ |
 | 4.4 | Cosine × solid-angle weighted integration | ✅ integrated per texel, not point sampled |
 | 4.4 | SH2 projection | ⬜ deliberately not done — see "Deviations" |
-| 3 | Direct lighting as a separate conventional pass, not out of the GI gather | ✅ analytic polygon irradiance, visibility sampled against the hemisphere's own buffer |
+| 3 | Direct lighting as a separate conventional pass, not out of the GI gather | ✅ analytic polygon irradiance; visibility from the hemisphere buffer for the bounce transport, and from shadow rays per pixel for the image |
 | 5.2 | Cluster DAG LOD, meshlets, boundary locking | ⬜ milestone 4, and the whole point of having this reference first |
 | 5.3 | Compute rasterizer, one workgroup per camera, LDS depth buffer, atomicMin | ✅ with a 32-bit key instead of 64 — see "Deviations" |
 | 5.3 | Visibility buffer resolved in a second pass | ✅ and better: it never leaves shared memory |
@@ -94,10 +96,13 @@ reload sees it.
 
 Shaders: `place.comp` (camera placement), `raster.comp` (the software rasterizer,
 the integration and the spawn), `gather.comp` (fold the children in),
-`upsample.comp` (GI grid → full res), plus the G-buffer and display raster pairs.
-`shaders/common/` carries `hemi.glsl` (the map, the clipper, the packed key),
-`scene.glsl` (structs, bindings, ONB), and `oct.glsl`, `gbuffer.glsl`,
-`brdf.glsl`, `tonemap.glsl` copied from example 40.
+`upsample.comp` (GI grid → full res), `direct_pixel.comp` (the image's direct
+term, per pixel), plus the G-buffer and display raster pairs. `shaders/common/`
+carries `hemi.glsl` (the map, the clipper, the packed key), `emitter.glsl` (the
+analytic magnitude and the ray-triangle test, shared by both direct paths so they
+cannot drift), `scene.glsl` (structs, bindings, ONB), and `oct.glsl`,
+`gbuffer.glsl`, `brdf.glsl`, `tonemap.glsl` from example 40 — `tonemap.glsl` with
+an AgX curve added (finding 10).
 
 ## Units
 
@@ -208,13 +213,20 @@ direct with 16 visibility samples, tent weights on.
 
 | | RMSE | roughness vs reference | cameras/sweep | sweep |
 |---|---|---|---|---|
-| 1 bounce vs the direct reference | 0.0486 | **0.61×** | 1.6e4 | 0.43 s |
-| 3 bounces vs the full-GI reference (sky 0.05) | 0.0537 | **1.12×** | 1.3e6 | 13 s |
+| 1 bounce vs the direct reference | **0.0431** | 0.91× | 1.6e4 | 0.40 s + 0.33 s direct |
+| 3 bounces vs the full-GI reference (sky 0.05) | **0.0522** | 1.16× | 1.3e6 | 12 s + 0.33 s direct |
 
-Roughness below 1.0 means the render is smoother than the converged path trace's
-own residual noise. The 3-bounce figure is carried by the ceiling (1.72×), which
-is the surface that needs the most bounces and gets its light entirely through
-the clustered indirect term.
+The direct pass is per frame rather than per sweep, and its 0.33 s is llvmpipe
+brute-forcing 16 shadow rays per emitter per pixel against all 32 triangles.
+
+Roughness is high-pass energy relative to the reference's own, so **both
+directions are wrong**: far below 1.0 is an over-smoothed image, far above it is
+artifacts. The same configuration with `MBG_DIRECT_PIXEL=0` scores 0.0486 and
+**0.61×** at one bounce — measurably smoother than a converged path trace, which
+is not a compliment: it is the shadow boundaries being blurred away by the
+upsample (finding 11). The 3-bounce figure above is carried by the ceiling
+(1.72×), the surface that needs the most bounces and gets its light entirely
+through the clustered indirect term.
 
 ### Bounce count (GI 64×64, tile 4, sky 0.05)
 
@@ -541,6 +553,56 @@ we are guessing, **the tone curve contributes about as much error as the light
 transport does**. Further transport work on this scene has to be scored on
 patches and on roughness rather than on a single number — and the real fix is a
 reference rendered through a curve we control.
+
+### 11. The direct term needs its own receiver, not just its own estimator
+
+Finding 2 took the direct term out of the quadrature. That fixed its *magnitude*
+and left its *resolution* wrong, because the receiver was still a secondary
+camera: one per `MBG_SCALE`×`MBG_SCALE` block of pixels, 4×4 by default, followed
+by a joint-bilateral upsample. Direct lighting carries the sharpest edges in the
+image — contact shadows, the boundary where a box occludes the panel — and
+reconstructing them from receivers four pixels apart makes them soft no matter
+how good the upsample is. That is Nyquist, not a filtering failure, and it is the
+same limit example 40 hit against its surfel spacing and answered the same way.
+
+So the direct term is split by **receiver** as well as by estimator:
+
+| | receiver | visibility | feeds |
+|---|---|---|---|
+| `raster.comp` | one per secondary camera | the hemisphere buffer it just rasterized | the bounce transport, where soft is fine |
+| `direct_pixel.comp` | one per **pixel** | shadow rays against the triangles | the image, where it is the sharpest term |
+
+Both call the same magnitude function (`common/emitter.glsl`), so they cannot
+drift. The solve is untouched — every camera still computes its own direct term,
+because the transport needs it — and the GI grid then carries the **indirect
+residual alone** (`gather.comp`'s `u_split`) so nothing is counted twice.
+
+Measured at one bounce against the direct reference, GI 128×128:
+
+| | RMSE | roughness |
+|---|---|---|
+| direct from the GI grid | 0.0486 | 0.61× |
+| **direct per pixel** | **0.0431** | 0.91× |
+
+The roughness figure is the interesting one. 0.61× says the image was *smoother
+than the converged path trace* — it had lost detail the reference has. Per pixel
+it lands at 0.91×, i.e. carrying about as much high-frequency content as the
+reference does, which is what a correct sharp image looks like on this metric.
+
+**The two paths agree, which is the check that matters.** At `MBG_SCALE=1`, where
+both have one receiver per pixel, mean image brightness differs by 1.6% (48.1
+against 47.4) — so the split is a redistribution and not a double count. The
+per-pixel path still scores better even there (0.0431 against 0.0448), because
+ray-cast visibility resolves a shadow boundary exactly while the rasterized one
+is limited by the 32² hemisphere's silhouette.
+
+**Ray casting here is not a retreat from the premise.** §3 puts direct lighting
+outside the GI pass on purpose, and a conventional pass may use whatever resolves
+a shadow best — example 40's equivalent tests against surfel discs, an engine
+would use a shadow map. Every claim this example makes about rasterized transport
+is about the hemisphere cameras, and they are untouched by this pass. The cast is
+brute force over every triangle for the same reason nothing else here has an
+acceleration structure.
 
 ## What this does not answer
 

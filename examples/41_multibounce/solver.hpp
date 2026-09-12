@@ -75,6 +75,13 @@ struct SolveConfig {
     bool      nee = true;
     uint32_t  shadow = 16;         // visibility samples per emitter per camera
     float     shadow_bias = 2e-3f; // relative depth bias for that test
+    // Evaluate the IMAGE's direct term per pixel with shadow rays instead of
+    // taking it from the GI grid. The grid answers for a scale x scale block, so
+    // the direct term -- the sharpest thing in the image -- is otherwise limited
+    // by the grid's Nyquist and comes out soft however good the upsample is.
+    // The solve is unchanged; only what the image reads changes.
+    bool      direct_pixel = true;
+    uint32_t  shadow_pixel = 16;   // shadow rays per emitter per pixel
     // Spread each texel's albedo mass across the four nearest spawn tiles
     // instead of assigning it to one. Removes the tile discontinuity; costs a
     // wider scan of shared memory and nothing else.
@@ -121,6 +128,10 @@ public:
               const SolveConfig& cfg);
     // GI grid -> full resolution. Runs every frame, independent of the chunk.
     void upsample(const GBuffer& gb, const gfx::Camera& cam, const SolveConfig& cfg);
+    // Adds the per-pixel direct term into the upsampled target. Runs after
+    // upsample(), every frame, and is independent of the chunk schedule.
+    void direct_pixel(const GBuffer& gb, const gfx::Camera& cam, const Scene& scene,
+                      const SolveConfig& cfg);
 
     // --- Gate entry points ---------------------------------------------------
     //
@@ -165,6 +176,7 @@ public:
     PassTimer& t_raster(uint32_t l) { return t_raster_[l]; }
     PassTimer& t_gather() { return t_gather_; }
     PassTimer& t_upsample() { return t_upsample_; }
+    PassTimer& t_direct() { return t_direct_; }
 
 private:
     void dispatch_1d(uint32_t count);          // 64-wide, split across x/y
@@ -176,7 +188,7 @@ private:
                     bool write_image);
     void upload_points(const std::vector<glm::vec4>& pos, const std::vector<glm::vec4>& nrm);
 
-    Pipeline place_, raster_, gather_, upsample_;
+    Pipeline place_, raster_, gather_, upsample_, direct_px_;
 
     // Per level: cameras, irradiance, the direct term with its visible fraction,
     // and the per-tile masses that spawned them (two vec4s per child: the
@@ -201,6 +213,7 @@ private:
         PassTimer{"Raster L3"}, PassTimer{"Raster L4"}};
     PassTimer t_gather_{"Resolve"};
     PassTimer t_upsample_{"Upsample"};
+    PassTimer t_direct_{"Direct/px"};
 };
 
 } // namespace mbg

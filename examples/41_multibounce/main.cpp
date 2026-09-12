@@ -47,6 +47,9 @@
 //   MBG_NEE=1               analytic direct term (doc section 3's separate pass)
 //   MBG_SHADOW=16           visibility samples per emitter, per camera
 //   MBG_TENT=1              spread each texel's mass over the 4 nearest tiles
+//   MBG_DIRECT_PIXEL=1      evaluate the image's direct term per pixel, not per
+//                           GI-grid camera -- the sharpest term in the image
+//   MBG_SHADOW_PIXEL=16     shadow rays per emitter for that pass
 //   MBG_SCALE=4             GI grid = framebuffer / scale; 1 == one camera/pixel
 //   MBG_BUDGET=4096         level-1 cameras per frame
 //   MBG_RES=32              level-1 target edge; MBG_RES2/3/4 for deeper levels
@@ -153,6 +156,8 @@ EnvOpts read_env() {
     if (const char* v = getenv("MBG_SHADOW"))   u32(v, o.cfg.shadow);
     if (const char* v = getenv("MBG_SHADOW_BIAS")) o.cfg.shadow_bias = float(atof(v));
     if (const char* v = getenv("MBG_TENT"))     o.cfg.tent = atoi(v) != 0;
+    if (const char* v = getenv("MBG_DIRECT_PIXEL")) o.cfg.direct_pixel = atoi(v) != 0;
+    if (const char* v = getenv("MBG_SHADOW_PIXEL")) u32(v, o.cfg.shadow_pixel);
     if (const char* v = getenv("MBG_PLANE"))    o.cfg.plane_tol = float(atof(v));
     if (const char* v = getenv("MBG_GTCAM"))    o.gtcam = atoi(v);
     if (const char* v = getenv("MBG_VIEW"))     o.view = atoi(v);
@@ -421,7 +426,7 @@ int main() {
     PassTimer* const solver_timers[] = {&solver.t_place(), &solver.t_raster(0),
                                         &solver.t_raster(1), &solver.t_raster(2),
                                         &solver.t_raster(3), &solver.t_gather(),
-                                        &solver.t_upsample()};
+                                        &solver.t_upsample(), &solver.t_direct()};
 
     // --- State ---------------------------------------------------------------
 
@@ -519,6 +524,11 @@ int main() {
             solver.step(gbuf, cam, scene, cfg);
         }
         solver.upsample(gbuf, cam, cfg);
+        // The image's direct term, per pixel, composited onto the upsampled
+        // indirect. Outside the pass above and with its own timer: PassTimer
+        // wraps a GL query object, and a query cannot begin while another is
+        // active.
+        solver.direct_pixel(gbuf, cam, scene, cfg);
 
         // 3. Display.
         {
@@ -599,6 +609,12 @@ int main() {
                     ImGui::SliderFloat("Shadow bias", &cfg.shadow_bias, 0.0f, 0.02f, "%.4f");
                 }
                 ImGui::Checkbox("Tent-weighted spawn tiles", &cfg.tent);
+                ImGui::Checkbox("Direct term per pixel", &cfg.direct_pixel);
+                if (cfg.direct_pixel) {
+                    int sp = int(cfg.shadow_pixel);
+                    if (ImGui::SliderInt("Shadow rays / pixel", &sp, 1, 64))
+                        cfg.shadow_pixel = uint32_t(sp);
+                }
             }
 
             if (ImGui::CollapsingHeader("View", ImGuiTreeNodeFlags_DefaultOpen)) {

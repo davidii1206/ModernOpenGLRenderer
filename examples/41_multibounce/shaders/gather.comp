@@ -25,6 +25,7 @@ layout(std430, binding = 3) buffer          MbgIrrad  { vec4 irradiance[]; };
 layout(std430, binding = 5) readonly buffer MbgChildW { vec4 child_w[]; };
 layout(std430, binding = 6) readonly buffer MbgChildE { vec4 child_e[]; };
 layout(std430, binding = 10) readonly buffer MbgChildD { vec4 child_d[]; };
+layout(std430, binding = 9)  readonly buffer MbgDirect { vec4 direct_in[]; };
 
 layout(binding = 0, rgba32f) uniform image2D u_gi;
 
@@ -33,6 +34,8 @@ uniform uint  u_children;    // per camera; 0 on a terminal level or a 1-bounce 
 uniform uint  u_write;       // 1 = this is level 1: scatter into the GI image
 uniform uint  u_cursor;      // GI pixel index of camera 0 of this chunk
 uniform ivec2 u_gi_size;
+uniform uint  u_split;       // 1 = scatter E MINUS the direct term (direct_pixel.comp
+                             //     re-adds it per pixel); 0 = scatter all of E
 
 void main() {
     uint cam = gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 64u + gl_GlobalInvocationID.x;
@@ -57,9 +60,13 @@ void main() {
     irradiance[cam] = vec4(E, 1.0);
 
     if (u_write != 0u) {
+        // The residual, not the total, when the image's direct term is coming
+        // from direct_pixel.comp. The camera's own direct term stays in
+        // irradiance[] either way, because the bounce transport above reads it.
+        vec3 img = u_split != 0u ? max(E - direct_in[cam].xyz, vec3(0.0)) : E;
         uint pix = u_cursor + cam;
         if (pix < uint(u_gi_size.x * u_gi_size.y))
             imageStore(u_gi, ivec2(int(pix) % u_gi_size.x, int(pix) / u_gi_size.x),
-                       vec4(E, 1.0));
+                       vec4(img, 1.0));
     }
 }

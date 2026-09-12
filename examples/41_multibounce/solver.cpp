@@ -43,7 +43,9 @@ bool Solver::init() {
     raster_   = Pipeline::compute("shaders/raster.comp");
     gather_   = Pipeline::compute("shaders/gather.comp");
     upsample_ = Pipeline::compute("shaders/upsample.comp");
-    return place_.valid() && raster_.valid() && gather_.valid() && upsample_.valid();
+    direct_px_ = Pipeline::compute("shaders/direct_pixel.comp");
+    return place_.valid() && raster_.valid() && gather_.valid() && upsample_.valid() &&
+           direct_px_.valid();
 }
 
 bool Solver::poll() {
@@ -51,6 +53,7 @@ bool Solver::poll() {
     changed |= raster_.poll();
     changed |= gather_.poll();
     changed |= upsample_.poll();
+    changed |= direct_px_.poll();
     return changed;
 }
 
@@ -239,6 +242,8 @@ void Solver::raster_level(uint32_t l, uint32_t count, const Scene& scene,
 
 void Solver::run_levels(uint32_t chunk, const Scene& scene, const SolveConfig& cfg,
                         bool write_image) {
+    const bool split = write_image && cfg.direct_pixel && cfg.nee &&
+                       scene.emitter_count() > 0;
     // Rasterize shallowest first: a level's cameras are spawned by the level
     // above it, so level l+1's camera buffer is written by level l's raster.
     uint32_t counts[kMaxLevels] = {chunk, 0, 0, 0};
@@ -263,6 +268,8 @@ void Solver::run_levels(uint32_t chunk, const Scene& scene, const SolveConfig& c
         gather_.set("u_write", write ? 1u : 0u);
         gather_.set("u_cursor", cursor_);
         gather_.set("u_gi_size", glm::ivec2(gi_w_, gi_h_));
+        gather_.set("u_split", (write && split) ? 1u : 0u);
+        direct_[l].bind_base(kBindDirect);
         dispatch_1d(counts[l]);
         gl::memory_barrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
     };
@@ -326,6 +333,30 @@ std::vector<uint32_t> Solver::raster_visibility(const Scene& scene, const SolveC
     glGetNamedBufferSubData(dump.handle(), 0,
                             GLsizeiptr(out.size() * sizeof(uint32_t)), out.data());
     return out;
+}
+
+void Solver::direct_pixel(const GBuffer& gb, const gfx::Camera& cam, const Scene& scene,
+                          const SolveConfig& cfg) {
+    if (!allocated_ || !direct_px_.valid() || !cfg.direct_pixel || !cfg.nee ||
+        scene.emitter_count() == 0) {
+        t_direct_.skip();
+        return;
+    }
+    ScopedPass p(t_direct_);
+    direct_px_.use();
+    scene.bind();
+    gb.bind_textures();
+    full_.bind_image(1, 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA32F);
+    direct_px_.set("u_size", glm::ivec2(gb.width, gb.height));
+    direct_px_.set("u_inv_view_proj", glm::inverse(cam.view_projection()));
+    direct_px_.set("u_tri_count", scene.count());
+    direct_px_.set("u_emitters", scene.emitter_count());
+    direct_px_.set("u_shadow", std::max(1u, cfg.shadow_pixel));
+    direct_px_.set("u_two_sided", cfg.two_sided ? 1u : 0u);
+    direct_px_.set("u_bias", cfg.bias);
+    direct_px_.set("u_emissive", cfg.emissive);
+    gl::dispatch_compute(uint32_t((gb.width + 7) / 8), uint32_t((gb.height + 7) / 8), 1);
+    gl::memory_barrier(GL_TEXTURE_FETCH_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
 }
 
 void Solver::upsample(const GBuffer& gb, const gfx::Camera& cam, const SolveConfig& cfg) {
