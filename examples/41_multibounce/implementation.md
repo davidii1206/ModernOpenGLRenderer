@@ -40,6 +40,10 @@ reload sees it.
 | `MBG_BUDGET=n` | level-1 cameras per frame. The sweep is split into `ceil(pixels/budget)` chunks; the budget is clamped down if the camera tree would exceed 512 MB |
 | `MBG_RES=n` / `MBG_RES2/3/4=n` | hemi-octahedral target edge per level, 2–32 |
 | `MBG_BLOCK=n` / `MBG_BLOCK2/3=n` | spawn tile edge in texels. **1 spawns a child per texel — the unabridged recursion** |
+| `MBG_NEE=0\|1` | evaluate the direct term analytically instead of taking it from the raster (default 1). **The single most important setting for image quality**; see finding 2 |
+| `MBG_SHADOW=n` | visibility samples per emitter per camera (default 16) |
+| `MBG_SHADOW_BIAS=f` | relative depth bias for the visibility test (default 2e-3) |
+| `MBG_TENT=0\|1` | spread each texel's mass over the four nearest spawn tiles (default 1) |
 | `MBG_SKY=f` | radiance of an uncovered texel. **0.05 is needed to reproduce the full-GI reference**; see finding 5 |
 | `MBG_EMISSIVE=f` | emissive scale |
 | `MBG_BIAS=f` | camera offset along its own normal, world units (default = 2.5e-4 × scene diagonal) |
@@ -49,7 +53,8 @@ reload sees it.
 | `MBG_SOLVE=n` | run n complete sweeps before the first present, then hold, and print the per-sweep wall clock |
 | `MBG_COMPARE=1` | RMSE/MAE against the reference selected by `MBG_REF`, in display space |
 | `MBG_REF=0\|1` | which reference: direct-lighting or full-GI |
-| `MBG_VIEW=n` / `MBG_TONEMAP=n` / `MBG_EXPOSURE=f` | initial display mode, tone curve, exposure |
+| `MBG_VIEW=n` / `MBG_TONEMAP=n` / `MBG_EXPOSURE=f` | initial display mode, tone curve (0 ACES, 1 Reinhard, 2 clamp, 3 filmic, 4 AgX; default 1, see finding 8), exposure |
+| `MBG_GATE_RES=n` / `MBG_GATE_BLOCK=n` | target and tile size for the `series` and `texeldir` gates, for bisecting a failure |
 | `MBG_BENCH=n` | run n frames, print wall-clock percentiles + per-pass GPU averages, exit |
 | `MBG_SHOT=path` | write a screenshot before exiting |
 | `MBG_NOGUI=1` | skip the ImGui overlay — **required** for a clean screenshot |
@@ -64,6 +69,7 @@ reload sees it.
 | 4.3 | Hemi-octahedral hemisphere map, one square target, one pass | ✅ |
 | 4.4 | Cosine × solid-angle weighted integration | ✅ integrated per texel, not point sampled |
 | 4.4 | SH2 projection | ⬜ deliberately not done — see "Deviations" |
+| 3 | Direct lighting as a separate conventional pass, not out of the GI gather | ✅ analytic polygon irradiance, visibility sampled against the hemisphere's own buffer |
 | 5.2 | Cluster DAG LOD, meshlets, boundary locking | ⬜ milestone 4, and the whole point of having this reference first |
 | 5.3 | Compute rasterizer, one workgroup per camera, LDS depth buffer, atomicMin | ✅ with a 32-bit key instead of 64 — see "Deviations" |
 | 5.3 | Visibility buffer resolved in a second pass | ✅ and better: it never leaves shared memory |
@@ -149,15 +155,16 @@ evaluating along +Z would band-limit a number this example already has exactly.
 Adding SH2 here would import the clustering variant's error into the reference
 that is supposed to bound it. It belongs with §4.1, in the example after this.
 
-**Direct lighting comes out of the same gather.** §3 lists "no correct area-light
-soft shadows from the GI pass. Direct lighting stays a separate conventional
-pass" as a non-goal. Cornell's only light is emissive geometry, so a separate
-direct pass would need an area-light estimator (example 40 has one, 251 lines of
-`nee.glsl`) and this example would then not be testing the thing it is for. The
-consequence is measured in finding 2: at 32×32 the emitter panel is resolved by
-a few tens of texels and the direct term carries a few percent of quadrature
-noise. That is the honest cost of taking the technique undiluted, and it is
-exactly why §3 says what it says.
+**Direct lighting is a separate pass, because §3 says so and the images agreed.**
+The first version of this example took the emitter out of the hemisphere raster
+like everything else, on the grounds that it was testing the technique
+undiluted. §3's non-goal — "no correct area-light soft shadows from the GI pass.
+Direct lighting stays a separate conventional pass" — turned out to be the whole
+ballgame for image quality, and finding 2 is the measurement. The direct term is
+now exact polygon irradiance with visibility sampled against the hemisphere
+buffer that is already in shared memory, so it costs one extra pass over the
+emitters and no extra structure at all. `MBG_NEE=0` restores the original
+behaviour, and the `rect` gate asserts both estimators separately.
 
 **Jacobi over chunks, not a per-frame N³.** The full tree does not fit in memory
 at a useful resolution (finding 6), so a sweep is split into chunks of
@@ -168,16 +175,17 @@ image rather than a converging one.
 
 ## Gates
 
-`MBG_GATE=all`, 21 assertions, all passing:
+`MBG_GATE=all`, **31 assertions, all passing**:
 
 | Gate | Asserts | Result |
 |---|---|---|
 | `quad` | the quadrature table integrates the hemisphere **before** normalization | `sum(dΩ)` = 2π and `sum(cos dΩ)` = π to 1e-8 relative at 8², 16², 32² |
-| `closed` | a camera sealed inside an emitter of radiance L reads exactly πL, at five orientations and two resolutions | worst orientation off by 7.5e-8 — i.e. the rasterizer leaves no cracks and double coverage costs nothing |
-| `rect` | a camera under a rectangle matches the analytic form factor | 20.0% at 8², 4.3% at 16², **1.1% at 32²**, and the gate asserts the halving, not just the bound |
+| `closed` | a camera sealed inside an emitter reads exactly πL — at five orientations, on all six faces, and next to an edge | worst case off by 3.7e-5: the rasterizer leaves no cracks, and double coverage costs nothing |
+| `rect` | a receiver under a rectangle matches the analytic form factor, both estimators | analytic: 0.02% at every target size, and **resolution-free to 1e-6**. Quadrature: 20.0% / 4.3% / 1.1% at 8² / 16² / 32², and the gate asserts the halving rather than the bound |
 | `occ` | an opaque panel between camera and emitter takes it to zero | exactly 0 |
-| `oracle` | the compute rasterizer vs a CPU ray cast, texel for texel, 64 cameras on Cornell's own surfaces | **0 disagreements in 65536 texels** (see finding 1) |
-| `series` | N camera levels in a closed box of albedo ρ read πL(1+ρ+…+ρ^(N-1)) | 4.8e-8, 2.0e-7, 1.1e-7 relative at 1, 2, 3 levels |
+| `oracle` | the compute rasterizer vs a CPU ray cast, texel for texel, 64 cameras on Cornell's own surfaces | **0 disagreements in 65536 texels** (finding 1) |
+| `texeldir` | the direct term evaluated at **hit points**, integrated against the analytic answer and cross-checked per texel against a CPU ray cast | mean within 2.4e-5, worst texel within 1.5e-4 (finding 8) |
+| `series` | N camera levels in a closed box of albedo ρ read πL(1+ρ+…+ρ^(N-1)) | 5.6e-5, 3.1e-4, 2.7e-4 relative at 1, 2, 3 levels |
 
 `closed` and `series` between them pin down everything a picture cannot: the
 solid-angle weights, the absence of cracks, the `/PI`, the per-tile albedo mass,
@@ -185,71 +193,85 @@ and the deepest-level-first resolve order.
 
 ## Measurements
 
-All at the reference camera, 512×512, one complete sweep, RMSE in display space
-against the path-traced PNG. **Timings are llvmpipe (software GL, 4 CPU threads)
-— they are not GPU numbers.** The camera/texel/triangle-raster counts beside them
-are hardware independent and are the thing to scale.
+All at the reference camera, 512×512, one complete sweep, against the matching
+path-traced PNG in display space under the default Reinhard curve (finding 10).
+RMSE is reported for continuity but **it is nearly blind to this example's
+artifacts** — see finding 9, and read the roughness column instead.
+**Timings are llvmpipe (software GL, 4 CPU threads) — they are not GPU numbers.**
+The camera and texel counts beside them are hardware independent and are the
+thing to scale.
 
-### Bounce count (GI 64×64, targets 32/8/8/8, tile 4, sky 0)
+### The default configuration
 
-| Bounces | vs direct ref | vs full-GI ref | cameras/sweep | texels/sweep | sweep |
-|---|---|---|---|---|---|
-| 1 | **0.0557** | 0.1511 | 4.1e3 | 4.2e6 | 0.11 s |
-| 2 | — | 0.0885 | 2.7e5 | 2.1e7 | 1.7 s |
-| 3 | — | **0.0808** | 1.3e6 | 8.8e7 | 8.2 s |
-| 4 | — | 0.0821 | 5.5e6 | 3.6e8 | 34 s |
+`MBG_BOUNCES=3`, `MBG_SCALE=4` (GI 128×128), targets 32/8/8, tiles 8/4, analytic
+direct with 16 visibility samples, tent weights on.
 
-### Spawn tile size (2 bounces, GI 64×64)
-
-| Tile | children/camera | vs full-GI ref | cameras/sweep | sweep |
+| | RMSE | roughness vs reference | cameras/sweep | sweep |
 |---|---|---|---|---|
-| 8 | 16 | 0.0997 | 7.0e4 | 0.54 s |
-| 4 | 64 | 0.0885 | 2.7e5 | 1.7 s |
-| 2 | 256 | 0.0859 | 1.1e6 | 6.0 s |
-| 1 | 1024 | 0.0845 | 4.2e6 | 21 s |
+| 1 bounce vs the direct reference | 0.0486 | **0.61×** | 1.6e4 | 0.43 s |
+| 3 bounces vs the full-GI reference (sky 0.05) | 0.0537 | **1.12×** | 1.3e6 | 13 s |
 
-### The configuration these images were taken at
+Roughness below 1.0 means the render is smoother than the converged path trace's
+own residual noise. The 3-bounce figure is carried by the ceiling (1.72×), which
+is the surface that needs the most bounces and gets its light entirely through
+the clustered indirect term.
 
-| Config | vs reference | cameras/sweep | texels/sweep | sweep |
-|---|---|---|---|---|
-| 1 bounce, GI 128×128, 32², sky 0 | **0.0577** vs direct | 1.6e4 | 1.7e7 | 0.76 s |
-| 3 bounces, GI 128×128, 32/16/8, tile 4, sky 0.05 | **0.0642** vs full GI | 1.8e7 | 1.4e9 | 111 s |
+### Bounce count (GI 64×64, tile 4, sky 0.05)
 
-### The sky term (3 bounces, GI 64×64, tile 4, vs the full-GI reference)
-
-| `MBG_SKY` | RMSE | MAE |
-|---|---|---|
-| 0 | 0.0808 | 0.0600 |
-| **0.05** | **0.0671** | **0.0444** |
-| 0.10 | 0.0843 | 0.0649 |
-
-### Deeper-level target resolution (3 bounces, tile 4, sky 0.05)
-
-| Ladder | RMSE | cameras/sweep | sweep |
+| Bounces | RMSE vs full GI | cameras/sweep | sweep |
 |---|---|---|---|
-| 32/8/8 | 0.0671 | 1.3e6 | 8.2 s |
-| 32/16/8 | 0.0638 | 4.5e6 | 27 s |
+| 1 | 0.1061 | 4.1e3 | 0.18 s |
+| 2 | 0.0586 | 2.7e5 | 3.0 s |
+| 3 | **0.0531** | 1.3e6 | 11 s |
+| 4 | 0.0530 | 5.5e6 | 47 s |
 
-3.3× the cameras for 5% of the RMSE. The document's own §6.2 ladder (32² → 12² →
-6²) is available through `MBG_RES2`/`MBG_RES3`; the default stays 32/8/8 because
-deep bounces are low frequency and this is where that claim holds up.
+### Spawn tile size (3 bounces, GI 64×64, sky 0.05)
+
+| Tile | RMSE | sweep | before the direct/indirect split (2 bounces) |
+|---|---|---|---|
+| 8 | 0.0533 | 1.9 s | 0.0997, with visible panel-shaped patches |
+| 4 | 0.0531 | 11 s | 0.0885 |
+| 2 | 0.0529 | 117 s | 0.0859 |
+
+### Estimator ablation (3 bounces, GI 64×64, tile 4, sky 0.05)
+
+| | RMSE | sweep |
+|---|---|---|
+| analytic direct + per-texel split | 0.0531 | 11.2 s |
+| quadrature direct (`MBG_NEE=0`) | 0.0555 | 9.2 s |
+| no tent weights (`MBG_TENT=0`) | 0.0530 | 10.9 s |
+
+The analytic direct term costs 22% of a sweep and is worth far more than the
+0.0024 of RMSE it shows here — see findings 2 and 9.
 
 ### Level-1 target resolution (1 bounce, vs the direct reference)
 
-| Target | RMSE | sweep |
-|---|---|---|
-| 8×8 | 0.1592 | 0.038 s |
-| 16×16 | 0.0714 | 0.051 s |
-| 32×32 | **0.0557** | 0.109 s |
-
-### Camera density (1 bounce, 32×32 target, vs the direct reference)
-
-| Scale | cameras/sweep | RMSE | sweep |
+| Target | RMSE | analytic direct term | quadrature direct term |
 |---|---|---|---|
-| 8 | 4.1e3 | **0.0557** | 0.11 s |
-| 4 | 1.6e4 | 0.0577 | 0.47 s |
-| 2 | 6.6e4 | 0.0564 | 3.3 s |
-| 1 (per pixel) | 2.6e5 | 0.0561 | 12 s |
+| 8×8 | 0.0529 | exact (0.02% on the `rect` gate) | 20.0% |
+| 16×16 | 0.0489 | exact | 4.3% |
+| 32×32 | **0.0468** | exact | 1.1% |
+
+What still improves with resolution is the *indirect* quadrature and the
+visibility test's silhouette, not the direct magnitude.
+
+### The sky term (3 bounces, GI 64×64, tile 4)
+
+| `MBG_SKY` | RMSE vs full GI |
+|---|---|
+| 0 | 0.0808 |
+| **0.05** | **0.0671** |
+| 0.10 | 0.0843 |
+
+(Measured under ACES before the tone curve was changed; the ordering is what
+matters and it matches example 40's finding 6 exactly.)
+
+### Camera density (3 bounces, sky 0.05)
+
+| Scale | GI grid | cameras/sweep | RMSE | sweep |
+|---|---|---|---|---|
+| 8 | 64×64 | 1.3e6 | 0.0531 | 11 s |
+| 4 | 128×128 | 5.3e6 | 0.0538 | 45 s |
 
 ## Findings
 
@@ -274,59 +296,98 @@ the same plane — so the asymmetry is entirely in our favour. After it: 0
 disagreements with the oracle, and the `series` gate's 3-level error improved
 from 4.8e-6 to 1.1e-7.
 
-### 2. The direct term's error is quadrature, and it converges as expected
+### 2. The direct term had to come out of the gather, exactly as §3 says
 
-Against the direct-lighting reference, which has no free parameters at all
-(`MBG_BOUNCES=1`, `MBG_SKY=0`), RMSE falls 0.159 → 0.071 → 0.056 for 8², 16²,
-32² targets, and the `rect` gate shows the same sequence against an analytic
-answer (20.0% → 4.3% → 1.1%). Coverage is binary per texel, so the error lives on
-the emitter's silhouette. At 32² the Cornell panel is resolved by a few tens of
-texels, which is where the residual mottling in the image comes from — not from
-noise in any stochastic sense; the solver is deterministic and a sweep is
-repeatable bit for bit.
+The first version of this example took everything from the hemisphere raster,
+including the emitter. The doc lists that as a non-goal -- "No correct area-light
+soft shadows from the GI pass. Direct lighting stays a separate conventional
+pass" -- and the images said the same thing louder: the panel is the brightest
+thing in the scene by two orders of magnitude and subtends a few percent of the
+hemisphere, so a texel either sees all of it or none of it, and every camera's
+direct term carried a few percent of error uncorrelated with its neighbours. At
+the 8x8 targets the deeper levels use, a camera that plainly sees the panel can
+miss it with every texel centre, which made the second bounce blotchy on top.
 
-This is §3's non-goal ("direct lighting stays a separate conventional pass")
-showing up as a number. An area-light estimator for the direct term would remove
-essentially all of it.
+The fix is the estimator now in `raster.comp`:
+
+- **magnitude**: the exact projected solid angle of the emitter polygon clipped
+  to the hemisphere (Lambert's formula). No quadrature, no resolution
+  dependence. The `rect` gate now reads 0.02% against the analytic form factor
+  at 8x8, 16x16 and 32x32 alike, where the quadrature reads 20.0%, 4.3% and 1.1%.
+- **visibility**: a contribution-weighted fraction sampled against the depth
+  already sitting in shared memory, 16 samples per emitter per camera.
+
+So the only sampled quantity left in the direct term is a number bounded in
+[0,1] that is 0 or 1 over most of the image with a ramp across penumbrae -- which
+is the error budget an area light actually wants.
+
+**RMSE cannot see any of this.** Against the direct reference the two estimators
+score *identically*, 0.0468, while one image is smooth and the other is covered
+in mottle. That is finding 9, and it is why this example grew a second metric.
+On the high-pass measure the quadrature direct term runs at **2.45x** the
+reference's own noise floor and the analytic one at **0.97x** -- at or below the
+path tracer's residual.
 
 ### 3. Camera density is not where the error is
 
-One camera per 8×8 block of pixels scores **the same** as one camera per pixel
-(0.0557 vs 0.0561) for 64× fewer cameras and 100× less time. Irradiance is low
-frequency, so the coarse grid plus a joint-bilateral upsample loses nothing
-measurable — and scale 8 is fractionally *better* than scale 4 because the
-upsample's blur suppresses the per-camera quadrature error of finding 2.
+One camera per 8×8 block of pixels scores the same as one per 4×4 — 0.0531
+against 0.0538 at three bounces, for a quarter of the cameras and a quarter of
+the time — and at one bounce the whole ladder from scale 8 down to scale 1 (one
+camera per pixel) moves RMSE by 0.0004. Irradiance is low frequency, so the
+coarse grid plus a joint-bilateral upsample loses nothing measurable, and the
+coarser grid is fractionally *better* because the upsample's blur suppresses
+what per-camera error remains.
 
-That is the single most useful number here for anyone planning the shipping
-configuration: at Cornell's scale, spend on target resolution and bounce depth,
-not on camera count. It is also a warning about §8.1 — the reuse-radius
-experiment is about clustering cameras across *world-space* distance, and a
-per-pixel grid at 512² over a 2 m box is already sampling every ~4 mm.
+That is the most useful number here for anyone planning a shipping
+configuration: at Cornell's scale, spend on bounce depth and on the direct
+estimator, not on camera count. It is also a warning about §8.1 — the
+reuse-radius experiment is about clustering cameras across *world-space*
+distance, and a per-pixel grid at 512² over a 2 m box is already sampling every
+~4 mm.
 
-### 4. Tile clustering fails structurally, not statistically
+### 4. Tile clustering fails structurally — until the fast part is taken out of it
 
 §6.2 offers "massive clustering at depth" as a cost lever on the grounds that the
 error is attenuated by albedo multiplications before it reaches the eye. It is,
 but the error is **correlated across neighbouring receivers**, so it does not
-look like attenuated noise — it looks like geometry.
+look like attenuated noise -- it looks like geometry. With tile 8 the 2-bounce
+image carried hard-edged patches shaped like the light panel, and at
+`MBG_SCALE=1`, where no upsample blurs anything, they resolved into polygonal
+streaks across every surface.
 
-With tile 8 (16 children per camera) the 2-bounce image carries hard-edged
-rectangular patches on the back wall, and at `MBG_SCALE=1` — where there is no
-upsample to blur anything — they resolve into large polygonal streaks across
-every surface. The mechanism: each tile reuses one representative hit point's
-irradiance for a whole solid-angle tile, and as the receiver moves the
-representative **flips discontinuously** from one surface to another (ceiling to
-emitter, wall to floor), so the reused value jumps along a line in screen space.
+The mechanism is not that one sample is noisy. It is that the tile stands in for
+a function that varies FAST across it: the bright pool the panel throws on the
+floor falls off as cos/d² over a few texels, and one sample of it smeared over a
+tile, with the sample jumping from one surface to another as the receiver moves,
+is a moving hard edge.
 
-RMSE barely registers this — 0.0997 at tile 8 against 0.0845 at tile 1, a 15%
-spread for 40× the cost — which is itself the finding: **RMSE is the wrong metric
-for this error class.** The images are not 15% apart, they are different in kind.
-Tile 4 is the default because it is where the structured artifacts stop being
-visible on this scene, not because of its RMSE.
+So the tile's mass is split by how fast the thing it multiplies varies:
 
-The obvious next move is to jitter the representative choice per camera, which
-converts the structure into noise a temporal filter can absorb. That is the right
-answer for variant B and the wrong one here: a reference has to be deterministic.
+| mass | multiplies | why it is safe |
+|---|---|---|
+| `M_dir` | the child's **visible fraction** | carries the unshadowed direct irradiance evaluated at **every texel's own hit point**, exactly |
+| `M_ind` | the child's irradiance **minus its direct term** | the smooth remainder, which is what clustering was always safe for |
+
+The result is that tile size almost stops mattering. Measured at 3 bounces
+against the full-GI reference:
+
+| Tile | before the split | after | cost after |
+|---|---|---|---|
+| 8 | 0.0997 (2-bounce) | **0.0533** | 1.9 s |
+| 4 | 0.0885 | 0.0531 | 11.2 s |
+| 2 | 0.0859 | 0.0529 | 117 s |
+| 1 | 0.0845 | — | — |
+
+An 18% spread became 0.8%, and the configuration that used to be visibly the
+worst is now the one to ship. The clustering lever the doc proposes is real; it
+just cannot be applied to the direct term.
+
+The **tent weighting** -- spreading each texel's mass over the four nearest tiles
+rather than assigning it to one -- was built for the same artifact and is kept,
+but it now changes RMSE by 0.0001 (0.0530 against 0.0531). It smooths a term that
+is no longer the dominant one. It stays on because the discontinuity it removes
+is a property of the scheme rather than of Cornell, and because it costs 3% of a
+sweep.
 
 ### 5. The full-GI reference needs `MBG_SKY=0.05`, the direct one needs nothing
 
@@ -343,20 +404,26 @@ parameter.
 
 ### 6. The N³ is real, and memory hits before time does
 
-Camera counts at the default schedule, per level: 4.1e3 → 2.6e5 → 1.0e6 → 5.5e6.
-Each level's cameras need 48 bytes of state (position, normal, irradiance, tile
-mass), so a 4-bounce tree over a 64×64 GI grid is already 330 MB, and a 1600×900
-framebuffer at `MBG_SCALE=4` would want 5 GB before it wanted a second of compute.
+Camera counts at the default schedule, per level: 4.1e3 → 6.6e4 → 2.6e5, and a
+fourth level would add 1.0e6. Each level's cameras need 96 bytes of state
+(position, normal, irradiance, the direct term, and two tile masses), so a
+4-bounce tree over a 64×64 GI grid runs to hundreds of megabytes and a 1600×900
+framebuffer at `MBG_SCALE=4` would want gigabytes before it wanted a second of
+compute.
 That is why the solver chunks: `MBG_BUDGET` level-1 cameras at a time, each
 carrying its whole subtree, with a hard clamp at 512 MB that halves the budget
 until the tree fits and says so.
 
-Time then scales with the same tree: ×16 for the second bounce, ×4.8 for the
-third, ×4.2 for the fourth — while RMSE goes 0.151 → 0.089 → 0.081 → 0.082. **The
-fourth bounce costs 4× and changes nothing measurable** (0.0013 RMSE, within the
-noise of the sky-term choice), which answers the question `kMaxLevels = 4` exists
-to ask. Three levels is the configuration; the doc's own §6.1 stops at three for
-the same reason.
+Time then scales with the same tree: ×17 for the second bounce, ×3.8 for the
+third, ×4.1 for the fourth — while RMSE goes 0.106 → 0.059 → 0.053 → 0.053. **The
+fourth bounce costs 4× and changes nothing measurable** (0.0001 RMSE), which
+answers the question `kMaxLevels = 4` exists to ask. Three levels is the
+configuration; the doc's own §6.1 stops at three for the same reason.
+
+What the fourth bounce would have bought is visible in the 3-bounce diff as a
+ceiling that is slightly too dark — the surface that needs the most bounces — and
+that is the case §7's variant B exists to serve, at one camera level per frame
+instead of four.
 
 ### 7. Per-pass timers and `MBG_SOLVE` do not mix
 
@@ -379,6 +446,101 @@ same timers report `Raster L1` 609 ms against `Raster L2` 3.9 ms, `Resolve`
 So: the per-sweep wall clock printed by `MBG_SOLVE`, bracketed by `glFinish` on
 both sides, is the number quoted throughout this document, and the per-pass
 timers are for steady-state profiling on real hardware.
+
+### 8. Two bugs in the analytic direct term, both found by gates, neither visible as "wrong"
+
+The estimator in finding 2 was written, passed four of the six gates, and was
+wrong twice. Both failures were in the same three lines, and neither would have
+been diagnosable from an image.
+
+**A receiver on the emitter's own plane reads a full hemisphere of it.** Lambert's
+formula integrates whatever polygon it is given; an emitter whose plane contains
+the receiver is edge-on and contributes nothing, but on the sphere that polygon
+degenerates to a great circle, and if the receiver's projection falls inside the
+triangle the three edge terms take the same sign and the sum comes out at 2π. So
+the formula reports π·L instead of 0 — the worst available answer, at the panel's
+radiance of 17, for every hit point on the panel and every child camera a tile
+places there. The `series` gate caught it as a **+29% energy overshoot** at two
+levels.
+
+**Rejecting on height alone then threw away perpendicular emitters.** The obvious
+fix — ignore an emitter when the receiver is within a bias of its plane — also
+discards emitters that merely *pass through* the receiver while standing
+perpendicular to it, and those cover half its hemisphere rather than none of it.
+A symmetric box puts many texel centres precisely on its own edges, so this cost
+**12% of the hemisphere at an 8×8 target**, and it survived the `closed` gate
+(whose cameras sit in open space) and the `rect` gate (one emitter, no edges). It
+took a gate that evaluates the direct term **at hit points** rather than at
+cameras — `texeldir`, which integrates the per-texel values against the analytic
+answer and cross-checks every one against a CPU ray cast — to localize it. The
+fix needs both conditions: coplanar means near the plane *and* parallel normals.
+
+A third, milder version of the same class sat in the shadow test. Comparing a
+sample's distance against the stored depth of the texel it lands in is a shadow
+map lookup with no slope-scaled bias: the depth belongs to the texel's centre,
+and on a surface seen at a grazing angle — the ceiling beside the panel, from
+anywhere on the back wall — it changes by more across one texel than the panel is
+far away. Samples that nothing was blocking read as occluded, and the visibility
+fraction stepped by 1/16 as the emitter's samples crossed texel boundaries,
+printing a fine diagonal cross-hatch of the octahedral grid onto every surface.
+The test is now identity first (an emitter is not an occluder), then a
+Möller-Trumbore against the one triangle the buffer named — intersecting its
+*plane* instead was tried and grows every shadow, because a plane is unbounded.
+
+### 9. RMSE is nearly blind to the artifacts, so the example measures roughness too
+
+The two direct-term estimators of finding 2 score the **same** 0.0468 RMSE
+against the direct reference. One of those images is smooth; the other is the
+mottled one this work started from. Two reasons: a high-frequency error averages
+to almost nothing in a per-pixel mean, and the residual is dominated by the tone
+curve (finding 10), which is a large smooth offset that drowns everything else.
+
+So `MBG_COMPARE` also reports **roughness**: each pixel minus the mean of its
+15×15 neighbourhood, RMS over patches that are smooth and shadow-free in the
+reference. The reference is a converged path trace, so its column is the noise
+floor of the comparison and anything above it is ours.
+
+| 1 bounce, direct reference | RMSE | roughness vs reference |
+|---|---|---|
+| quadrature direct term | 0.0468 | **2.45×** |
+| analytic direct term | 0.0468 | **0.97×** |
+
+The kernel size is not incidental: the artifacts live at the GI grid's scale, 8
+pixels at `MBG_SCALE=8`, and a 5×5 high-pass looks straight past them — on the
+same pair of images it reports 1.06 against 0.54 where the 15×15 reports 3.93
+against 1.31. A metric has to be tuned to the artifact it is meant to see, and
+the honest version of that statement is that **the images remain the primary
+instrument** and both numbers are supporting evidence.
+
+### 10. The references are not reproduced by AgX, and the tone curve now costs as much as the transport
+
+Example 40 reasoned that both PNGs must be Blender AgX renders — the panel lands
+near-neutral without clipping, which is AgX's signature — and called an exact
+port the follow-up. This example has that port (`MBG_TONEMAP=4`, the standard
+approximation of Sobotka's transform). It is **not** the closest match.
+
+Per patch, against the direct reference:
+
+| curve | back wall | short box top | RMSE |
+|---|---|---|---|
+| reference | (112, 91, 47) | (104, 86, 48) | — |
+| **Reinhard** | **(105, 90, 53)** | **(99, 86, 52)** | **0.0468** |
+| filmic | (124, 103, 48) | (120, 103, 53) | 0.0482 |
+| clamp | (114, 95, 54) | (111, 94, 54) | 0.0486 |
+| ACES | (134, 109, 47) | (133, 112, 53) | 0.0532 |
+| AgX | (112, 97, 84) | (104, 93, 86) | 0.0649 |
+
+AgX gets the red almost exactly and then desaturates the blue to nearly double
+the reference's. Either the renders are not AgX, or the standard approximation
+diverges from Blender's OCIO transform at this saturation. Either way the
+measurement picks the default, which is now Reinhard, and all five stay
+available.
+
+This matters beyond presentation: at RMSE 0.047 against a reference whose curve
+we are guessing, **the tone curve contributes about as much error as the light
+transport does**. Further transport work on this scene has to be scored on
+patches and on roughness rather than on a single number — and the real fix is a
+reference rendered through a curve we control.
 
 ## What this does not answer
 

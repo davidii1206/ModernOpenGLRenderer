@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cstdio>
 #include <random>
 #include <cstdlib>
 
@@ -133,6 +134,43 @@ bool ray_tri(const glm::vec3& o, const glm::vec3& d, const Tri& tr, float& t_out
     return true;
 }
 
+// Lambert's formula on the CPU: the projected solid angle of a triangle seen
+// from `pos` with normal `nrm`, clipped to that hemisphere. The mirror of
+// mbg_emitter_unshadowed in raster.comp, and the reference the texeldir gate
+// scores the shader against.
+double cpu_unshadowed(const Tri& tr, const glm::vec3& pos, const glm::vec3& nrm,
+                      float bias) {
+    const double h = double(glm::dot(tr.n, pos - tr.p[0]));
+    if (h < 0.0 && !tr.double_sided) return 0.0;
+    // Coplanar means measure zero; merely passing through the receiver while
+    // perpendicular to it does not. Both conditions, as in the shader.
+    if (std::abs(h) < 2.0 * double(bias) &&
+        std::abs(glm::dot(tr.n, nrm)) > 0.9f) return 0.0;
+
+    glm::vec3 poly[4];
+    int n = 0;
+    for (int i = 0; i < 3; ++i) {
+        const glm::vec3 a = tr.p[i] - pos;
+        const glm::vec3 b = tr.p[(i + 1) % 3] - pos;
+        const float da = glm::dot(nrm, a), db = glm::dot(nrm, b);
+        if (da >= 0.0f && n < 4) poly[n++] = a;
+        if ((da >= 0.0f) != (db >= 0.0f) && n < 4) poly[n++] = a + (b - a) * (da / (da - db));
+    }
+    if (n < 3) return 0.0;
+
+    double sum = 0.0;
+    for (int i = 0; i < n; ++i) {
+        const glm::vec3 a = glm::normalize(poly[i]);
+        const glm::vec3 b = glm::normalize(poly[(i + 1) % n]);
+        const glm::vec3 x = glm::cross(a, b);
+        const double len = double(glm::length(x));
+        if (len < 1e-9) continue;
+        sum += std::acos(std::clamp(double(glm::dot(a, b)), -1.0, 1.0)) *
+               double(glm::dot(nrm, x / float(len)));
+    }
+    return 0.5 * std::abs(sum);
+}
+
 // Solve one point set and return the mean irradiance channel.
 double mean_channel(const std::vector<glm::vec4>& e, int ch) {
     double s = 0.0;
@@ -188,6 +226,26 @@ bool run_gates(const std::string& names, Solver& solver, const SolveConfig& base
             pos.push_back(glm::vec4(0.0f, 0.0f, 0.0f, 1.0f));
             nrm.push_back(glm::vec4(d, 0.0f));
         }
+        // Receivers ON the faces, not just in the middle. A point on a wall of a
+        // sealed emitter still reads exactly PI*L -- its own face is coplanar and
+        // contributes nothing, and the other five cover its hemisphere. This is
+        // the configuration every HIT POINT in the recursion is in, so it is the
+        // one that has to be right for the per-texel direct term to be right.
+        const float inset = 0.999f;
+        const glm::vec3 face_pos[6] = {
+            {0, 0, -inset}, {0, 0, inset}, {-inset, 0, 0},
+            {inset, 0, 0}, {0, -inset, 0}, {0, inset, 0}};
+        const glm::vec3 face_nrm[6] = {
+            {0, 0, 1}, {0, 0, -1}, {1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}};
+        for (int i = 0; i < 6; ++i) {
+            pos.push_back(glm::vec4(face_pos[i], 1.0f));
+            nrm.push_back(glm::vec4(face_nrm[i], 0.0f));
+        }
+        // And receivers close to an edge, where a neighbouring face is nearly
+        // edge-on and the clip has the least room.
+        pos.push_back(glm::vec4(0.98f, 0.0f, -inset, 1.0f));
+        nrm.push_back(glm::vec4(0.0f, 0.0f, 1.0f, 0.0f));
+
         for (uint32_t res : {8u, 32u}) {
             cfg.res[0] = res;
             const std::vector<glm::vec4> e = solver.solve_points(s, cfg, pos, nrm);
@@ -224,12 +282,35 @@ bool run_gates(const std::string& names, Solver& solver, const SolveConfig& base
         const std::vector<glm::vec4> pos{{0.0f, 0.0f, 0.0f, 1.0f}};
         const std::vector<glm::vec4> nrm{{0.0f, 0.0f, 1.0f, 0.0f}};
         const double expect = rect_irradiance(a, b, h, L);
-        // Measured: 0.200 at 8x8, 0.043 at 16x16, 0.011 at 32x32. Coverage is
-        // binary per texel, so the error lives entirely on the rectangle's
-        // silhouette and falls off with resolution -- the tolerances below are
-        // that sequence with room, and the shrinking assertion is the one that
-        // would actually catch a regression, since a constant-factor bug would
-        // hold the error flat while still passing a loose per-resolution bound.
+
+        // Two estimators, two different properties to assert.
+        //
+        // With the analytic direct term on (the default), the magnitude is
+        // Lambert's formula and the only sampled quantity is a visibility
+        // fraction that is identically 1 here -- so the answer must be right AND
+        // must not depend on the target resolution at all. The second half is
+        // the stronger claim and the one that says the quadrature has been taken
+        // out of the direct path.
+        //
+        // With it off, the emitter is found by the raster and coverage is binary
+        // per texel, so the error lives on the silhouette and has to SHRINK with
+        // resolution. Measured: 0.200 at 8x8, 0.043 at 16x16, 0.011 at 32x32. A
+        // constant-factor bug would hold it flat while still passing any loose
+        // per-resolution bound, which is why the assertion is on the shrinking.
+        cfg.nee = true;
+        double first = 0.0, spread = 0.0;
+        for (uint32_t res : {8u, 16u, 32u}) {
+            cfg.res[0] = res;
+            const std::vector<glm::vec4> e = solver.solve_points(s, cfg, pos, nrm);
+            char lbl[64];
+            snprintf(lbl, sizeof lbl, "analytic, %ux%u target", res, res);
+            r.check(3, "rect", lbl, double(e[0].x), expect, 1e-3);
+            if (res == 8u) first = double(e[0].x);
+            else spread = std::max(spread, std::abs(double(e[0].x) - first));
+        }
+        r.check(3, "rect", "analytic is resolution-free", spread, 0.0, 1e-6, true);
+
+        cfg.nee = false;
         double prev = 1e30;
         bool shrinking = true;
         const double tol[3] = {0.25, 0.06, 0.02};
@@ -238,13 +319,14 @@ bool run_gates(const std::string& names, Solver& solver, const SolveConfig& base
             cfg.res[0] = res;
             const std::vector<glm::vec4> e = solver.solve_points(s, cfg, pos, nrm);
             char lbl[64];
-            snprintf(lbl, sizeof lbl, "E under rectangle %ux%u", res, res);
+            snprintf(lbl, sizeof lbl, "quadrature, %ux%u target", res, res);
             r.check(3, "rect", lbl, double(e[0].x), expect, tol[ti++]);
             const double err = std::abs(double(e[0].x) - expect);
             if (err > prev * 0.5) shrinking = false;
             prev = err;
         }
-        r.check(3, "rect", "error halves with resolution", shrinking ? 1.0 : 0.0, 1.0, 1e-9);
+        r.check(3, "rect", "quadrature error halves", shrinking ? 1.0 : 0.0, 1.0, 1e-9);
+        cfg.nee = true;
     }
 
     // --- 4. Occlusion --------------------------------------------------------
@@ -381,6 +463,93 @@ bool run_gates(const std::string& names, Solver& solver, const SolveConfig& base
         r.check(5, "oracle", "energy fraction in dispute", lost_weight / kPi, 0.0, 1e-4, true);
     }
 
+    // --- 5b. The per-texel direct term --------------------------------------
+    //
+    // The reconstruction evaluates the unshadowed direct irradiance at every
+    // texel's HIT POINT, and that number is what a whole tile's mass gets
+    // multiplied by. No camera-based gate reaches it: a camera gate checks the
+    // formula at a point it chose itself, while this path has to choose the
+    // point -- from a quantized visibility key, a texel direction and a plane
+    // intersection. Getting the point wrong is invisible in every other
+    // assertion and shows up only as a few percent of missing bounce energy.
+    //
+    // Inside a sealed emitter every hit point reads PI*L, so the cosine-weighted
+    // average over the hemisphere must be PI*L too, whatever the resolution.
+    if (wants(names, "texeldir")) {
+        const double L = 0.25;
+        Scene s;
+        s.build(make_box(1.0f, glm::vec3(0.5f), glm::vec3(float(L))));
+        SolveConfig cfg = base;
+        cfg.bounces = 1;
+        cfg.bias = 1e-4f;
+        cfg.sky = glm::vec3(0.0f);
+        const std::vector<glm::vec4> pos{{0.0f, 0.0f, 0.0f, 1.0f}};
+        const std::vector<glm::vec4> nrm{{0.0f, 1.0f, 0.0f, 0.0f}};
+
+        for (uint32_t res : {8u, 16u, 32u}) {
+            cfg.res[0] = res;
+            Quadrature q;
+            q.build(res);
+            const std::vector<uint32_t> raw = solver.raster_visibility(s, cfg, pos, nrm, 2);
+
+            // The same hemisphere, evaluated entirely on the CPU: ray cast to
+            // find the hit, then Lambert at that hit. Any per-texel disagreement
+            // is the shader choosing a different hit point, which is the one
+            // failure mode this gate exists to catch.
+            const std::vector<Tri> box = make_box(1.0f, glm::vec3(0.5f), glm::vec3(float(L)));
+            glm::vec3 T, B;
+            const glm::vec3 N = glm::vec3(nrm[0]);
+            onb(N, T, B);
+            const glm::vec3 P = glm::vec3(pos[0]) + N * cfg.bias;
+
+            double acc = 0.0, acc_cpu = 0.0, worst = 0.0;
+            int worst_i = -1, reported = 0;
+            for (uint32_t i = 0; i < res * res; ++i) {
+                float v;
+                std::memcpy(&v, &raw[i], sizeof v);
+                acc += double(v) * double(q.texels[i].w);
+
+                const glm::vec3 dl = glm::vec3(q.texels[i]);
+                const glm::vec3 d = T * dl.x + B * dl.y + N * dl.z;
+                int best = -1;
+                float bestt = 1e30f;
+                for (std::size_t k = 0; k < box.size(); ++k) {
+                    float t;
+                    if (ray_tri(P, d, box[k], t) && t < bestt) { bestt = t; best = int(k); }
+                }
+                double cpu = 0.0;
+                if (best >= 0) {
+                    const glm::vec3 hp = P + d * bestt;
+                    const glm::vec3 hn = glm::dot(box[best].n, d) < 0.0f ? box[best].n
+                                                                        : -box[best].n;
+                    for (const Tri& e : box)
+                        cpu += cpu_unshadowed(e, hp, hn, cfg.bias) *
+                               double(e.emission.x);
+                }
+                acc_cpu += cpu * double(q.texels[i].w);
+
+                const double diff = std::abs(double(v) - cpu);
+                if (diff > worst) { worst = diff; worst_i = int(i); }
+                if (std::abs(cpu - kPi * L) > 1e-3 * kPi * L && reported < 6) {
+                    ++reported;
+                    const glm::vec3 hp = best >= 0 ? P + d * bestt : glm::vec3(0.0f);
+                    printf("[GATE] 7 texeldir  texel %u (%u,%u) dir (%.3f %.3f %.3f) "
+                           "hit tri %d at (%.4f %.4f %.4f) t=%.4f: GPU %.6f CPU %.6f\n",
+                           i, i % res, i / res, dl.x, dl.y, dl.z, best,
+                           hp.x, hp.y, hp.z, bestt, double(v), cpu);
+                }
+            }
+            char lbl[64];
+            snprintf(lbl, sizeof lbl, "mean E_dir at hits %ux%u", res, res);
+            // The average is over PI steradians of cosine weight, so divide it out.
+            r.check(7, "texeldir", lbl, acc / kPi, kPi * L, 2e-3);
+            snprintf(lbl, sizeof lbl, "vs CPU hit points %ux%u", res, res);
+            r.check(7, "texeldir", lbl, worst, 0.0, 1e-3 * kPi * L, true);
+            (void)worst_i;
+            (void)acc_cpu;
+        }
+    }
+
     // --- 6. Multi-bounce energy ---------------------------------------------
     //
     // A closed enclosure with uniform emission L and uniform albedo p has a
@@ -397,7 +566,13 @@ bool run_gates(const std::string& names, Solver& solver, const SolveConfig& base
         SolveConfig cfg = base;
         cfg.bias = 1e-4f;
         cfg.sky = glm::vec3(0.0f);
-        for (uint32_t i = 0; i < kMaxLevels; ++i) { cfg.res[i] = 16; cfg.block[i] = 4; }
+        // Overridable so the gate can be bisected against resolution and tile
+        // size when it fails -- which is how the coplanar-emitter bug and the
+        // grazing-hit bug below were both localized.
+        uint32_t gres = 16, gblock = 4;
+        if (const char* v = getenv("MBG_GATE_RES")) gres = uint32_t(std::max(2, atoi(v)));
+        if (const char* v = getenv("MBG_GATE_BLOCK")) gblock = uint32_t(std::max(1, atoi(v)));
+        for (uint32_t i = 0; i < kMaxLevels; ++i) { cfg.res[i] = gres; cfg.block[i] = gblock; }
 
         const std::vector<glm::vec4> pos{{0.0f, 0.0f, 0.0f, 1.0f},
                                          {0.4f, -0.3f, 0.2f, 1.0f}};

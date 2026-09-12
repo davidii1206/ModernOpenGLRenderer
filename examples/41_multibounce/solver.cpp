@@ -33,7 +33,8 @@ uint32_t snap_block(uint32_t res, uint32_t block) {
 // geometric in the tile count. Rather than let a slider allocate 8 GB, the
 // budget is clamped and the clamp is reported.
 constexpr std::size_t kMaxCameraBytes = 512ull * 1024ull * 1024ull;
-constexpr std::size_t kCamBytes = 32, kIrradBytes = 16, kWeightBytes = 16;
+constexpr std::size_t kCamBytes = 32, kIrradBytes = 16, kDirectBytes = 16,
+                      kWeightBytes = 32;
 
 } // namespace
 
@@ -82,7 +83,8 @@ void Solver::configure(const SolveConfig& cfg_in, int fb_w, int fb_h) {
         for (uint32_t l = 0; l < levels_; ++l) {
             const uint32_t block = (l + 1 == levels_) ? 0u : cfg.block[l];
             const uint32_t children = block ? (cfg.res[l] / block) * (cfg.res[l] / block) : 0u;
-            total += std::size_t(k) * (kCamBytes + kIrradBytes + (l ? kWeightBytes : 0));
+            total += std::size_t(k) * (kCamBytes + kIrradBytes + kDirectBytes +
+                                       (l ? kWeightBytes : 0));
             if (!children) break;
             if (k > 0 && children > (0xFFFFFFFFu / k)) { k = 0; break; }   // overflow guard
             k *= children;
@@ -103,11 +105,13 @@ void Solver::configure(const SolveConfig& cfg_in, int fb_w, int fb_h) {
         li.block = (l + 1 == levels_) ? 0u : cfg.block[l];
         li.children = li.block ? (li.res / li.block) * (li.res / li.block) : 0u;
         li.cameras = count;
-        li.bytes = std::size_t(count) * (kCamBytes + kIrradBytes + (l ? kWeightBytes : 0));
+        li.bytes = std::size_t(count) * (kCamBytes + kIrradBytes + kDirectBytes +
+                                        (l ? kWeightBytes : 0));
 
         const std::vector<uint8_t> zero(std::size_t(count) * kCamBytes, 0);
         cams_[l].data(zero.data(), zero.size());
         irrad_[l].data(nullptr, std::size_t(count) * kIrradBytes);
+        direct_[l].data(nullptr, std::size_t(count) * kDirectBytes);
         if (l) weights_[l].data(nullptr, std::size_t(count) * kWeightBytes);
 
         quad_[l].build(li.res);
@@ -204,6 +208,7 @@ void Solver::raster_level(uint32_t l, uint32_t count, const Scene& scene,
     cams_[l].bind_base(kBindCams);
     quad_[l].bind();
     irrad_[l].bind_base(kBindIrrad);
+    direct_[l].bind_base(kBindDirect);
     if (li.children) {
         cams_[l + 1].bind_base(kBindChildCam);
         weights_[l + 1].bind_base(kBindChildW);
@@ -223,7 +228,11 @@ void Solver::raster_level(uint32_t l, uint32_t count, const Scene& scene,
     raster_.set("u_sky", cfg.sky);
     raster_.set("u_emissive", cfg.emissive);
     raster_.set("u_two_sided", cfg.two_sided ? 1u : 0u);
-    raster_.set("u_dump", dump ? 1u : 0u);
+    raster_.set("u_dump", dump ? dump_mode_ : 0u);
+    raster_.set("u_emitters", cfg.nee ? scene.emitter_count() : 0u);
+    raster_.set("u_shadow", std::max(1u, cfg.shadow));
+    raster_.set("u_shadow_bias", cfg.shadow_bias);
+    raster_.set("u_tent", cfg.tent ? 1u : 0u);
     dispatch_groups(count);
     gl::memory_barrier(GL_SHADER_STORAGE_BARRIER_BIT);
 }
@@ -247,6 +256,7 @@ void Solver::run_levels(uint32_t chunk, const Scene& scene, const SolveConfig& c
         irrad_[l].bind_base(kBindIrrad);
         weights_[children ? l + 1 : l].bind_base(kBindChildW);
         irrad_[children ? l + 1 : l].bind_base(kBindChildE);
+        direct_[children ? l + 1 : l].bind_base(kBindChildD);
         gi_.bind_image(0, 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA32F);
         gather_.set("u_cam_count", counts[l]);
         gather_.set("u_children", children);
@@ -295,7 +305,8 @@ std::vector<glm::vec4> Solver::solve_points(const Scene& scene, const SolveConfi
 
 std::vector<uint32_t> Solver::raster_visibility(const Scene& scene, const SolveConfig& cfg,
                                                 const std::vector<glm::vec4>& pos,
-                                                const std::vector<glm::vec4>& nrm) {
+                                                const std::vector<glm::vec4>& nrm,
+                                                uint32_t mode) {
     const uint32_t n = uint32_t(pos.size());
     if (n == 0) return {};
     SolveConfig c = cfg;
@@ -307,7 +318,9 @@ std::vector<uint32_t> Solver::raster_visibility(const Scene& scene, const SolveC
     const uint32_t texels = info_[0].res * info_[0].res;
     gl::Buffer dump(gl::BufferType::shader, gl::BufferUsage::dynamic_read);
     dump.data(nullptr, std::size_t(n) * texels * sizeof(uint32_t));
+    dump_mode_ = mode;
     raster_level(0, n, scene, c, &dump);
+    dump_mode_ = 1;
 
     std::vector<uint32_t> out(std::size_t(n) * texels);
     glGetNamedBufferSubData(dump.handle(), 0,

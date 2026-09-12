@@ -56,12 +56,29 @@ struct SolveConfig {
     // it. res/block must be an integer, and configure() snaps it down until it
     // is -- a tile edge that does not divide the target would drop the remainder.
     //
-    // 4 rather than 8 on measurement, not taste: at 8 the reused irradiance
-    // flips surface discontinuously as the receiver moves and the 2-bounce image
-    // carries hard-edged patches (implementation.md, finding 4). RMSE barely
-    // separates the two -- 0.0997 against 0.0885 -- which is why the default is
-    // set by looking at the images.
-    std::array<uint32_t, kMaxLevels> block{{4, 4, 4, 4}};
+    // 8 at level 1, on measurement. Before the direct term was split out of the
+    // clustered mass (implementation.md, finding 4) a tile of 8 was visibly the
+    // worst setting here -- hard-edged panel-shaped patches that RMSE barely
+    // registered. With the split it is worth 0.0533 against tile 4's 0.0531 and
+    // tile 2's 0.0529, for a sixth and a sixtieth of the time respectively.
+    //
+    // The deeper levels keep 4 because their targets are 8x8: a tile of 8 there
+    // spawns a single child and the level below it stops being a gather at all,
+    // and the extra children are cheap next to level 1's, which multiplies
+    // everything under it.
+    std::array<uint32_t, kMaxLevels> block{{8, 4, 4, 4}};
+
+    // The direct term. `nee` routes every emissive triangle through the analytic
+    // estimator in raster.comp instead of letting the quadrature find it, which
+    // is doc section 3's "direct lighting stays a separate conventional pass"
+    // and is worth more to the image than any other single setting here.
+    bool      nee = true;
+    uint32_t  shadow = 16;         // visibility samples per emitter per camera
+    float     shadow_bias = 2e-3f; // relative depth bias for that test
+    // Spread each texel's albedo mass across the four nearest spawn tiles
+    // instead of assigning it to one. Removes the tile discontinuity; costs a
+    // wider scan of shared memory and nothing else.
+    bool      tent = true;
 
     float     bias = 1e-3f;        // camera offset along its own normal, world units
     glm::vec3 sky{0.0f};           // radiance of an uncovered texel
@@ -122,7 +139,8 @@ public:
     // milestone 3).
     std::vector<uint32_t> raster_visibility(const Scene& scene, const SolveConfig& cfg,
                                             const std::vector<glm::vec4>& pos,
-                                            const std::vector<glm::vec4>& nrm);
+                                            const std::vector<glm::vec4>& nrm,
+                                            uint32_t mode = 1);
 
     const gl::Texture& target() const { return full_; }
 
@@ -160,9 +178,10 @@ private:
 
     Pipeline place_, raster_, gather_, upsample_;
 
-    // Per level: cameras, irradiance, and the per-tile albedo mass that spawned
-    // them. weights_[0] is unused -- level 1 has no parent.
-    std::array<gl::Buffer, kMaxLevels> cams_, irrad_, weights_;
+    // Per level: cameras, irradiance, the direct term with its visible fraction,
+    // and the per-tile masses that spawned them (two vec4s per child: the
+    // indirect mass and the direct mass -- see raster.comp).
+    std::array<gl::Buffer, kMaxLevels> cams_, irrad_, direct_, weights_;
     std::array<Quadrature, kMaxLevels> quad_;
     std::array<LevelInfo, kMaxLevels> info_{};
     uint32_t levels_ = 0;
@@ -174,6 +193,7 @@ private:
     SolveConfig layout_{};
     bool allocated_ = false;
     uint32_t cursor_ = 0, sweeps_ = 0, last_chunk_ = 0;
+    uint32_t dump_mode_ = 1;
 
     PassTimer t_place_{"Place"};
     std::array<PassTimer, kMaxLevels> t_raster_{

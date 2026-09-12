@@ -24,6 +24,7 @@ layout(local_size_x = 64) in;
 layout(std430, binding = 3) buffer          MbgIrrad  { vec4 irradiance[]; };
 layout(std430, binding = 5) readonly buffer MbgChildW { vec4 child_w[]; };
 layout(std430, binding = 6) readonly buffer MbgChildE { vec4 child_e[]; };
+layout(std430, binding = 10) readonly buffer MbgChildD { vec4 child_d[]; };
 
 layout(binding = 0, rgba32f) uniform image2D u_gi;
 
@@ -40,9 +41,18 @@ void main() {
     vec3 E = irradiance[cam].xyz;
     for (uint b = 0u; b < u_children; ++b) {
         uint slot = cam * u_children + b;
-        vec4 w = child_w[slot];
-        if (w.w == 0.0) continue;
-        E += w.xyz * child_e[slot].xyz * 0.31830988618379;
+        vec4 m_ind = child_w[slot * 2u + 0u];
+        if (m_ind.w == 0.0) continue;
+        vec4 m_dir = child_w[slot * 2u + 1u];
+        vec4 d = child_d[slot];              // (direct irradiance, visible fraction)
+
+        // The direct half is reconstructed per texel by the parent and only
+        // SCALED by what this child measured about visibility; the indirect half
+        // is the child's irradiance with its own direct term removed, which is
+        // the smooth part that a tile can legitimately stand in for. See the
+        // mass accumulation in raster.comp.
+        vec3 rest = max(child_e[slot].xyz - d.xyz, vec3(0.0));
+        E += (m_ind.xyz * rest + m_dir.xyz * d.w) * 0.31830988618379;
     }
     irradiance[cam] = vec4(E, 1.0);
 

@@ -71,6 +71,9 @@ enum Binding : uint32_t {
     kBindChildW   = 5,
     kBindChildE   = 6,
     kBindVisOut   = 7,     // raster.comp's optional visibility dump, gates only
+    kBindEmitters = 8,     // triangle indices of the analytic emitters
+    kBindDirect   = 9,     // this level's (direct irradiance, visible fraction)
+    kBindChildD   = 10,    // the next level's, read by the gather
 };
 
 // The GPU triangle, mirroring MbgTri in shaders/common/scene.glsl.
@@ -87,18 +90,22 @@ public:
     // depth key allows (see hemi.glsl). That cap is a property of this
     // example's 32-bit key, not of the method.
     bool build(const std::vector<Tri>& tris);
-    void bind() const { buf_.bind_base(kBindTris); }
+    void bind() const { buf_.bind_base(kBindTris); emit_.bind_base(kBindEmitters); }
 
     uint32_t count() const { return count_; }
     const Bounds& bounds() const { return bounds_; }
     double area() const { return area_; }
     uint32_t emissive_count() const { return emissive_; }
+    // Triangles whose direct contribution is evaluated analytically rather than
+    // being picked up by the hemisphere raster. See raster.comp.
+    uint32_t emitter_count() const { return emitter_count_; }
 
     static constexpr uint32_t kMaxTris = 65535;
 
 private:
     gl::Buffer buf_{gl::BufferType::shader, gl::BufferUsage::static_draw};
-    uint32_t count_ = 0, emissive_ = 0;
+    gl::Buffer emit_{gl::BufferType::shader, gl::BufferUsage::static_draw};
+    uint32_t count_ = 0, emissive_ = 0, emitter_count_ = 0;
     double area_ = 0.0;
     Bounds bounds_;
 };

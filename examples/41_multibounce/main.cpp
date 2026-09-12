@@ -22,6 +22,8 @@
 //     no LOD, no cluster DAG, no work list (5.2, 5.4 are what this measures)
 //   - recursion to MBG_BOUNCES levels with the resolution ladder and tile
 //     clustering of 6.2, terminating in direct lighting only (6.1)
+//   - the direct term as a separate analytic pass (3): exact polygon irradiance
+//     with visibility sampled against the hemisphere's own depth buffer
 //
 // What it is NOT: variant B. There is no radiance cache and nothing reads last
 // frame's output, so a completed sweep is correct on its own terms rather than
@@ -42,6 +44,9 @@
 //   MBG_GATE=all            run the analytic gates and exit
 //   MBG_MODEL=path.glb      CornellBoxOriginal.glb; the references only match it
 //   MBG_BOUNCES=3           camera levels; 1 == direct only
+//   MBG_NEE=1               analytic direct term (doc section 3's separate pass)
+//   MBG_SHADOW=16           visibility samples per emitter, per camera
+//   MBG_TENT=1              spread each texel's mass over the 4 nearest tiles
 //   MBG_SCALE=4             GI grid = framebuffer / scale; 1 == one camera/pixel
 //   MBG_BUDGET=4096         level-1 cameras per frame
 //   MBG_RES=32              level-1 target edge; MBG_RES2/3/4 for deeper levels
@@ -90,7 +95,22 @@ constexpr glm::vec3 kGtTarget{0.004f, 0.999f, 0.0f};
 constexpr float     kGtFovY = 38.75f;
 constexpr int       kGtRes  = 512;
 
-const char* const kTonemapNames[] = {"ACES", "Reinhard", "Clamp", "Filmic"};
+const char* const kTonemapNames[] = {"ACES", "Reinhard", "Clamp", "Filmic", "AgX"};
+constexpr int kTonemapCount = 5;
+// Reinhard, on measurement rather than on principle. Example 40 reasoned that
+// both references must be AgX renders (the panel lands near-neutral without
+// clipping) and called an AgX port the follow-up; this example has that port,
+// and per-patch it is not the closest match. Against the direct reference's back
+// wall, reference (112,91,47): Reinhard (105,90,53), ACES (134,109,47), AgX
+// (112,97,84) -- AgX gets the red and green almost exactly and then desaturates
+// the blue to nearly double. Either the renders are not AgX, or the standard
+// approximation of it diverges from Blender's OCIO transform at this saturation.
+//
+// The tone curve is a presentation choice, so the default is the one that
+// measures closest and all five stay available. It matters more than it sounds:
+// at this point the curve contributes as much to the RMSE as the transport does,
+// which is why implementation.md reports patches and not just a single number.
+constexpr int kTonemapDefault = 1;
 
 struct EnvOpts {
     std::string gate;
@@ -105,7 +125,7 @@ struct EnvOpts {
     std::string shot_path;
     bool  nogui = false;
     bool  compare = false;
-    int   tonemap = 0;
+    int   tonemap = kTonemapDefault;
     float exposure = 1.0f;
     bool  paused = false;
 };
@@ -129,6 +149,10 @@ EnvOpts read_env() {
     if (const char* v = getenv("MBG_SKY"))      o.cfg.sky = glm::vec3(float(atof(v)));
     if (const char* v = getenv("MBG_EMISSIVE")) o.cfg.emissive = float(atof(v));
     if (const char* v = getenv("MBG_TWOSIDED")) o.cfg.two_sided = atoi(v) != 0;
+    if (const char* v = getenv("MBG_NEE"))      o.cfg.nee = atoi(v) != 0;
+    if (const char* v = getenv("MBG_SHADOW"))   u32(v, o.cfg.shadow);
+    if (const char* v = getenv("MBG_SHADOW_BIAS")) o.cfg.shadow_bias = float(atof(v));
+    if (const char* v = getenv("MBG_TENT"))     o.cfg.tent = atoi(v) != 0;
     if (const char* v = getenv("MBG_PLANE"))    o.cfg.plane_tol = float(atof(v));
     if (const char* v = getenv("MBG_GTCAM"))    o.gtcam = atoi(v);
     if (const char* v = getenv("MBG_VIEW"))     o.view = atoi(v);
@@ -183,26 +207,91 @@ void compare_to_reference(const References& refs, int gt_index, int w, int h) {
     glGetTextureImage(ref.handle(), 0, GL_RGBA, GL_UNSIGNED_BYTE,
                       GLsizei(theirs.size()), theirs.data());
 
-    // glReadPixels is bottom-up, stb_image loaded the PNG top-down.
+    // glReadPixels is bottom-up, stb_image loaded the PNG top-down. Flip ours
+    // once here so everything below indexes the same way the reference does.
+    std::vector<unsigned char> flipped(ours.size());
+    for (int y = 0; y < h; ++y)
+        std::memcpy(&flipped[std::size_t(y) * w * 4],
+                    &ours[std::size_t(h - 1 - y) * w * 4], std::size_t(w) * 4);
+
     double se = 0.0, ae = 0.0, peak = 0.0;
     std::size_t n = 0;
-    for (int y = 0; y < h; ++y) {
-        const unsigned char* a = &ours[std::size_t(y) * w * 4];
-        const unsigned char* b = &theirs[std::size_t(h - 1 - y) * w * 4];
-        for (int x = 0; x < w * 4; ++x) {
-            if ((x & 3) == 3) continue;                 // alpha
-            const double d = (double(a[x]) - double(b[x])) / 255.0;
-            se += d * d;
-            ae += std::abs(d);
-            peak = std::max(peak, std::abs(d));
-            ++n;
-        }
+    for (std::size_t i = 0; i < flipped.size(); ++i) {
+        if ((i & 3) == 3) continue;                 // alpha
+        const double d = (double(flipped[i]) - double(theirs[i])) / 255.0;
+        se += d * d;
+        ae += std::abs(d);
+        peak = std::max(peak, std::abs(d));
+        ++n;
     }
     const double rmse = std::sqrt(se / double(std::max<std::size_t>(1, n)));
     printf("[compare] vs %s: RMSE %.4f  MAE %.4f  peak %.4f  (display space, 0..1)\n",
            gt_index == 0 ? "CornellBoxGroundTruthDirectLighting.png"
                          : "CornellBoxOriginalGroundTruth.png",
            rmse, ae / double(std::max<std::size_t>(1, n)), peak);
+
+    // --- Roughness ----------------------------------------------------------
+    //
+    // RMSE cannot see this example's artifacts. Measured against the direct
+    // reference, the analytic direct term and the quadrature one score the SAME
+    // 0.0468 -- while one image is smooth and the other is covered in mottle.
+    // Two reasons: a high-frequency error averages to almost nothing in a
+    // per-pixel mean, and the residual is dominated by the tone curve (finding
+    // 8), which is a large smooth offset that drowns everything else.
+    //
+    // So the artifacts get their own instrument, the one example 40 used on its
+    // reconstruction: high-pass energy over patches that are provably smooth in
+    // the reference. Each pixel minus the mean of its 5x5 neighbourhood, RMS over
+    // the patch, in 0..255 units. The reference is a converged path trace, so its
+    // value is the noise floor of the comparison; ours above that is artifact.
+    // Patches chosen to be smooth AND shadow-free in the reference: a shadow
+    // boundary is detail, not roughness, and including one would reward blur.
+    struct Patch { const char* name; int x, y, w, h; };
+    static const Patch patches[] = {
+        {"back wall",  140, 110, 230,  80},
+        {"left wall",   15, 150,  55, 180},
+        {"right wall", 450, 150,  50, 180},
+        {"ceiling",    110,  15,  80,  45},
+    };
+    // 15x15, not 5x5. The artifacts this is meant to see live at the GI grid's
+    // scale -- 8 pixels at MBG_SCALE=8 -- and a 5x5 high-pass looks straight past
+    // them: measured on the same pair of images it reports 1.06 against 0.54
+    // where the 15x15 reports 3.93 against 1.31.
+    constexpr int kKernel = 15;
+    auto roughness = [&](const std::vector<unsigned char>& img, const Patch& p) {
+        double acc = 0.0;
+        int count = 0;
+        constexpr int r = kKernel / 2;
+        for (int y = std::max(p.y, r); y < std::min(p.y + p.h, h - r); ++y) {
+            for (int x = std::max(p.x, r); x < std::min(p.x + p.w, w - r); ++x) {
+                for (int c = 0; c < 3; ++c) {
+                    double mean = 0.0;
+                    for (int dy = -r; dy <= r; ++dy)
+                        for (int dx = -r; dx <= r; ++dx)
+                            mean += double(img[(std::size_t(y + dy) * w + x + dx) * 4 + c]);
+                    mean /= double(kKernel * kKernel);
+                    const double d = double(img[(std::size_t(y) * w + x) * 4 + c]) - mean;
+                    acc += d * d;
+                    ++count;
+                }
+            }
+        }
+        return count ? std::sqrt(acc / double(count)) : 0.0;
+    };
+    printf("[compare] roughness (15x15 high-pass RMS, 0..255; the reference is a "
+           "converged path trace, so its column is the noise floor)\n");
+    double sum_ours = 0.0, sum_ref = 0.0;
+    for (const Patch& p : patches) {
+        const double a = roughness(flipped, p);
+        const double b = roughness(theirs, p);
+        sum_ours += a;
+        sum_ref += b;
+        printf("[compare]   %-11s ours %6.3f   reference %6.3f   %5.2fx\n",
+               p.name, a, b, b > 1e-6 ? a / b : 0.0);
+    }
+    const double np = double(sizeof(patches) / sizeof(patches[0]));
+    printf("[compare]   %-11s ours %6.3f   reference %6.3f   %5.2fx\n", "MEAN",
+           sum_ours / np, sum_ref / np, sum_ref > 1e-6 ? sum_ours / sum_ref : 0.0);
 }
 
 } // namespace
@@ -338,7 +427,7 @@ int main() {
 
     int view_mode = env.view;
     int gt_index = std::clamp(env.gt_index, 0, 1);
-    int tonemap = std::clamp(env.tonemap, 0, 3);
+    int tonemap = std::clamp(env.tonemap, 0, kTonemapCount - 1);
     float exposure = env.exposure;
     float irradiance_gain = 1.0f;
     float diff_gain = 4.0f;
@@ -502,13 +591,21 @@ int main() {
                 ImGui::SliderFloat("Upsample plane tol", &cfg.plane_tol, 0.0f,
                                    sb.diagonal() * 0.1f, "%.4f");
                 ImGui::Checkbox("Force two-sided emitters", &cfg.two_sided);
+                ImGui::Checkbox("Analytic direct term", &cfg.nee);
+                if (cfg.nee) {
+                    int sh = int(cfg.shadow);
+                    if (ImGui::SliderInt("Visibility samples", &sh, 1, 64))
+                        cfg.shadow = uint32_t(sh);
+                    ImGui::SliderFloat("Shadow bias", &cfg.shadow_bias, 0.0f, 0.02f, "%.4f");
+                }
+                ImGui::Checkbox("Tent-weighted spawn tiles", &cfg.tent);
             }
 
             if (ImGui::CollapsingHeader("View", ImGuiTreeNodeFlags_DefaultOpen)) {
                 int n = 0;
                 const char* const* names = DisplayPass::view_mode_names(n);
                 ImGui::Combo("Mode", &view_mode, names, n);
-                ImGui::Combo("Tonemap", &tonemap, kTonemapNames, 4);
+                ImGui::Combo("Tonemap", &tonemap, kTonemapNames, kTonemapCount);
                 ImGui::Combo("Reference", &gt_index, "Direct\0Full GI\0");
                 ImGui::SliderFloat("Exposure", &exposure, 0.05f, 8.0f);
                 ImGui::SliderFloat("Irradiance gain", &irradiance_gain, 0.05f, 20.0f);
