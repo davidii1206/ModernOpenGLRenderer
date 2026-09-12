@@ -233,8 +233,6 @@ void Solver::raster_level(uint32_t l, uint32_t count, const Scene& scene,
     raster_.set("u_two_sided", cfg.two_sided ? 1u : 0u);
     raster_.set("u_dump", dump ? dump_mode_ : 0u);
     raster_.set("u_emitters", cfg.nee ? scene.emitter_count() : 0u);
-    raster_.set("u_shadow", std::max(1u, cfg.shadow));
-    raster_.set("u_shadow_bias", cfg.shadow_bias);
     raster_.set("u_tent", cfg.tent ? 1u : 0u);
     dispatch_groups(count);
     gl::memory_barrier(GL_SHADER_STORAGE_BARRIER_BIT);
@@ -343,19 +341,28 @@ void Solver::direct_pixel(const GBuffer& gb, const gfx::Camera& cam, const Scene
         return;
     }
     ScopedPass p(t_direct_);
+    // Its own quadrature table: this pass's hemisphere need not be the same size
+    // as the GI grid's, and the table is what carries the texel weights the
+    // visibility ratio is built from.
+    const uint32_t res = std::clamp(cfg.direct_res, 2u, 32u);
+    if (direct_quad_.res != res) direct_quad_.build(res);
     direct_px_.use();
     scene.bind();
+    direct_quad_.bind();
     gb.bind_textures();
     full_.bind_image(1, 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA32F);
     direct_px_.set("u_size", glm::ivec2(gb.width, gb.height));
     direct_px_.set("u_inv_view_proj", glm::inverse(cam.view_projection()));
     direct_px_.set("u_tri_count", scene.count());
     direct_px_.set("u_emitters", scene.emitter_count());
-    direct_px_.set("u_shadow", std::max(1u, cfg.shadow_pixel));
+    direct_px_.set("u_res", res);
+    direct_px_.set("u_inv_far", 1.0f / std::max(1e-4f, scene.bounds().diagonal() * 1.5f));
     direct_px_.set("u_two_sided", cfg.two_sided ? 1u : 0u);
     direct_px_.set("u_bias", cfg.bias);
     direct_px_.set("u_emissive", cfg.emissive);
-    gl::dispatch_compute(uint32_t((gb.width + 7) / 8), uint32_t((gb.height + 7) / 8), 1);
+    // One workgroup per pixel: this pass rasterizes a hemisphere per receiver,
+    // exactly as the secondary cameras do.
+    dispatch_groups(uint32_t(gb.width) * uint32_t(gb.height));
     gl::memory_barrier(GL_TEXTURE_FETCH_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
 }
 

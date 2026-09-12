@@ -9,48 +9,20 @@
 // example does that, and then splits it again by RECEIVER, because the two have
 // completely different resolution requirements:
 //
-//   raster.comp        one receiver per secondary camera. Visibility comes from
-//                      the hemisphere buffer it just rasterized. Feeds the bounce
+//   raster.comp        one receiver per secondary camera. Feeds the bounce
 //                      transport, where a soft answer is fine.
-//   direct_pixel.comp  one receiver per PIXEL. Visibility comes from shadow rays.
-//                      Feeds the image, where it is the sharpest term there is.
+//   direct_pixel.comp  one receiver per PIXEL. Feeds the image, where it is the
+//                      sharpest term there is.
 //
-// Both call the magnitude function below, so the two paths cannot drift apart.
+// Both get their VISIBILITY the same way and the only way anything in this
+// renderer does: from the rasterized hemisphere's depth sort, via
+// mbg_emitter_visible_fraction() below. Both call the magnitude function below
+// that, so the two paths cannot drift apart.
 // The triangle buffer and the emitter list are declared by the including shader;
 // only the maths lives here.
 // ---------------------------------------------------------------------------
 
 #include "hemi.glsl"
-
-vec2 mbg_hammersley(uint i, uint n) {
-    uint b = (i << 16u) | (i >> 16u);
-    b = ((b & 0x55555555u) << 1u) | ((b & 0xAAAAAAAAu) >> 1u);
-    b = ((b & 0x33333333u) << 2u) | ((b & 0xCCCCCCCCu) >> 2u);
-    b = ((b & 0x0F0F0F0Fu) << 4u) | ((b & 0xF0F0F0F0u) >> 4u);
-    b = ((b & 0x00FF00FFu) << 8u) | ((b & 0xFF00FF00u) >> 8u);
-    return vec2((float(i) + 0.5) / float(n), float(b) * 2.3283064365386963e-10);
-}
-
-// Moller-Trumbore against one triangle, two-sided -- the rasterizer does not
-// cull either. raster.comp calls it on the single triangle its visibility buffer
-// already named, as a confirmation; direct_pixel.comp calls it on every triangle
-// in the scene, as a search.
-bool mbg_ray_tri(vec3 o, vec3 d, MbgTri tr, out float t) {
-    vec3 e1 = tr.p1.xyz - tr.p0.xyz;
-    vec3 e2 = tr.p2.xyz - tr.p0.xyz;
-    vec3 pv = cross(d, e2);
-    float det = dot(e1, pv);
-    if (abs(det) < 1e-20) return false;
-    float inv = 1.0 / det;
-    vec3 tv = o - tr.p0.xyz;
-    float u = dot(tv, pv) * inv;
-    if (u < 0.0 || u > 1.0) return false;
-    vec3 qv = cross(tv, e1);
-    float v = dot(d, qv) * inv;
-    if (v < 0.0 || u + v > 1.0) return false;
-    t = dot(e2, qv) * inv;
-    return t > 0.0;
-}
 
 vec3 mbg_emitter_unshadowed(vec3 pos, vec3 nrm, MbgTri tr, bool two_sided,
                             float plane_eps, float emissive_scale) {
@@ -112,5 +84,86 @@ vec3 mbg_emitter_unshadowed(vec3 pos, vec3 nrm, MbgTri tr, bool two_sided,
     return tr.emission.xyz * emissive_scale * (0.5 * abs(sum));
 }
 
+
+// The fraction of an emitter that a receiver can actually see, entirely from the
+// depth sort.
+//
+// The numerator is the cosine-weighted mass of the texels this emitter WON in
+// the full buffer; the denominator is the mass it covers with nothing else in
+// the scene, from the emitters-only buffer. Both come off the same texel grid,
+// so the grid's quantization -- the thing that made a raw quadrature estimate of
+// the direct term useless -- cancels exactly, and what is left is a proper
+// fraction in [0,1] that is 1 in the open, 0 in umbra and a ramp across a
+// penumbra.
+//
+// NOTHING HERE COMPARES A DEPTH AGAINST ANYTHING. The atomicMin already did
+// that, per texel, along the texel's own direction, which is the only place the
+// comparison is exact. An earlier version tested emitter samples against the
+// stored depth and paid for it twice: first with false self-occlusion wherever a
+// surface was grazing (a diagonal cross-hatch over the whole image), then with a
+// ray cast to paper over it. The depth sort takes care of it.
+//
+// Call it with the texel range this thread owns and reduce across the workgroup;
+// `x` is the numerator, `y` the denominator.
+vec2 mbg_emitter_mass(uint tri_index, uint lo, uint hi, uint stride) {
+    vec2 m = vec2(0.0);
+    for (uint i = lo; i < hi; i += stride) {
+        uint ke = s_emit[i];
+        if (ke == MBG_EMPTY || mbg_key_tri(ke) != tri_index) continue;
+        m.y += quad[i].w;                       // the emitter reaches this texel
+
+        // ...and nothing got in front of it. Both depths were produced by the
+        // same rasterizer along the SAME texel direction, so this comparison is
+        // exact -- it is the depth sort's own answer read back, not a shadow-map
+        // lookup with a slope to worry about.
+        //
+        // The +1 of tolerance is one step of the 16-bit key, and it is what makes
+        // a coplanar emitter work at all: Cornell's panel lies IN the ceiling, so
+        // the two are at identical depth in every texel the panel covers and
+        // atomicMin breaks the tie by triangle index. Without the tolerance the
+        // ceiling wins half of them, the visible fraction comes out below 1 in
+        // full view, and the error moves from pixel to pixel -- 4x the
+        // reference's roughness on the back wall, measured.
+        uint kv = s_vis[i];
+        if (kv == MBG_EMPTY || (kv >> 16u) + 1u >= (ke >> 16u)) m.x += quad[i].w;
+    }
+    return m;
+}
+
+// An emitter smaller than one texel wins no texel centre, and then there is no
+// ratio to take: the denominator is zero. This is the resolution floor of the
+// method, and what happens at it matters more than it sounds -- at a 32x32
+// target a surprising number of Cornell's receivers see the panel across fewer
+// than one texel, and answering "not visible" there put dark speckle along every
+// surface junction in the image (2.64x the reference's roughness, against 1.37x
+// when the same case answered "visible").
+//
+// So the degenerate case degrades to a single depth comparison, still the depth
+// sort's own numbers and still no ray: look up the texel the emitter's centroid
+// falls in, and ask whether whatever won it is behind the emitter's own plane
+// along that same texel's direction. Sub-texel emitters get a one-texel-wide
+// shadow boundary, which is the honest answer at that resolution.
+float mbg_emitter_fallback(MbgTri tr, uint res, float inv_far) {
+    vec3 cl = mbg_to_local((tr.p0.xyz + tr.p1.xyz + tr.p2.xyz) / 3.0 - g_P);
+    if (cl.z <= 0.0) return 0.0;
+
+    vec2  px = mbg_square_to_px(hemi_oct_encode(normalize(cl)), res);
+    ivec2 t  = clamp(ivec2(px), ivec2(0), ivec2(int(res) - 1));
+    uint  key = s_vis[uint(t.y) * res + uint(t.x)];
+    if (key == MBG_EMPTY) return 1.0;                            // nothing in the way
+    if (tris[mbg_key_tri(key)].emission.w != 0.0) return 1.0;     // an emitter won
+
+    // Both distances along this texel's centre direction, so the comparison is
+    // between two numbers the same rasterizer produced for the same ray.
+    vec3  w   = mbg_to_world(mbg_px_to_dir(vec2(t) + vec2(0.5), res));
+    float den = dot(tr.n.xyz, w);
+    if (abs(den) < 1e-12) return 0.0;
+    float te = dot(tr.n.xyz, tr.p0.xyz - g_P) / den;
+    if (te <= 0.0) return 0.0;
+
+    float step = 1.0 / (65535.0 * inv_far);
+    float stored = float(key >> 16u) * step;
+    return stored + 2.0 * step >= te * length(w) ? 1.0 : 0.0;
+}
 
 #endif

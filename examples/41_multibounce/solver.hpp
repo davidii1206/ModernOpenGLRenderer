@@ -73,15 +73,14 @@ struct SolveConfig {
     // is doc section 3's "direct lighting stays a separate conventional pass"
     // and is worth more to the image than any other single setting here.
     bool      nee = true;
-    uint32_t  shadow = 16;         // visibility samples per emitter per camera
-    float     shadow_bias = 2e-3f; // relative depth bias for that test
-    // Evaluate the IMAGE's direct term per pixel with shadow rays instead of
+    // Rasterize a hemisphere PER PIXEL for the image's direct term instead of
     // taking it from the GI grid. The grid answers for a scale x scale block, so
     // the direct term -- the sharpest thing in the image -- is otherwise limited
     // by the grid's Nyquist and comes out soft however good the upsample is.
-    // The solve is unchanged; only what the image reads changes.
+    // Same rasterizer and same depth sort as everywhere else; only the receiver
+    // changes. The solve is unchanged; only what the image reads changes.
     bool      direct_pixel = true;
-    uint32_t  shadow_pixel = 16;   // shadow rays per emitter per pixel
+    uint32_t  direct_res = 32;     // that pass's own hemisphere target edge
     // Spread each texel's albedo mass across the four nearest spawn tiles
     // instead of assigning it to one. Removes the tile discontinuity; costs a
     // wider scan of shared memory and nothing else.
@@ -195,6 +194,7 @@ private:
     // indirect mass and the direct mass -- see raster.comp).
     std::array<gl::Buffer, kMaxLevels> cams_, irrad_, direct_, weights_;
     std::array<Quadrature, kMaxLevels> quad_;
+    Quadrature direct_quad_;       // for the per-pixel direct pass
     std::array<LevelInfo, kMaxLevels> info_{};
     uint32_t levels_ = 0;
 

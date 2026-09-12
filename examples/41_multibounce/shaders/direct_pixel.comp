@@ -1,52 +1,39 @@
 #version 460 core
-layout(local_size_x = 8, local_size_y = 8) in;
+layout(local_size_x = 64) in;
 
 // ---------------------------------------------------------------------------
-// The direct term, one thread per PIXEL.
+// The direct term, one hemisphere per PIXEL.
 //
-// Same estimator as the one in raster.comp -- literally the same magnitude
-// function, from common/emitter.glsl -- with the receiver taken from the
-// G-buffer instead of from a secondary camera. That is the whole difference,
-// and it is the difference that matters, because the GI grid is the resolution
-// limit:
+// Same rasterizer, same depth sort, same visibility ratio as the secondary
+// cameras use -- the only thing that changes is the receiver. That is the whole
+// point: the GI grid answers for an MBG_SCALE x MBG_SCALE block of pixels, 4x4 by
+// default, and a shadow boundary reconstructed from receivers that far apart and
+// then bilaterally upsampled is soft no matter how good the upsample is. Nyquist,
+// not a filtering failure. Direct lighting is where it shows, because it carries
+// the sharpest edges in the image.
 //
-//   * a secondary camera answers for a whole MBG_SCALE x MBG_SCALE block of
-//     pixels, 4x4 by default. A shadow boundary reconstructed from receivers
-//     that far apart and then bilaterally upsampled is soft no matter how good
-//     the upsample is. That is Nyquist, not a filtering failure, and direct
-//     lighting is where it shows: it carries the sharpest edges in the image.
-//   * a per-pixel receiver has no such limit. The boundary is resolved at the
-//     resolution of the OCCLUDER representation -- here the triangles
-//     themselves, exactly -- and of the light stratification, both far finer
-//     than the receiver spacing.
+// So this pass gives the direct term its own receiver. One workgroup per pixel,
+// its own hemisphere rasterized from the G-buffer point, visibility from the
+// atomicMin winner exactly as everywhere else in this renderer. The penumbra is
+// resolved by how many texels the emitter covers; the shadow BOUNDARY is
+// resolved per pixel, which is what was missing.
 //
-// The solve is untouched: every secondary camera still computes its own direct
-// term, because the bounce transport needs it. This only changes what the IMAGE
-// reads. The GI grid then has to carry the indirect residual alone or the direct
-// term would be counted twice, which is what gather.comp's u_split does.
+// The solve is untouched -- every secondary camera still computes its own direct
+// term, because the bounce transport reads it. This only changes what the image
+// reads, and the GI grid then carries the indirect residual alone (gather.comp's
+// u_split) so nothing is counted twice.
 //
-// Indirect stays interpolated from the GI grid, which is the right place for it:
-// it is low frequency and 16x cheaper there.
-//
-// VISIBILITY IS RAY CAST, and that is not a retreat from the technique. Doc
-// section 3 puts direct lighting outside the GI pass on purpose ("direct
-// lighting stays a separate conventional pass"), and a conventional pass is
-// free to use whatever resolves a shadow best -- example 40's equivalent tests
-// against surfel discs, a real engine would use a shadow map. Every claim this
-// example makes about rasterized transport is about the hemisphere cameras,
-// which are untouched by this file. The cast is brute force over every triangle
-// for the same reason nothing else here has an acceleration structure.
-//
-// ADDS INTO the upsampled target rather than writing its own: the target holds
-// irradiance E directly, so the direct term composites with a read-modify-write
-// and needs no second full-resolution texture.
+// COST is a hemisphere per pixel, i.e. the doc's own section 4.1 reference
+// configuration, but for one level and with no children. At 512x512 that is 262k
+// workgroups against the 16k the GI grid runs -- and it buys the one term that
+// cannot be interpolated. MBG_DIRECT_RES trades the penumbra's smoothness for it.
 // ---------------------------------------------------------------------------
 
 #include "scene.glsl"
+#include "raster.glsl"
 #include "emitter.glsl"
 #include "gbuffer.glsl"
 
-layout(std430, binding = 0) readonly buffer MbgTris { MbgTri tris[]; };
 layout(std430, binding = 8) readonly buffer MbgEmit { uint   emitters[]; };
 
 layout(binding = 0) uniform sampler2D u_albedo;
@@ -59,63 +46,74 @@ uniform ivec2 u_size;
 uniform mat4  u_inv_view_proj;
 uniform uint  u_tri_count;
 uniform uint  u_emitters;
-uniform uint  u_shadow;        // shadow rays per emitter
 uniform uint  u_two_sided;
 uniform float u_bias;
 uniform float u_emissive;
 
+
 void main() {
-    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
-    if (p.x >= u_size.x || p.y >= u_size.y) return;
-    if (u_emitters == 0u) return;
+    uint pix = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (pix >= uint(u_size.x * u_size.y) || u_emitters == 0u) return;
+
+    ivec2 p = ivec2(int(pix) % u_size.x, int(pix) / u_size.x);
     if (texelFetch(u_albedo, p, 0).a <= 0.5) return;
 
     vec3  N = normalize(texelFetch(u_normal, p, 0).xyz);
     float d = texelFetch(u_depth, p, 0).r;
-    vec3  P = world_from_depth(d, (vec2(p) + 0.5) / vec2(u_size), u_inv_view_proj) +
-              N * u_bias;
+    mbg_set_receiver(world_from_depth(d, (vec2(p) + 0.5) / vec2(u_size), u_inv_view_proj),
+                     N, u_bias);
+
+    uint texels = u_res * u_res;
+
+    // Emitters alone, then everything: the denominator and the numerator of the
+    // visibility ratio, both off the same grid.
+    mbg_clear_vis(tid, 64u);
+    barrier();
+    memoryBarrierShared();
+    for (uint i = tid; i < u_emitters; i += 64u) mbg_raster_tri(emitters[i]);
+    barrier();
+    memoryBarrierShared();
+    for (uint i = tid; i < texels; i += 64u) s_emit[i] = s_vis[i];
+    barrier();
+    memoryBarrierShared();
+
+    mbg_clear_vis(tid, 64u);
+    barrier();
+    memoryBarrierShared();
+    for (uint t = tid; t < u_tri_count; t += 64u) mbg_raster_tri(t);
+    barrier();
+    memoryBarrierShared();
 
     vec3 E = vec3(0.0);
     for (uint e = 0u; e < u_emitters; ++e) {
-        MbgTri tr = tris[emitters[e]];
-        vec3 mag = mbg_emitter_unshadowed(P, N, tr, u_two_sided != 0u, 2.0 * u_bias,
-                                          u_emissive);
-        if (dot(mag, vec3(1.0)) <= 0.0) continue;     // below the horizon, or its back
+        uint ti = emitters[e];
+        vec3 mag = mbg_emitter_unshadowed(g_P, g_N, tris[ti], u_two_sided != 0u,
+                                          2.0 * u_bias, u_emissive);
+        bool lit = dot(mag, vec3(1.0)) > 0.0;
 
-        // Contribution-weighted visibility, as in raster.comp: the fraction of
-        // ENERGY that gets through, not the fraction of area. The magnitude above
-        // is exact, so this ratio is the only sampled quantity in the whole
-        // direct term.
-        float num = 0.0, den = 0.0;
-        uint S = max(1u, u_shadow);
-        for (uint s = 0u; s < S; ++s) {
-            vec2 uv = mbg_hammersley(s, S);
-            if (uv.x + uv.y > 1.0) uv = vec2(1.0) - uv;       // square -> triangle
-            vec3 q = tr.p0.xyz + (tr.p1.xyz - tr.p0.xyz) * uv.x +
-                                 (tr.p2.xyz - tr.p0.xyz) * uv.y;
-            vec3 sd = q - P;
-            float dist = length(sd);
-            if (dist < 1e-9) continue;
-            vec3 dir = sd / dist;
-            float cr = dot(N, dir);
-            if (cr <= 0.0) continue;
-            float f = cr * abs(dot(tr.n.xyz, dir)) / (dist * dist);
-            den += f;
-
-            // The emitter itself sits at t == dist, and a coplanar neighbour
-            // (the panel's other half) at the same place, so the test is on
-            // strictly nearer hits.
-            float lim = dist * (1.0 - 1e-3);
-            bool blocked = false;
-            for (uint t = 0u; t < u_tri_count && !blocked; ++t) {
-                float th;
-                if (mbg_ray_tri(P, dir, tris[t], th) && th < lim) blocked = true;
-            }
-            if (!blocked) num += f;
+        s_red2[tid] = vec4(lit ? mbg_emitter_mass(ti, tid, texels, 64u) : vec2(0.0),
+                           0.0, 0.0);
+        barrier();
+        for (uint r = 32u; r > 0u; r >>= 1u) {
+            if (tid < r) s_red2[tid] += s_red2[tid + r];
+            barrier();
         }
-        if (den > 0.0) E += mag * (num / den);
+        if (lit) {
+            vec2 m = s_red2[0].xy;
+            float vis;
+            if (m.y > 1e-9) {
+                vis = clamp(m.x / m.y, 0.0, 1.0);
+            } else {
+                vis = mbg_emitter_fallback(tris[ti], u_res, u_inv_far);
+            }
+            E += mag * vis;
+        }
+        barrier();
     }
 
-    vec4 cur = imageLoad(u_target, p);
-    imageStore(u_target, p, vec4(cur.rgb + E, 1.0));
+    if (tid == 0u) {
+        vec4 cur = imageLoad(u_target, p);
+        imageStore(u_target, p, vec4(cur.rgb + E, 1.0));
+    }
 }

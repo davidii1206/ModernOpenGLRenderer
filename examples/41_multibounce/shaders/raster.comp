@@ -34,11 +34,10 @@ layout(local_size_x = 64) in;
 
 #include "scene.glsl"
 #include "hemi.glsl"
+#include "raster.glsl"
 #include "emitter.glsl"
 
-layout(std430, binding = 0) readonly  buffer MbgTris     { MbgTri tris[]; };
 layout(std430, binding = 1) readonly  buffer MbgCams     { MbgCam cams[]; };
-layout(std430, binding = 2) readonly  buffer MbgQuad     { vec4   quad[]; };
 layout(std430, binding = 3) writeonly buffer MbgIrrad    { vec4   irradiance[]; };
 layout(std430, binding = 4) writeonly buffer MbgChildCam { MbgCam child_cam[]; };
 layout(std430, binding = 5) writeonly buffer MbgChildW   { vec4   child_w[]; };
@@ -52,247 +51,14 @@ layout(std430, binding = 9) writeonly buffer MbgDirect  { vec4   direct_out[]; }
 
 uniform uint  u_cam_count;
 uniform uint  u_tri_count;
-uniform uint  u_res;          // target edge, texels
 uniform uint  u_block;        // spawn block edge; 0 = terminal level, no children
 uniform float u_bias;         // camera offset along its own normal, world units
-uniform float u_inv_far;      // 1 / far, for the packed depth key
 uniform vec3  u_sky;          // radiance of an uncovered texel
 uniform float u_emissive;     // emissive scale
 uniform uint  u_two_sided;    // force every triangle to emit from both faces
 uniform uint  u_dump;         // 1 = dump visibility keys, 2 = dump per-texel direct
 uniform uint  u_emitters;     // analytic emitter count; 0 = take direct from the raster
-uniform uint  u_shadow;       // visibility samples per emitter
-uniform float u_shadow_bias;  // relative depth bias for the visibility test
 uniform uint  u_tent;         // 1 = tent-weighted spawn tiles, 0 = hard tiles
-
-// 32x32 is the doc's near-camera tier and the largest this example allows.
-#define MBG_MAX_TEXELS 1024
-shared uint s_vis[MBG_MAX_TEXELS];
-shared vec4 s_red[64];
-shared vec4 s_red2[64];
-
-vec3 g_P, g_T, g_B, g_N;      // the camera, set once per workgroup
-
-vec3 mbg_to_local(vec3 w) { return vec3(dot(w, g_T), dot(w, g_B), dot(w, g_N)); }
-vec3 mbg_to_world(vec3 l) { return g_T * l.x + g_B * l.y + g_N * l.z; }
-
-// Fill one straight-edged triangle of the projected polygon.
-//
-// Depth is EVALUATED, not interpolated: for the texel's direction w and the
-// triangle's plane (pn, pc) in camera-local coordinates the hit parameter is
-// exactly pc / dot(pn, w). That is the same cost as setting up an interpolant
-// and it removes a whole class of precision question from a reference renderer.
-void mbg_fill(vec2 A, vec2 B, vec2 C, vec3 pn, float pc, uint ti) {
-    float area2 = (B.x - A.x) * (C.y - A.y) - (B.y - A.y) * (C.x - A.x);
-    if (abs(area2) < 1e-14) return;
-    float s = area2 < 0.0 ? -1.0 : 1.0;   // orientation, so one test works for both
-
-    // THE FOLD TOLERANCE. A texel centre can land EXACTLY on an octahedral fold:
-    // at an even target edge, texel (i,i) and texel (i, res-1-i) have t.x or t.y
-    // identically zero. A triangle spanning that fold is split there into two
-    // pieces whose shared edge passes exactly through the centre, so both edge
-    // functions evaluate to zero plus float noise -- and if both pieces round the
-    // wrong way, the texel is left empty and the camera sees a hole in a solid
-    // wall.
-    //
-    // Measured before this tolerance existed: 3 empty texels in 65536 over 64
-    // Cornell cameras, every one of them on a fold (the oracle gate prints them
-    // with MBG_GATE_VERBOSE=1). Small, but it is a hole in a visibility buffer,
-    // and the same geometry at a different orientation is free to make it a
-    // bigger one.
-    //
-    // The fix is to let the two pieces OVERLAP by a hair instead of risking a
-    // gap between them. atomicMin makes double coverage free -- both pieces
-    // compute the same depth from the same plane -- so the asymmetry is entirely
-    // in our favour. The tolerance scales with the piece's own area because the
-    // edge functions are products of pixel coordinates and their noise floor
-    // scales the same way.
-    float eps = 1e-5 * abs(area2) + 1e-6;
-
-    vec2 lo = min(A, min(B, C));
-    vec2 hi = max(A, max(B, C));
-    int res = int(u_res);
-    int x0 = clamp(int(floor(lo.x)), 0, res - 1);
-    int x1 = clamp(int(ceil (hi.x)), 0, res - 1);
-    int y0 = clamp(int(floor(lo.y)), 0, res - 1);
-    int y1 = clamp(int(ceil (hi.y)), 0, res - 1);
-
-    for (int y = y0; y <= y1; ++y) {
-        for (int x = x0; x <= x1; ++x) {
-            vec2 p = vec2(float(x) + 0.5, float(y) + 0.5);
-            // Inclusive on every edge, with the fold tolerance above. Shared
-            // edges between fan triangles, and between the four quadrant pieces
-            // of one triangle, are therefore covered twice -- which atomicMin
-            // resolves to the same value. A top-left rule would avoid the double
-            // write and open a one-texel crack instead, and a crack in a
-            // visibility buffer is a light leak.
-            float w0 = ((C.x - B.x) * (p.y - B.y) - (C.y - B.y) * (p.x - B.x)) * s;
-            float w1 = ((A.x - C.x) * (p.y - C.y) - (A.y - C.y) * (p.x - C.x)) * s;
-            float w2 = ((B.x - A.x) * (p.y - A.y) - (B.y - A.y) * (p.x - A.x)) * s;
-            if (w0 < -eps || w1 < -eps || w2 < -eps) continue;
-
-            vec3 w = mbg_px_to_dir(p, u_res);
-            float denom = dot(pn, w);
-            if (abs(denom) < 1e-20) continue;
-            float t = pc / denom;
-            if (t <= 0.0) continue;                    // behind the camera
-            atomicMin(s_vis[uint(y) * u_res + uint(x)],
-                      mbg_pack_key(t * length(w), u_inv_far, ti));
-        }
-    }
-}
-
-void mbg_raster_tri(uint ti) {
-    MbgTri tr = tris[ti];
-
-    vec3 v[MBG_CLIP_MAX];
-    v[0] = mbg_to_local(tr.p0.xyz - g_P);
-    v[1] = mbg_to_local(tr.p1.xyz - g_P);
-    v[2] = mbg_to_local(tr.p2.xyz - g_P);
-
-    vec3  pn = mbg_to_local(tr.n.xyz);   // rotation only: still unit, still the plane normal
-    float pc = dot(pn, v[0]);
-
-    // The horizon. The camera sits ON a surface, so its own triangle passes
-    // through the origin; u_bias has already pushed the origin off that plane,
-    // and this clip then removes it entirely along with everything below.
-    vec3 hemi[MBG_CLIP_MAX];
-    int nh = mbg_clip_plane(v, 3, vec3(0.0, 0.0, 1.0), hemi);
-    if (nh < 3) return;
-
-    for (int q = 0; q < 4; ++q) {
-        float sx = (q & 1) == 0 ? 1.0 : -1.0;
-        float sy = (q & 2) == 0 ? 1.0 : -1.0;
-
-        vec3 cx[MBG_CLIP_MAX];
-        int nx = mbg_clip_plane(hemi, nh, vec3(sx, 0.0, 0.0), cx);
-        if (nx < 3) continue;
-        vec3 cy[MBG_CLIP_MAX];
-        int ny = mbg_clip_plane(cx, nx, vec3(0.0, sy, 0.0), cy);
-        if (ny < 3) continue;
-
-        vec2 px[MBG_CLIP_MAX];
-        bool ok = true;
-        for (int i = 0; i < ny; ++i) {
-            float L;
-            vec2 e = mbg_project(cy[i], sx, sy, L);
-            // L <= 0 means the vertex is at or behind the centre of projection,
-            // i.e. the geometry touches the camera origin. u_bias exists so this
-            // does not happen; dropping the piece is the safe failure.
-            if (!(L > 1e-12)) { ok = false; break; }
-            px[i] = mbg_square_to_px(e, u_res);
-        }
-        if (!ok) continue;
-
-        for (int k = 1; k + 1 < ny; ++k) mbg_fill(px[0], px[k], px[k + 1], pn, pc, ti);
-    }
-}
-
-// --- The direct term, analytically ------------------------------------------
-//
-// Doc section 3, non-goals: "No correct area-light soft shadows from the GI
-// pass. Direct lighting stays a separate conventional pass." This is that pass,
-// kept inside the same kernel because the visibility it needs is already
-// sitting in shared memory.
-//
-// WHY IT IS NOT OPTIONAL HERE. The emitter is the brightest thing in the scene
-// by two orders of magnitude and subtends a few percent of the hemisphere, so a
-// texel either sees all of it or none of it. At 32x32 that is a few percent of
-// error per camera, uncorrelated between neighbours, and it reads as the
-// mottling that dominated the first version of this example. At the 8x8 targets
-// the deeper levels use, the panel can miss every texel centre of a camera that
-// plainly sees it, and the indirect term goes blotchy.
-//
-// So the emitter's contribution is split in two:
-//
-//   magnitude   the EXACT projected solid angle of the emitter polygon, clipped
-//               to the hemisphere -- Lambert's formula, no quadrature at all
-//   visibility  a contribution-weighted fraction, sampled against the depth
-//               already in s_vis
-//
-// The magnitude carries all the energy and is now exact. The visibility is the
-// only sampled quantity left, it is bounded in [0,1], and it is 1 or 0 over most
-// of the image with a smooth ramp across penumbrae -- which is exactly the error
-// budget an area light wants. The hemisphere resolve then skips L_e on these
-// triangles (emission.w), so nothing is counted twice.
-// The fraction of emitter `ei` that this camera can actually see, weighted by
-// each sample's own contribution (cos_r * cos_e / d^2) so the answer is the
-// fraction of ENERGY that gets through rather than the fraction of area.
-float mbg_emitter_visibility(uint ei) {
-    MbgTri tr = tris[emitters[ei]];
-    float num = 0.0, den = 0.0;
-    uint S = max(1u, u_shadow);
-    for (uint s = 0u; s < S; ++s) {
-        vec2 uv = mbg_hammersley(s, S);
-        if (uv.x + uv.y > 1.0) uv = vec2(1.0) - uv;      // square -> triangle
-        vec3 q = tr.p0.xyz + (tr.p1.xyz - tr.p0.xyz) * uv.x +
-                             (tr.p2.xyz - tr.p0.xyz) * uv.y;
-        vec3 d = q - g_P;
-        float dist = length(d);
-        if (dist < 1e-9) continue;
-        vec3 dl = mbg_to_local(d) / dist;
-        if (dl.z <= 0.0) continue;
-        float f = dl.z * abs(dot(tr.n.xyz, d / dist)) / (dist * dist);
-        den += f;
-
-        // The shadow test IS the hemisphere buffer. No second structure and no
-        // ray cast: whatever the rasterizer put in this texel is the nearest
-        // surface in that direction.
-        //
-        // The test is on IDENTITY first and depth second, and that ordering is
-        // the whole correctness of it. A pure depth comparison is a shadow map
-        // lookup with no slope-scaled bias: the texel's depth was taken at its
-        // CENTRE, this ray is not that ray, and on a slanted surface the two
-        // distances differ by the slope across a texel. Against a large emitter
-        // roughly half the samples then read as self-occluded -- the gates
-        // measured exactly that, a rect scoring 0.62 of its analytic value and
-        // getting worse as resolution fell.
-        //
-        // So: if the nearest thing in this direction is itself an emitter, it is
-        // not an occluder. Depth only decides the case where the emitter is
-        // smaller than a texel and the centre saw past it to whatever stands
-        // behind -- and there the comparison is safe, because "behind the
-        // emitter" is unambiguous at any slope.
-        //
-        // The one thing this gets wrong is one emitter eclipsing another, which
-        // it treats as unoccluded. Cornell has a single panel; a scene with
-        // lights in front of lights would want the depth of the winning emitter
-        // compared against this sample's.
-        vec2 px = mbg_square_to_px(hemi_oct_encode(dl), u_res);
-        ivec2 t = clamp(ivec2(px), ivec2(0), ivec2(int(u_res) - 1));
-        uint key = s_vis[uint(t.y) * u_res + uint(t.x)];
-        bool clear = key == MBG_EMPTY || tris[mbg_key_tri(key)].emission.w != 0.0;
-        if (!clear) {
-            // The occluder is re-intersected ALONG THIS SAMPLE'S OWN RAY rather
-            // than compared against the stored depth. The stored depth belongs to
-            // the texel's centre, and on a surface seen at a grazing angle -- the
-            // ceiling beside the panel, from anywhere on the back wall -- the
-            // distance changes by more across one texel than the panel is far
-            // away, so the comparison rejects samples that nothing is blocking.
-            //
-            // Visually that was a fine diagonal cross-hatch over every surface:
-            // the visibility fraction stepping by 1/16 as the emitter's samples
-            // crossed texel boundaries, imprinting the octahedral grid on the
-            // image. Intersecting the plane along the sample's own direction
-            // removes the slope entirely and costs one divide.
-            //
-            // The triangle is still only the nearest surface along the TEXEL
-            // CENTRE, so a sample can be tested against an occluder that its own
-            // ray would have missed. That is a conservative error bounded by one
-            // texel of silhouette, and it is the reason the test runs at the
-            // camera's own target resolution rather than a coarser one.
-            // Intersecting the PLANE is not enough either: an occluder's plane
-            // is unbounded, so a sample that passes cleanly beside a box still
-            // reads as blocked and the shadow grows. Test the triangle itself.
-            MbgTri occ = tris[mbg_key_tri(key)];
-            float bias = u_shadow_bias * dist + 3.0 / (65535.0 * u_inv_far);
-            float thit;
-            clear = !mbg_ray_tri(g_P, d / dist, occ, thit) || thit >= dist - bias;
-        }
-        if (clear) num += f;
-    }
-    return den > 0.0 ? num / den : 0.0;
-}
 
 void main() {
     uint cam = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
@@ -329,7 +95,22 @@ void main() {
     g_P = c.pos.xyz + g_N * u_bias;
 
     uint texels = u_res * u_res;
-    for (uint i = tid; i < texels; i += 64u) s_vis[i] = MBG_EMPTY;
+
+    // The emitters alone, first. This is the denominator of every visibility
+    // ratio below: what this receiver would see with nothing else in the scene.
+    // Rasterizing them twice costs two extra triangles and removes every depth
+    // comparison from the direct term -- see mbg_emitter_mass in emitter.glsl.
+    mbg_clear_vis(tid, 64u);
+    barrier();
+    memoryBarrierShared();
+    for (uint i = tid; i < u_emitters; i += 64u) mbg_raster_tri(emitters[i]);
+    barrier();
+    memoryBarrierShared();
+    for (uint i = tid; i < texels; i += 64u) s_emit[i] = s_vis[i];
+    barrier();
+    memoryBarrierShared();
+
+    mbg_clear_vis(tid, 64u);
     barrier();
     memoryBarrierShared();
 
@@ -389,25 +170,54 @@ void main() {
             acc += tr.emission.xyz * u_emissive * q.w;
     }
 
-    // One thread per emitter, folded into the same reduction as the quadrature.
+    // The direct term: exact magnitude, visibility taken off the two buffers.
+    // The emitter loop is uniform across the workgroup, so the reduction inside
+    // it may carry barriers; every thread ends up with the same `direct`, and
+    // only thread 0 folds it into the sum being reduced.
+    //
     // Both the shadowed and the unshadowed total are carried: their ratio is the
     // scalar this camera's PARENT needs to shade a whole tile of directions from
     // one gather -- see the mass accumulation below.
     vec3  direct = vec3(0.0);
     float unshadowed = 0.0;
-    for (uint e = tid; e < u_emitters; e += 64u) {
-        vec3 u = mbg_emitter_unshadowed(g_P, g_N, tris[emitters[e]],
-                                        u_two_sided != 0u, 2.0 * u_bias, u_emissive);
-        direct += u * mbg_emitter_visibility(e);
-        unshadowed += dot(u, vec3(1.0));
-    }
-    acc += direct;
+    for (uint e = 0u; e < u_emitters; ++e) {
+        uint ti = emitters[e];
+        vec3 mag = mbg_emitter_unshadowed(g_P, g_N, tris[ti], u_two_sided != 0u,
+                                          2.0 * u_bias, u_emissive);
+        bool lit = dot(mag, vec3(1.0)) > 0.0;
 
+        s_red2[tid] = vec4(lit ? mbg_emitter_mass(ti, tid, texels, 64u) : vec2(0.0),
+                           0.0, 0.0);
+        barrier();
+        for (uint r = 32u; r > 0u; r >>= 1u) {
+            if (tid < r) s_red2[tid] += s_red2[tid + r];
+            barrier();
+        }
+        if (lit) {
+            vec2 m = s_red2[0].xy;
+            float vis;
+            if (m.y > 1e-9) {
+                vis = clamp(m.x / m.y, 0.0, 1.0);
+            } else {
+                vis = mbg_emitter_fallback(tris[ti], u_res, u_inv_far);
+            }
+            direct += mag * vis;
+            unshadowed += dot(mag, vec3(1.0));
+        }
+        barrier();
+    }
+    if (tid == 0u) acc += direct;
+
+    // Only `acc` is per-thread and needs reducing. `direct` and `unshadowed`
+    // came out of a reduction already and are identical in every thread, so
+    // thread 0 writes its own copy -- summing them again over 64 threads would
+    // report 64x the direct term, which the gather then subtracts from the
+    // child's total and clamps to zero, silently deleting every bounce below it.
+    // That is what the series gate caught when this was written the other way.
     s_red[tid] = vec4(acc, 0.0);
-    s_red2[tid] = vec4(direct, unshadowed);
     barrier();
     for (uint s = 32u; s > 0u; s >>= 1u) {
-        if (tid < s) { s_red[tid] += s_red[tid + s]; s_red2[tid] += s_red2[tid + s]; }
+        if (tid < s) s_red[tid] += s_red[tid + s];
         barrier();
     }
     if (tid == 0u) {
@@ -415,8 +225,8 @@ void main() {
         // (direct, visible fraction). The fraction is energy weighted over every
         // emitter, so one number answers "how much of the direct light does this
         // neighbourhood receive" even with several lights of different colours.
-        float vis = s_red2[0].w > 1e-12 ? dot(s_red2[0].xyz, vec3(1.0)) / s_red2[0].w : 0.0;
-        direct_out[cam] = vec4(s_red2[0].xyz, vis);
+        float vis = unshadowed > 1e-12 ? dot(direct, vec3(1.0)) / unshadowed : 0.0;
+        direct_out[cam] = vec4(direct, vis);
     }
 
     if (u_block == 0u) return;

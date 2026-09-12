@@ -22,8 +22,10 @@
 //     no LOD, no cluster DAG, no work list (5.2, 5.4 are what this measures)
 //   - recursion to MBG_BOUNCES levels with the resolution ladder and tile
 //     clustering of 6.2, terminating in direct lighting only (6.1)
-//   - the direct term as a separate analytic pass (3): exact polygon irradiance
-//     with visibility sampled against the hemisphere's own depth buffer
+//   - the direct term as a separate pass (3): exact polygon irradiance, with
+//     visibility taken off the rasterized depth sort -- per camera for the
+//     bounce transport, and a hemisphere per PIXEL for the image, which is the
+//     only way its shadow boundaries come out sharp
 //
 // What it is NOT: variant B. There is no radiance cache and nothing reads last
 // frame's output, so a completed sweep is correct on its own terms rather than
@@ -45,11 +47,10 @@
 //   MBG_MODEL=path.glb      CornellBoxOriginal.glb; the references only match it
 //   MBG_BOUNCES=3           camera levels; 1 == direct only
 //   MBG_NEE=1               analytic direct term (doc section 3's separate pass)
-//   MBG_SHADOW=16           visibility samples per emitter, per camera
 //   MBG_TENT=1              spread each texel's mass over the 4 nearest tiles
-//   MBG_DIRECT_PIXEL=1      evaluate the image's direct term per pixel, not per
-//                           GI-grid camera -- the sharpest term in the image
-//   MBG_SHADOW_PIXEL=16     shadow rays per emitter for that pass
+//   MBG_DIRECT_PIXEL=1      rasterize a hemisphere per pixel for the image's
+//                           direct term, not one per GI-grid camera
+//   MBG_DIRECT_RES=32       that pass's own hemisphere target edge
 //   MBG_SCALE=4             GI grid = framebuffer / scale; 1 == one camera/pixel
 //   MBG_BUDGET=4096         level-1 cameras per frame
 //   MBG_RES=32              level-1 target edge; MBG_RES2/3/4 for deeper levels
@@ -153,11 +154,9 @@ EnvOpts read_env() {
     if (const char* v = getenv("MBG_EMISSIVE")) o.cfg.emissive = float(atof(v));
     if (const char* v = getenv("MBG_TWOSIDED")) o.cfg.two_sided = atoi(v) != 0;
     if (const char* v = getenv("MBG_NEE"))      o.cfg.nee = atoi(v) != 0;
-    if (const char* v = getenv("MBG_SHADOW"))   u32(v, o.cfg.shadow);
-    if (const char* v = getenv("MBG_SHADOW_BIAS")) o.cfg.shadow_bias = float(atof(v));
     if (const char* v = getenv("MBG_TENT"))     o.cfg.tent = atoi(v) != 0;
     if (const char* v = getenv("MBG_DIRECT_PIXEL")) o.cfg.direct_pixel = atoi(v) != 0;
-    if (const char* v = getenv("MBG_SHADOW_PIXEL")) u32(v, o.cfg.shadow_pixel);
+    if (const char* v = getenv("MBG_DIRECT_RES")) u32(v, o.cfg.direct_res);
     if (const char* v = getenv("MBG_PLANE"))    o.cfg.plane_tol = float(atof(v));
     if (const char* v = getenv("MBG_GTCAM"))    o.gtcam = atoi(v);
     if (const char* v = getenv("MBG_VIEW"))     o.view = atoi(v);
@@ -602,18 +601,12 @@ int main() {
                                    sb.diagonal() * 0.1f, "%.4f");
                 ImGui::Checkbox("Force two-sided emitters", &cfg.two_sided);
                 ImGui::Checkbox("Analytic direct term", &cfg.nee);
-                if (cfg.nee) {
-                    int sh = int(cfg.shadow);
-                    if (ImGui::SliderInt("Visibility samples", &sh, 1, 64))
-                        cfg.shadow = uint32_t(sh);
-                    ImGui::SliderFloat("Shadow bias", &cfg.shadow_bias, 0.0f, 0.02f, "%.4f");
-                }
                 ImGui::Checkbox("Tent-weighted spawn tiles", &cfg.tent);
                 ImGui::Checkbox("Direct term per pixel", &cfg.direct_pixel);
                 if (cfg.direct_pixel) {
-                    int sp = int(cfg.shadow_pixel);
-                    if (ImGui::SliderInt("Shadow rays / pixel", &sp, 1, 64))
-                        cfg.shadow_pixel = uint32_t(sp);
+                    int dr = int(cfg.direct_res);
+                    if (ImGui::SliderInt("Direct target", &dr, 2, 32))
+                        cfg.direct_res = uint32_t(dr);
                 }
             }
 

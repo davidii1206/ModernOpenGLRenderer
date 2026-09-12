@@ -41,11 +41,9 @@ reload sees it.
 | `MBG_RES=n` / `MBG_RES2/3/4=n` | hemi-octahedral target edge per level, 2–32 |
 | `MBG_BLOCK=n` / `MBG_BLOCK2/3=n` | spawn tile edge in texels. **1 spawns a child per texel — the unabridged recursion** |
 | `MBG_NEE=0\|1` | evaluate the direct term analytically instead of taking it from the raster (default 1). **The single most important setting for image quality**; see finding 2 |
-| `MBG_SHADOW=n` | visibility samples per emitter per camera (default 16) |
-| `MBG_SHADOW_BIAS=f` | relative depth bias for the visibility test (default 2e-3) |
 | `MBG_TENT=0\|1` | spread each texel's mass over the four nearest spawn tiles (default 1) |
-| `MBG_DIRECT_PIXEL=0\|1` | evaluate the **image's** direct term per pixel with shadow rays instead of taking it from the GI grid (default 1); see finding 11 |
-| `MBG_SHADOW_PIXEL=n` | shadow rays per emitter for that pass (default 16) |
+| `MBG_DIRECT_PIXEL=0\|1` | rasterize a hemisphere **per pixel** for the image's direct term instead of taking it from the GI grid (default 1); see finding 11 |
+| `MBG_DIRECT_RES=n` | that pass's own hemisphere target edge (default 32) |
 | `MBG_SKY=f` | radiance of an uncovered texel. **0.05 is needed to reproduce the full-GI reference**; see finding 5 |
 | `MBG_EMISSIVE=f` | emissive scale |
 | `MBG_BIAS=f` | camera offset along its own normal, world units (default = 2.5e-4 × scene diagonal) |
@@ -71,7 +69,7 @@ reload sees it.
 | 4.3 | Hemi-octahedral hemisphere map, one square target, one pass | ✅ |
 | 4.4 | Cosine × solid-angle weighted integration | ✅ integrated per texel, not point sampled |
 | 4.4 | SH2 projection | ⬜ deliberately not done — see "Deviations" |
-| 3 | Direct lighting as a separate conventional pass, not out of the GI gather | ✅ analytic polygon irradiance; visibility from the hemisphere buffer for the bounce transport, and from shadow rays per pixel for the image |
+| 3 | Direct lighting as a separate conventional pass, not out of the GI gather | ✅ analytic polygon irradiance, visibility from the rasterized depth sort — per camera for the transport, per pixel for the image |
 | 5.2 | Cluster DAG LOD, meshlets, boundary locking | ⬜ milestone 4, and the whole point of having this reference first |
 | 5.3 | Compute rasterizer, one workgroup per camera, LDS depth buffer, atomicMin | ✅ with a 32-bit key instead of 64 — see "Deviations" |
 | 5.3 | Visibility buffer resolved in a second pass | ✅ and better: it never leaves shared memory |
@@ -213,11 +211,13 @@ direct with 16 visibility samples, tent weights on.
 
 | | RMSE | roughness vs reference | cameras/sweep | sweep |
 |---|---|---|---|---|
-| 1 bounce vs the direct reference | **0.0431** | 0.91× | 1.6e4 | 0.40 s + 0.33 s direct |
-| 3 bounces vs the full-GI reference (sky 0.05) | **0.0522** | 1.16× | 1.3e6 | 12 s + 0.33 s direct |
+| 1 bounce vs the direct reference | **0.0439** | 1.02× | 1.6e4 + 262k direct | 0.40 s + 7.4 s direct |
+| 3 bounces vs the full-GI reference (sky 0.05) | **0.0533** | 1.21× | 1.3e6 + 262k direct | 12 s + 7.4 s direct |
 
-The direct pass is per frame rather than per sweep, and its 0.33 s is llvmpipe
-brute-forcing 16 shadow rays per emitter per pixel against all 32 triangles.
+The direct pass is per frame rather than per sweep, and it is a hemisphere per
+pixel — 262k workgroups at 512×512, against the 16k the GI grid runs. That is the
+doc's own §4.1 reference configuration for a single level, and it buys the one
+term that cannot be interpolated.
 
 Roughness is high-pass energy relative to the reference's own, so **both
 directions are wrong**: far below 1.0 is an over-smoothed image, far above it is
@@ -487,17 +487,7 @@ cameras — `texeldir`, which integrates the per-texel values against the analyt
 answer and cross-checks every one against a CPU ray cast — to localize it. The
 fix needs both conditions: coplanar means near the plane *and* parallel normals.
 
-A third, milder version of the same class sat in the shadow test. Comparing a
-sample's distance against the stored depth of the texel it lands in is a shadow
-map lookup with no slope-scaled bias: the depth belongs to the texel's centre,
-and on a surface seen at a grazing angle — the ceiling beside the panel, from
-anywhere on the back wall — it changes by more across one texel than the panel is
-far away. Samples that nothing was blocking read as occluded, and the visibility
-fraction stepped by 1/16 as the emitter's samples crossed texel boundaries,
-printing a fine diagonal cross-hatch of the octahedral grid onto every surface.
-The test is now identity first (an emitter is not an occluder), then a
-Möller-Trumbore against the one triangle the buffer named — intersecting its
-*plane* instead was tried and grows every shadow, because a plane is unbounded.
+A third version of the same class sat in the shadow test, and is finding 12.
 
 ### 9. RMSE is nearly blind to the artifacts, so the example measures roughness too
 
@@ -565,44 +555,84 @@ reconstructing them from receivers four pixels apart makes them soft no matter
 how good the upsample is. That is Nyquist, not a filtering failure, and it is the
 same limit example 40 hit against its surfel spacing and answered the same way.
 
-So the direct term is split by **receiver** as well as by estimator:
+So the direct term gets its own receiver: `direct_pixel.comp` rasterizes **a
+hemisphere per pixel**. Same rasterizer, same LDS buffer, same atomicMin, same
+visibility rule — only the receiver changes. The solve is untouched (every camera
+still computes its own direct term, because the transport reads it) and the GI
+grid then carries the **indirect residual alone** (`gather.comp`'s `u_split`), so
+nothing is counted twice.
 
-| | receiver | visibility | feeds |
+| | RMSE | roughness | direct pass |
 |---|---|---|---|
-| `raster.comp` | one per secondary camera | the hemisphere buffer it just rasterized | the bounce transport, where soft is fine |
-| `direct_pixel.comp` | one per **pixel** | shadow rays against the triangles | the image, where it is the sharpest term |
+| direct from the GI grid | 0.0474 | 0.69× | — |
+| direct per pixel, 8×8 target | 0.0517 | 1.29× | 2.7 s |
+| direct per pixel, 16×16 | 0.0458 | 1.46× | 3.7 s |
+| **direct per pixel, 32×32** | **0.0439** | **1.02×** | 7.4 s |
 
-Both call the same magnitude function (`common/emitter.glsl`), so they cannot
-drift. The solve is untouched — every camera still computes its own direct term,
-because the transport needs it — and the GI grid then carries the **indirect
-residual alone** (`gather.comp`'s `u_split`) so nothing is counted twice.
+The per-pixel pass's own target sets how many texels the emitter covers, and so
+how many levels its visible fraction can take. At 8×8 the Cornell panel is close
+to sub-texel from much of the room and the ratio degrades to the one-texel
+fallback over large areas.
 
-Measured at one bounce against the direct reference, GI 128×128:
+The roughness figure is the interesting one. 0.61× said the image was *smoother
+than the converged path trace* — detail lost to the upsample, which is not a
+compliment. Per pixel it sits at 1.02×, carrying the same high-frequency content
+the reference does.
 
-| | RMSE | roughness |
-|---|---|---|
-| direct from the GI grid | 0.0486 | 0.61× |
-| **direct per pixel** | **0.0431** | 0.91× |
+### 12. Visibility is the depth sort, and nothing else
 
-The roughness figure is the interesting one. 0.61× says the image was *smoother
-than the converged path trace* — it had lost detail the reference has. Per pixel
-it lands at 0.91×, i.e. carrying about as much high-frequency content as the
-reference does, which is what a correct sharp image looks like on this metric.
+Getting there took three attempts, and the two failures are worth recording
+because both looked reasonable.
 
-**The two paths agree, which is the check that matters.** At `MBG_SCALE=1`, where
-both have one receiver per pixel, mean image brightness differs by 1.6% (48.1
-against 47.4) — so the split is a redistribution and not a double count. The
-per-pixel path still scores better even there (0.0431 against 0.0448), because
-ray-cast visibility resolves a shadow boundary exactly while the rasterized one
-is limited by the 32² hemisphere's silhouette.
+**Attempt 1 — sample the emitter, test against the stored depth.** Pick points on
+the emitter, find the texel each falls in, compare its stored depth against the
+sample's distance. This is a shadow-map lookup with no slope-scaled bias: the
+depth belongs to the texel's *centre*, the sample ray is not that ray, and on a
+surface seen at a grazing angle — the ceiling beside the panel, from anywhere on
+the back wall — the distance changes by more across one texel than the panel is
+far away. Samples nothing was blocking read as occluded, and the visible fraction
+stepped by 1/16 as samples crossed texel boundaries, printing a fine diagonal
+cross-hatch of the octahedral grid onto every surface.
 
-**Ray casting here is not a retreat from the premise.** §3 puts direct lighting
-outside the GI pass on purpose, and a conventional pass may use whatever resolves
-a shadow best — example 40's equivalent tests against surfel discs, an engine
-would use a shadow map. Every claim this example makes about rasterized transport
-is about the hemisphere cameras, and they are untouched by this pass. The cast is
-brute force over every triangle for the same reason nothing else here has an
-acceleration structure.
+**Attempt 2 — fix it with a ray cast.** Replacing the depth comparison with a
+Möller-Trumbore against the scene removed the artifact and was the wrong answer:
+avoiding ray traversal is the entire premise of the technique. A renderer that
+rasterizes its transport and then ray casts its shadows has not tested the thing
+the document is about.
+
+**What works is a ratio taken off two rasterizations.** The emitters are
+rasterized *alone* into a second LDS buffer, then:
+
+```
+visible fraction = (cosine-weighted mass of texels the emitter WON in the full buffer)
+                 / (cosine-weighted mass it covers with nothing else in the scene)
+```
+
+Both come off the same texel grid, so the quantization that made the raw
+quadrature estimate useless cancels exactly, and what is left is a proper
+fraction: 1 in the open, 0 in umbra, a ramp across a penumbra. Nothing compares a
+depth against anything — the atomicMin already did that, per texel, along the
+texel's own direction, which is the only place the comparison is exact. Cost is
+two extra triangles rasterized and one LDS buffer.
+
+Two details the gates and the roughness metric forced out:
+
+- **Coplanar emitters.** Cornell's panel lies in the ceiling's plane, so the two
+  are at identical depth in every texel the panel covers and atomicMin breaks the
+  tie by triangle index. The numerator therefore compares the winner's depth
+  against the emitter's own, from the two buffers, with one key-step of
+  tolerance — still two numbers the same rasterizer produced for the same ray.
+- **Sub-texel emitters.** When the emitter wins no texel centre the denominator
+  is zero and there is no ratio. Answering "not visible" there put dark speckle
+  along every surface junction — **2.64×** the reference's roughness, against
+  1.37× when the same case answered "visible". It now degrades to a single depth
+  comparison at the texel the emitter's centroid falls in, which lands at
+  **1.02×**. Sub-texel lights get a one-texel-wide shadow boundary, which is the
+  honest answer at that resolution.
+
+There is now exactly one visibility mechanism in this renderer — rasterize, let
+the depth sort decide, read the winner — and every pass shares it through
+`common/raster.glsl`.
 
 ## What this does not answer
 
