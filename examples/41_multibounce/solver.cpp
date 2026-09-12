@@ -62,7 +62,7 @@ void Solver::configure(const SolveConfig& cfg_in, int fb_w, int fb_h) {
     cfg.bounces = std::clamp(cfg.bounces, 1u, kMaxLevels);
     cfg.scale   = std::clamp(cfg.scale, 1u, 64u);
     for (uint32_t l = 0; l < cfg.bounces; ++l) {
-        cfg.res[l]   = std::clamp(cfg.res[l], 2u, 32u);
+        cfg.res[l]   = std::clamp(cfg.res[l], 2u, 64u);
         cfg.block[l] = snap_block(cfg.res[l], cfg.block[l]);
     }
 
@@ -234,6 +234,7 @@ void Solver::raster_level(uint32_t l, uint32_t count, const Scene& scene,
     raster_.set("u_dump", dump ? dump_mode_ : 0u);
     raster_.set("u_emitters", cfg.nee ? scene.emitter_count() : 0u);
     raster_.set("u_tent", cfg.tent ? 1u : 0u);
+    raster_.set("u_lv_res", std::clamp(cfg.cam_lv_res, 2u, 32u));
     dispatch_groups(count);
     gl::memory_barrier(GL_SHADER_STORAGE_BARRIER_BIT);
 }

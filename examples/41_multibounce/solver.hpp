@@ -48,9 +48,16 @@ struct SolveConfig {
     uint32_t scale   = 4;          // GI grid = framebuffer / scale
     uint32_t budget  = 4096;       // level-1 cameras per frame
 
-    // The resolution ladder of section 6.2 / 4.1. 32 near, then aggressive
-    // falloff: deep bounces carry little energy and are extremely low frequency.
-    std::array<uint32_t, kMaxLevels> res{{32, 8, 8, 8}};
+    // The resolution ladder of section 6.2 / 4.1: near cameras get the
+    // resolution, deep ones do not, because deep bounces carry little energy and
+    // are extremely low frequency.
+    //
+    // 64 at level 1 rather than the doc's 32, on measurement. The quadrature
+    // error of a 32x32 gather is correlated between neighbouring receivers -- the
+    // directions are the same for all of them -- so it does not read as noise,
+    // it reads as horizontal banding across the ceiling and the upper walls.
+    // 4096 directions removes it; see implementation.md, finding 14.
+    std::array<uint32_t, kMaxLevels> res{{64, 8, 8, 8}};
     // Tile edge for spawning the next level, in texels of THIS level's target.
     // 1 spawns per texel (the unabridged recursion); the terminal level ignores
     // it. res/block must be an integer, and configure() snaps it down until it
@@ -66,7 +73,10 @@ struct SolveConfig {
     // spawns a single child and the level below it stops being a gather at all,
     // and the extra children are cheap next to level 1's, which multiplies
     // everything under it.
-    std::array<uint32_t, kMaxLevels> block{{8, 4, 4, 4}};
+    // 16 at level 1 keeps the child count at 16 now that the target is 64 wide;
+    // the measurement behind the tile size is in finding 4 and is about how many
+    // children there are, not how many texels each covers.
+    std::array<uint32_t, kMaxLevels> block{{16, 4, 4, 4}};
 
     // The direct term. `nee` routes every emissive triangle through the analytic
     // estimator in raster.comp instead of letting the quadrature find it, which
@@ -84,6 +94,12 @@ struct SolveConfig {
     // emitter, against the 4-29 a 32x32 hemisphere manages -- see
     // common/lightview.glsl.
     uint32_t  direct_res = 16;
+    // Light-view edge for the SECONDARY CAMERAS' direct term. Smaller than the
+    // per-pixel pass's because it feeds bounce transport rather than the image,
+    // but it cannot be the hemisphere: at an 8x8 target a camera's hemisphere
+    // puts half a texel on Cornell's panel, and a yes/no answer there is the
+    // banding the indirect term used to show.
+    uint32_t  cam_lv_res = 8;
     // Composite nothing but the indirect residual: the solve runs exactly as it
     // does normally and the per-pixel direct pass is skipped, so the image is
     // the bounce term alone. A diagnostic, not a rendering mode -- the indirect

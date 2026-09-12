@@ -50,7 +50,8 @@
 //   MBG_TENT=1              spread each texel's mass over the 4 nearest tiles
 //   MBG_DIRECT_PIXEL=1      rasterize a hemisphere per pixel for the image's
 //                           direct term, not one per GI-grid camera
-//   MBG_DIRECT_RES=16       edge of that pass's per-emitter light view
+//   MBG_DIRECT_RES=16       edge of the per-pixel pass's light view
+//   MBG_LV_RES=8            edge of the secondary cameras' light view
 //   MBG_INDIRECT_ONLY=1     composite the bounce term alone, for inspecting it
 //   MBG_SCALE=4             GI grid = framebuffer / scale; 1 == one camera/pixel
 //   MBG_BUDGET=4096         level-1 cameras per frame
@@ -158,6 +159,7 @@ EnvOpts read_env() {
     if (const char* v = getenv("MBG_TENT"))     o.cfg.tent = atoi(v) != 0;
     if (const char* v = getenv("MBG_DIRECT_PIXEL")) o.cfg.direct_pixel = atoi(v) != 0;
     if (const char* v = getenv("MBG_DIRECT_RES")) u32(v, o.cfg.direct_res);
+    if (const char* v = getenv("MBG_LV_RES"))    u32(v, o.cfg.cam_lv_res);
     if (const char* v = getenv("MBG_INDIRECT_ONLY")) o.cfg.indirect_only = atoi(v) != 0;
     if (const char* v = getenv("MBG_PLANE"))    o.cfg.plane_tol = float(atof(v));
     if (const char* v = getenv("MBG_GTCAM"))    o.gtcam = atoi(v);
@@ -608,9 +610,12 @@ int main() {
                 ImGui::Checkbox("Direct term per pixel", &cfg.direct_pixel);
                 if (cfg.direct_pixel) {
                     int dr = int(cfg.direct_res);
-                    if (ImGui::SliderInt("Direct target", &dr, 2, 32))
+                    if (ImGui::SliderInt("Light view / pixel", &dr, 2, 32))
                         cfg.direct_res = uint32_t(dr);
                 }
+                int cr = int(cfg.cam_lv_res);
+                if (ImGui::SliderInt("Light view / camera", &cr, 2, 32))
+                    cfg.cam_lv_res = uint32_t(cr);
             }
 
             if (ImGui::CollapsingHeader("View", ImGuiTreeNodeFlags_DefaultOpen)) {

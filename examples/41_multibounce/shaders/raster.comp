@@ -35,6 +35,8 @@ layout(local_size_x = 64) in;
 #include "scene.glsl"
 #include "hemi.glsl"
 #include "raster.glsl"
+#include "emitter.glsl"
+#include "lightview.glsl"
 
 layout(std430, binding = 1) readonly  buffer MbgCams     { MbgCam cams[]; };
 layout(std430, binding = 3) writeonly buffer MbgIrrad    { vec4   irradiance[]; };
@@ -58,6 +60,7 @@ uniform uint  u_two_sided;    // force every triangle to emit from both faces
 uniform uint  u_dump;         // 1 = dump visibility keys, 2 = dump per-texel direct
 uniform uint  u_emitters;     // analytic emitter count; 0 = take direct from the raster
 uniform uint  u_tent;         // 1 = tent-weighted spawn tiles, 0 = hard tiles
+uniform uint  u_lv_res;       // light-view edge for this level's direct term
 
 void main() {
     uint cam = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
@@ -94,20 +97,6 @@ void main() {
     g_P = c.pos.xyz + g_N * u_bias;
 
     uint texels = u_res * u_res;
-
-    // The emitters alone, first. This is the denominator of every visibility
-    // ratio below: what this receiver would see with nothing else in the scene.
-    // Rasterizing them twice costs two extra triangles and removes every depth
-    // comparison from the direct term -- see mbg_emitter_mass in emitter.glsl.
-    mbg_clear_vis(tid, 64u);
-    barrier();
-    memoryBarrierShared();
-    for (uint i = tid; i < u_emitters; i += 64u) mbg_raster_tri(emitters[i]);
-    barrier();
-    memoryBarrierShared();
-    for (uint i = tid; i < texels; i += 64u) s_emit[i] = s_vis[i];
-    barrier();
-    memoryBarrierShared();
 
     mbg_clear_vis(tid, 64u);
     barrier();
@@ -184,9 +173,30 @@ void main() {
         vec3 mag = mbg_emitter_unshadowed(g_P, g_N, tris[ti], u_two_sided != 0u,
                                           2.0 * u_bias, u_emissive);
         bool lit = dot(mag, vec3(1.0)) > 0.0;
+        // A frustum fitted to the emitter, not the hemisphere. At an 8x8 target
+        // this camera's hemisphere puts HALF A TEXEL on Cornell's panel, so its
+        // visible fraction would be the sub-texel yes/no -- and a yes/no at the
+        // second bounce, flipping as a tile's representative moves, is the
+        // horizontal banding that the indirect term used to show. The fitted
+        // view spends its texels on the light instead. See lightview.glsl.
+        bool fitted = lit && lv_setup(g_P, g_N, tris[ti]);
 
-        s_red2[tid] = vec4(lit ? mbg_emitter_mass(ti, tid, texels, 64u) : vec2(0.0),
-                           0.0, 0.0);
+        if (fitted) {
+            for (uint i = tid; i < u_lv_res * u_lv_res; i += 64u) {
+                s_lv[i] = MBG_EMPTY;
+                s_lv_e[i] = MBG_EMPTY;
+            }
+            barrier();
+            memoryBarrierShared();
+            lv_raster_tri(ti, u_lv_res, u_inv_far, true);
+            for (uint t = tid; t < u_tri_count; t += 64u)
+                lv_raster_tri(t, u_lv_res, u_inv_far, false);
+            barrier();
+            memoryBarrierShared();
+        }
+
+        s_red2[tid] = vec4(fitted ? lv_mass(u_lv_res, g_N, tid, u_lv_res * u_lv_res, 64u)
+                                  : vec2(0.0), 0.0, 0.0);
         barrier();
         for (uint r = 32u; r > 0u; r >>= 1u) {
             if (tid < r) s_red2[tid] += s_red2[tid + r];
@@ -194,12 +204,10 @@ void main() {
         }
         if (lit) {
             vec2 m = s_red2[0].xy;
-            float vis;
-            if (m.y > 1e-9) {
-                vis = clamp(m.x / m.y, 0.0, 1.0);
-            } else {
-                vis = mbg_emitter_fallback(tris[ti], u_res, u_inv_far);
-            }
+            // No bounded frustum (an emitter spanning most of the sky) or no
+            // mass in it: unoccluded is the right answer for a receiver that
+            // close to a light that big.
+            float vis = (fitted && m.y > 1e-12) ? clamp(m.x / m.y, 0.0, 1.0) : 1.0;
             direct += mag * vis;
             unshadowed += dot(mag, vec3(1.0));
         }
