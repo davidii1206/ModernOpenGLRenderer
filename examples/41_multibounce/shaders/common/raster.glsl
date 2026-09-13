@@ -46,6 +46,62 @@ vec3 g_P, g_T, g_B, g_N;      // the camera, set once per workgroup
 vec3 mbg_to_local(vec3 w) { return vec3(dot(w, g_T), dot(w, g_B), dot(w, g_N)); }
 vec3 mbg_to_world(vec3 l) { return g_T * l.x + g_B * l.y + g_N * l.z; }
 
+// --- Culling a hemisphere ----------------------------------------------------
+//
+// A LIGHT VIEW'S FRUSTUM DOES NOT TRANSFER. lv_cull tests seven half-spaces and
+// throws away almost everything, because the sun's cone is a degree wide. A
+// hemisphere is 2*pi steradians: the only hard constraint is the receiver's own
+// plane, and standing on Sponza's floor that keeps most of the building.
+//
+// So the hemisphere gets two weaker levers instead, and needs both:
+//
+//   A BITMASK, NOT A LIST. lv_cull compacts survivors into 256 slots, which is
+//   right when almost nothing survives and useless here, where almost
+//   everything does -- the list would overflow on every camera and fall back to
+//   walking the scene. One bit per cluster is 4098 bits for Sponza, so the
+//   whole answer is 512 bytes of shared memory and cannot overflow at all.
+//
+//   A DISTANCE BOUND PER TEXEL. The real lever. The texel loop keeps the
+//   nearest hit so far in a register, so a cluster whose closest point is
+//   already farther than that cannot win and its 64 triangles can be skipped
+//   for six operations. This is a BVH's early-out without the tree: the bound
+//   tightens as the texel finds nearer geometry, and in an interior the first
+//   wall it hits shuts out most of the building.
+#define MBG_CLUSTER_WORDS 256            // 8192 clusters = 524k triangles
+shared uint s_climask[MBG_CLUSTER_WORDS];
+shared uint s_cli_all;                   // 1 = mask unusable, walk everything
+
+void mbg_cull(uint tid, uint stride, uint cluster_count) {
+    // Nothing to gain on a scene with a handful of clusters, and the mask clear
+    // alone cost Cornell 30% of its sweep before this early-out: 256 words
+    // cleared per camera, 1.3 million cameras, to describe 32 triangles.
+    if (u_cull == 0u || cluster_count <= 8u ||
+        cluster_count > MBG_CLUSTER_WORDS * 32u) {
+        if (tid == 0u) s_cli_all = 1u;
+        barrier();
+        return;
+    }
+    if (tid == 0u) s_cli_all = 0u;
+    // Only the words this scene actually uses.
+    uint words = (cluster_count + 31u) >> 5u;
+    for (uint w = tid; w < words; w += stride) s_climask[w] = 0u;
+    barrier();
+    for (uint c = tid; c < cluster_count; c += stride) {
+        vec3 lo = clusters[c].lo.xyz - g_P;
+        vec3 hi = clusters[c].hi.xyz - g_P;
+        vec3 ctr = (lo + hi) * 0.5, e = (hi - lo) * 0.5;
+        // Entirely below the receiver's tangent plane: no direction of this
+        // hemisphere can reach it.
+        if (dot(g_N, ctr) + dot(abs(g_N), e) < 0.0) continue;
+        atomicOr(s_climask[c >> 5u], 1u << (c & 31u));
+    }
+    barrier();
+}
+
+bool mbg_cl_live(uint c) {
+    return s_cli_all != 0u || (s_climask[c >> 5u] & (1u << (c & 31u))) != 0u;
+}
+
 // --- The hemisphere, inverted ------------------------------------------------
 //
 // One texel per thread, each asking which triangle is nearest along its own
@@ -106,16 +162,54 @@ bool mbg_tri_hit(uint ti, vec3 d, out float dist) {
 }
 
 // Fill s_vis for this thread's texels. Replaces clear + rasterize + barrier.
-void mbg_resolve_vis(uint tid, uint stride, uint tri_count) {
+void mbg_resolve_vis(uint tid, uint stride, uint cluster_count, uint tri_count) {
     uint n = u_res * u_res;
+
+    // A scene small enough not to be culled does not want the cluster
+    // indirection either: one global read per texel to describe 32 triangles is
+    // 85 million reads across a Cornell sweep, and it cost 30% of it. The branch
+    // is workgroup uniform.
+    if (s_cli_all != 0u) {
+        for (uint i = tid; i < n; i += stride) {
+            vec3  d = mbg_to_world(mbg_px_to_dir(vec2(float(i % u_res),
+                                                      float(i / u_res)) + vec2(0.5), u_res));
+            uint  best = MBG_EMPTY;
+            float bestt = 1e30;
+            for (uint t = 0u; t < tri_count; ++t) {
+                float tt;
+                if (mbg_tri_hit(t, d, tt) && tt < bestt) { bestt = tt; best = t; }
+            }
+            s_vis[i] = best;
+        }
+        return;
+    }
+
     for (uint i = tid; i < n; i += stride) {
-        vec3 d = mbg_to_world(mbg_px_to_dir(vec2(float(i % u_res), float(i / u_res))
-                                            + vec2(0.5), u_res));
+        vec3  d = mbg_to_world(mbg_px_to_dir(vec2(float(i % u_res), float(i / u_res))
+                                             + vec2(0.5), u_res));
+        float len_d = length(d);
         uint  best = MBG_EMPTY;
-        float bestd = 1e30;
-        for (uint t = 0u; t < tri_count; ++t) {
-            float dist;
-            if (mbg_tri_hit(t, d, dist) && dist < bestd) { bestd = dist; best = t; }
+        // A real distance, not the ray parameter, so it can be compared against
+        // a cluster's. 1e18 rather than 1e30 because it gets squared below and
+        // 1e30 squared is not a float.
+        float bestdist = 1e18;
+
+        for (uint c = 0u; c < cluster_count; ++c) {
+            if (!mbg_cl_live(c)) continue;
+            // Closest point of the box to the receiver, componentwise: zero on
+            // any axis the receiver is already between lo and hi.
+            vec3 q = max(max(clusters[c].lo.xyz - g_P, vec3(0.0)),
+                         g_P - clusters[c].hi.xyz);
+            if (dot(q, q) > bestdist * bestdist) continue;   // cannot beat what we have
+
+            uint first = uint(clusters[c].lo.w);
+            uint last  = first + uint(clusters[c].hi.w);
+            for (uint t = first; t < last; ++t) {
+                float tt;
+                if (!mbg_tri_hit(t, d, tt)) continue;
+                float dist = tt * len_d;
+                if (dist < bestdist) { bestdist = dist; best = t; }
+            }
         }
         s_vis[i] = best;
     }

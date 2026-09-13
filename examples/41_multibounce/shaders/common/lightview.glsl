@@ -221,8 +221,6 @@ vec3 lv_px_to_dir(vec2 px, uint res) {
 //
 // This is why the inversion matters beyond its own speedup: the loop order it
 // produced is the one culling attaches to.
-uniform uint u_cull;          // 0 = walk every cluster, for ablation
-
 #define MBG_MAX_VIS_CLUSTERS 256
 shared uint s_cl[MBG_MAX_VIS_CLUSTERS];
 shared uint s_cl_n;

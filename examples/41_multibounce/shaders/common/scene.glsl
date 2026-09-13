@@ -62,6 +62,10 @@ struct MbgCluster {
     vec4 hi;               // w: how many
 };
 
+// 0 = walk every cluster, for ablation. Declared here because both
+// rasterizers cull and they are included in either order.
+uniform uint u_cull;
+
 layout(std430, binding = 0) readonly buffer MbgTris { MbgTri tris[]; };
 layout(std430, binding = 11) readonly buffer MbgClusters { MbgCluster clusters[]; };
 layout(std430, binding = 2) readonly buffer MbgQuad { vec4   quad[]; };
