@@ -26,6 +26,7 @@ layout(std430, binding = 5) readonly buffer MbgChildW { vec4 child_w[]; };
 layout(std430, binding = 6) readonly buffer MbgChildE { vec4 child_e[]; };
 layout(std430, binding = 10) readonly buffer MbgChildD { vec4 child_d[]; };
 layout(std430, binding = 9)  readonly buffer MbgDirect { vec4 direct_in[]; };
+layout(binding = 1, rgba32f) uniform writeonly image2D u_vis;
 
 layout(binding = 0, rgba32f) uniform image2D u_gi;
 
@@ -74,8 +75,15 @@ void main() {
         // irradiance[] either way, because the bounce transport above reads it.
         vec3 img = u_split != 0u ? max(E - direct_in[cam * 2u].xyz, vec3(0.0)) : E;
         uint pix = u_cursor + cam;
-        if (pix < uint(u_gi_size.x * u_gi_size.y))
-            imageStore(u_gi, ivec2(int(pix) % u_gi_size.x, int(pix) / u_gi_size.x),
-                       vec4(img, 1.0));
+        if (pix < uint(u_gi_size.x * u_gi_size.y)) {
+            ivec2 gp = ivec2(int(pix) % u_gi_size.x, int(pix) / u_gi_size.x);
+            imageStore(u_gi, gp, vec4(img, 1.0));
+            // The two visible fractions this camera already measured, kept apart
+            // for finding 18's reason and written out for direct_pixel.comp's
+            // mask to decide where a per-pixel light view is actually needed.
+            // w = 1 marks the cell as solved; the mask refuses to trust a zero.
+            imageStore(u_vis, gp, vec4(direct_in[cam * 2u + 0u].w,
+                                       direct_in[cam * 2u + 1u].w, 0.0, 1.0));
+        }
     }
 }

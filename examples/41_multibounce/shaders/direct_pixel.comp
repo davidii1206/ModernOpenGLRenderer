@@ -67,6 +67,7 @@ layout(binding = 1) uniform sampler2D u_normal;
 layout(binding = 3) uniform sampler2D u_depth;
 
 layout(binding = 1, rgba32f) uniform image2D u_target;   // full resolution, (E, 1)
+layout(binding = 2, rgba32f) uniform readonly image2D u_vis;  // GI grid, the two fractions
 
 uniform ivec2 u_size;
 uniform mat4  u_inv_view_proj;
@@ -77,8 +78,118 @@ uniform uint  u_two_sided;
 uniform float u_bias;
 uniform float u_emissive;
 uniform uint  u_cluster_count;
+uniform ivec2 u_gi_size;
+uniform uint  u_scale;
+uniform uint  u_mask;
+uniform float u_mask_eps_e;
+uniform float u_mask_eps_s;
+uniform float u_plane_tol;
 
 shared vec4 s_lvred[64];
+shared vec4 s_tap[4];        // per tap: (frac_e, frac_s, valid, bilinear weight)
+shared vec4 s_mval;          // (frac_e, frac_s, refine_e, refine_s)
+
+// --- Where a per-pixel light view is actually needed -------------------------
+//
+// THE GRID ALREADY KNOWS. Every secondary camera rasterizes its own hemisphere
+// and reports what fraction of each light it could see, and finding 18 already
+// keeps the emitter's fraction and the sun's apart. Across a 4x4 block that is
+// four samples of the same function this pass is about to spend 64 texels of
+// cone per pixel computing -- and where those four agree, there is no penumbra
+// crossing the block and nothing for the extra resolution to resolve. Most of
+// an interior is like that: fully lit, or fully shadowed, with a thin band
+// between. Only the band needs the light view.
+//
+// NOTHING IS INTERPOLATED. A block is skipped only when its four samples agree
+// that it is entirely lit or entirely in shadow, and then the fraction used is
+// exactly 1 or exactly 0 -- a value the light view would have returned too, not
+// a guess standing in for it. A block that agrees on some MIDDLE value is a
+// block inside a penumbra, and those are computed.
+//
+// That is the whole difference between this and an upsample. The cheap answer
+// is only taken where it is not an approximation at all; everything uncertain
+// pays full price. The magnitude is closed form either way --
+// mbg_emitter_unshadowed and mbg_sun_unshadowed read the receiver's own
+// position and normal -- so a skipped pixel keeps its exact per-pixel cosine
+// falloff and solid angle regardless.
+//
+// THE DECISION USES THE 2x2 THE VALUE COMES FROM, AND NO WIDER. A one-cell
+// dilation ring around it was tried first, as insurance against a seam where a
+// refined block meets an interpolated one, and it is a trap: four cells span 16
+// pixels at scale 4, and in an arcade that window almost always straddles a
+// shadow edge, so the range test failed everywhere and the mask skipped nothing
+// at all on Sponza. The seam it guarded against is bounded by eps anyway -- a
+// block is only skipped where the fraction varies by less than that, so the two
+// estimators cannot part by more than that across the boundary.
+//
+// THE THRESHOLD IS NEARLY INERT, which is what made the rule above cheap to
+// adopt. The grid's fraction comes off a cam_lv_res^2 light view, so it is
+// quantised to multiples of 1/64 and an epsilon below that quantum is
+// meaningless by construction. But 0.1 texel and 1 texel measured the same time
+// to 1% and the same wrong pixels on Sponza: the blocks that skip are already
+// the ones whose samples agree exactly, so refusing the partial ones costs
+// almost nothing. The epsilon survives only to absorb that quantisation.
+//
+// THE TEST IS NOT CONSERVATIVE, and no threshold fixes that. On Sponza 26 pixels
+// of 262144 lose part of a thin shadow, and they are not blocks where the taps
+// disagreed and the tolerance was too loose -- they are blocks where all four
+// taps agree exactly and the truth BETWEEN them differs, because the occluder
+// is narrow enough to fall entirely between grid receivers. Every sample says
+// lit, so there is nothing for an epsilon to catch. Only a denser grid or a
+// genuinely conservative test would see it.
+void mbg_mask(ivec2 p, uint tid, vec3 n0, vec3 x0) {
+    vec2  g  = (vec2(p) - vec2(float(u_scale) * 0.5)) / float(u_scale);
+    ivec2 g0 = ivec2(floor(g));
+    vec2  f  = g - vec2(g0);
+
+    if (tid < 4u) {
+        int i = int(tid & 1u), j = int(tid >> 1u);
+        ivec2 gi = g0 + ivec2(i, j);
+        vec4 tap = vec4(0.0);
+        if (all(greaterThanEqual(gi, ivec2(0))) && all(lessThan(gi, u_gi_size))) {
+            // The same taps, and the same rejection, the bilateral upsample
+            // uses -- so the mask agrees with the thing it is standing in for.
+            ivec2 sp = min(gi * int(u_scale) + int(u_scale) / 2, u_size - 1);
+            vec4 vg = imageLoad(u_vis, gi);
+            if (vg.w > 0.5 && texelFetch(u_albedo, sp, 0).a > 0.5) {
+                vec3  ns = normalize(texelFetch(u_normal, sp, 0).xyz);
+                float ds = texelFetch(u_depth, sp, 0).r;
+                vec3  xs = world_from_depth(ds, (vec2(sp) + 0.5) / vec2(u_size),
+                                            u_inv_view_proj);
+                float wn = max(dot(ns, n0), 0.0); wn *= wn; wn *= wn;
+                float wp = max(1.0 - abs(dot(xs - x0, n0)) / max(1e-5, u_plane_tol), 0.0);
+                if (wn * wp > 0.0) {
+                    tap = vec4(vg.x, vg.y, 1.0, 0.0);
+                }
+            }
+        }
+        s_tap[tid] = tap;                     // (frac_e, frac_s, valid, weight)
+    }
+    barrier();
+
+    if (tid == 0u) {
+        vec2 lo = vec2(1.0), hi = vec2(0.0);
+        bool usable = true;
+        for (uint k = 0u; k < 4u; ++k) {
+            vec4 t = s_tap[k];
+            // A rejected tap is a geometric edge in the block, so there is no
+            // agreement to read -- refine.
+            if (t.z < 0.5) { usable = false; continue; }
+            lo = min(lo, t.xy);
+            hi = max(hi, t.xy);
+        }
+        // Entirely lit, or entirely shadowed, by every sample. Anything else --
+        // disagreement, or agreement on a middle value -- is a penumbra and is
+        // computed rather than guessed.
+        bvec2 dark = lessThanEqual(hi, vec2(u_mask_eps_e, u_mask_eps_s));
+        bvec2 lit  = greaterThanEqual(lo, vec2(1.0) - vec2(u_mask_eps_e, u_mask_eps_s));
+        s_mval = vec4(lit.x ? 1.0 : 0.0,
+                      lit.y ? 1.0 : 0.0,
+                      (!usable || !(dark.x || lit.x)) ? 1.0 : 0.0,
+                      (!usable || !(dark.y || lit.y)) ? 1.0 : 0.0);
+    }
+    barrier();
+}
 
 void main() {
     uint pix = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
@@ -90,14 +201,34 @@ void main() {
 
     vec3  N = normalize(texelFetch(u_normal, p, 0).xyz);
     float d = texelFetch(u_depth, p, 0).r;
-    vec3  P = world_from_depth(d, (vec2(p) + 0.5) / vec2(u_size), u_inv_view_proj) +
-              N * u_bias;
+    vec3  x0 = world_from_depth(d, (vec2(p) + 0.5) / vec2(u_size), u_inv_view_proj);
+    vec3  P = x0 + N * u_bias;
+
+    // Ask the grid where the light view is worth running. Both answers are
+    // workgroup uniform, which is what lets the branches below skip the
+    // barriers inside the loops without splitting the workgroup.
+    bool refine_e = true, refine_s = true;
+    vec2 gfrac = vec2(0.0);
+    if (u_mask != 0u && u_scale > 1u) {
+        mbg_mask(p, tid, N, x0);
+        gfrac = s_mval.xy;
+        refine_e = s_mval.z > 0.5;
+        refine_s = s_mval.w > 0.5;
+    }
 
     vec3 E = vec3(0.0);
     lv_jit = vec2(0.0);          // emitter views: their frames already differ per receiver
 
+    // The cheap half: the magnitude is analytic, so a skipped pixel still gets
+    // its own cosine falloff and solid angle and only borrows the fraction.
+    if (!refine_e) {
+        for (uint e = 0u; e < u_emitters; ++e)
+            E += mbg_emitter_unshadowed(P, N, tris[emitters[e]], u_two_sided != 0u,
+                                        2.0 * u_bias, u_emissive) * gfrac.x;
+    }
+
     // Uniform loop bound, so the barriers inside it are safe.
-    for (uint e = 0u; e < u_emitters; ++e) {
+    for (uint e = 0u; refine_e && e < u_emitters; ++e) {
         uint ti = emitters[e];
         MbgTri tr = tris[ti];
 
@@ -154,7 +285,9 @@ void main() {
     // enough that the GI grid resolves it. The sun is the opposite -- one
     // direction, hard-edged -- which is why it is the half that moved here.
     vec3 sun_mag = mbg_sun_unshadowed(N);
-    if (dot(sun_mag, vec3(1.0)) > 0.0) {
+    if (dot(sun_mag, vec3(1.0)) > 0.0 && !refine_s) {
+        E += sun_mag * gfrac.y;
+    } else if (dot(sun_mag, vec3(1.0)) > 0.0) {
         // AN ORDERED DITHER, NOT A ROTATION AND NOT A HASH.
         //
         // lv_setup_dir builds its frame from the sun direction, which is the

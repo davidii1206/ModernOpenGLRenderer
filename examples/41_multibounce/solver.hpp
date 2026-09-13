@@ -150,6 +150,16 @@ struct SolveConfig {
     // One traversal per workgroup with several texels per thread, instead of
     // one traversal per texel. See mbg_resolve_vis_coop.
     bool      coop = true;
+    // Skip the per-pixel light view where the GI grid's own visible fractions
+    // already agree across the block, and take the fraction from them instead.
+    // See direct_pixel.comp. The thresholds are per light character, and the
+    // sun's is tighter because its penumbra is narrow.
+    bool      direct_mask = true;
+    // In TEXELS of the grid's own light view, not in absolute fraction: that
+    // view is cam_lv_res^2 texels, so its answer is quantised to 1/that, and a
+    // threshold below the quantum can never be met. See direct_pixel.comp.
+    float     mask_texels_e = 2.0f;
+    float     mask_texels_s = 1.0f;
     // Visit the coarse groups nearest-first, so the per-texel distance bound
     // tightens early instead of at whatever point the Morton order happens to
     // cross the receiver's end of the scene. See mbg_order_groups.
@@ -327,6 +337,11 @@ private:
 
     gl::Texture gi_{gl::TextureType::tex_2d};      // GI grid, RGBA32F, (E, 1)
     gl::Texture gi_tmp_{gl::TextureType::tex_2d};  // ping-pong for the denoise
+    // Per GI cell: (emitter visible fraction, sun visible fraction, 0, written).
+    // The grid already MEASURES both -- finding 18 keeps them apart because an
+    // emitter's penumbra is soft and a sun's is not -- so this texture only
+    // carries numbers that already existed. See direct_pixel.comp's mask.
+    gl::Texture vis_{gl::TextureType::tex_2d};
     // The denoised copy. SEPARATE FROM gi_ ON PURPOSE: the grid accumulates
     // across frames (a sweep is chunked), so a filter that wrote back into it
     // would re-filter every cell the chunk cursor is not currently rewriting,

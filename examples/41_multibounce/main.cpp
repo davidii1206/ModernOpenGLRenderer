@@ -70,6 +70,11 @@
 //   MBG_RR=0.15             Russian-roulette threshold on path throughput; 0 off
 //   MBG_IMPORTANCE=1        weight the continuation by the hit's radiance, not
 //                           by cos * solid angle * albedo alone
+//   MBG_DIRECT_MASK=1       skip the per-pixel light view where the GI grid's
+//                           own visible fractions already agree across the block
+//   MBG_MASK_TEXELS_E=2     how much the emitter fraction may vary and still
+//                           skip, in TEXELS of the grid's light view
+//   MBG_MASK_TEXELS_S=1     the same for the sun, tighter: its penumbra is narrow
 //   MBG_ORDER=1             visit the coarse groups nearest-first
 //   MBG_NEE=1               analytic direct term (doc section 3's separate pass)
 //   MBG_TENT=1              spread each texel's mass over the 4 nearest tiles
@@ -192,6 +197,9 @@ EnvOpts read_env() {
     if (const char* v = getenv("MBG_RR"))       o.cfg.rr = float(atof(v));
     if (const char* v = getenv("MBG_IMPORTANCE")) o.cfg.importance = atoi(v) != 0;
     if (const char* v = getenv("MBG_CULL"))     o.cfg.cull = atoi(v) != 0;
+    if (const char* v = getenv("MBG_DIRECT_MASK")) o.cfg.direct_mask = atoi(v) != 0;
+    if (const char* v = getenv("MBG_MASK_TEXELS_E")) o.cfg.mask_texels_e = float(atof(v));
+    if (const char* v = getenv("MBG_MASK_TEXELS_S")) o.cfg.mask_texels_s = float(atof(v));
     if (const char* v = getenv("MBG_ORDER"))    o.cfg.order = atoi(v) != 0;
     if (const char* v = getenv("MBG_COOP"))     o.cfg.coop = atoi(v) != 0;
     if (const char* v = getenv("MBG_SCALE"))    u32(v, o.cfg.scale);

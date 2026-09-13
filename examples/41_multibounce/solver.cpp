@@ -161,6 +161,7 @@ void Solver::configure(const SolveConfig& cfg_in, int fb_w, int fb_h) {
     make_image(gi_, gi_w_, gi_h_);
     make_image(gi_tmp_, gi_w_, gi_h_);
     make_image(gi_disp_, gi_w_, gi_h_);
+    make_image(vis_, gi_w_, gi_h_);
     make_image(full_, fb_w, fb_h);
     full_w_ = fb_w;
     full_h_ = fb_h;
@@ -177,6 +178,10 @@ void Solver::clear_image() {
     if (gi_.handle()) glClearTexImage(gi_.handle(), 0, GL_RGBA, GL_FLOAT, zero);
     if (gi_tmp_.handle()) glClearTexImage(gi_tmp_.handle(), 0, GL_RGBA, GL_FLOAT, zero);
     if (gi_disp_.handle()) glClearTexImage(gi_disp_.handle(), 0, GL_RGBA, GL_FLOAT, zero);
+    // Cleared to zero, and the w channel is the "this cell has been solved" flag,
+    // so every pixel refines until the sweep has actually reached its cell. The
+    // mask cannot skip work on data that does not exist yet.
+    if (vis_.handle()) glClearTexImage(vis_.handle(), 0, GL_RGBA, GL_FLOAT, zero);
     if (full_.handle()) glClearTexImage(full_.handle(), 0, GL_RGBA, GL_FLOAT, zero);
 }
 
@@ -316,6 +321,7 @@ void Solver::run_levels(uint32_t chunk, const Scene& scene, const SolveConfig& c
         irrad_[children ? l + 1 : l].bind_base(kBindChildE);
         direct_[children ? l + 1 : l].bind_base(kBindChildD);
         gi_.bind_image(0, 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA32F);
+        vis_.bind_image(1, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA32F);
         gather_.set("u_cam_count", counts[l]);
         gather_.set("u_children", children);
         gather_.set("u_write", write ? 1u : 0u);
@@ -411,7 +417,17 @@ void Solver::direct_pixel(const GBuffer& gb, const gfx::Camera& cam, const Scene
     direct_quad_.bind();
     gb.bind_textures();
     full_.bind_image(1, 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA32F);
+    vis_.bind_image(2, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA32F);
     direct_px_.set("u_size", glm::ivec2(gb.width, gb.height));
+    direct_px_.set("u_gi_size", glm::ivec2(gi_w_, gi_h_));
+    direct_px_.set("u_scale", std::max(1u, cfg.scale));
+    direct_px_.set("u_mask", cfg.direct_mask ? 1u : 0u);
+    // One texel of the GRID's light view (cam_lv_res), which is what produced
+    // the fractions -- not this pass's own u_lv_res, which is finer.
+    const float quantum = 1.0f / float(std::max(1u, cfg.cam_lv_res * cfg.cam_lv_res));
+    direct_px_.set("u_mask_eps_e", cfg.mask_texels_e * quantum);
+    direct_px_.set("u_mask_eps_s", cfg.mask_texels_s * quantum);
+    direct_px_.set("u_plane_tol", cfg.plane_tol);
     direct_px_.set("u_inv_view_proj", glm::inverse(cam.view_projection()));
     direct_px_.set("u_tri_count", scene.count());
     direct_px_.set("u_cluster_count", scene.cluster_count());

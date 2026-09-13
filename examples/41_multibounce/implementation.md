@@ -1616,6 +1616,95 @@ both candidates and counts a difference only when the depths actually differ.
 Without that it fails on Sponza and sends you hunting a bound bug that is not
 there.
 
+### 25. The grid already knows where the per-pixel direct term is needed
+
+The per-pixel light view is the most expensive pass in the renderer, and it runs
+for every lit pixel. But every secondary camera has ALREADY measured what
+fraction of each light it can see, and finding 18 already keeps the emitter's
+fraction and the sun's apart because their penumbrae have different characters.
+Across a 4x4 block those are four samples of the function this pass is about to
+spend 64 cone texels per pixel recomputing. Where all four agree that the block
+is entirely lit or entirely in shadow, there is no penumbra crossing it and
+nothing for the resolution to resolve.
+
+So gather writes the two fractions to a grid-sized texture and direct_pixel
+skips the light view where they agree. The data is free -- it already existed in
+`direct_out` -- and the only new plumbing is the texture.
+
+| Direct/px, 512x512 | mask off | mask on | | image cost |
+|---|---|---|---|---|
+| Cornell | 70.1 ms | **17.7 ms** | **3.95x** | 0 pixels differ |
+| Cornell+bunny, daylight | 1321.9 ms | **1021.6 ms** | **1.29x** | 10 of 262144 |
+| Sponza, sun only | 503.8 ms | **295.0 ms** | **1.70x** | 26 of 262144 |
+
+Cornell's RMSE against the direct reference is **0.0430 either way**, unchanged
+to four figures, and so is its MAE. The right-hand column counts pixels differing
+by more than 8/255 from the unmasked render.
+
+It pays where blocks are uniform over large areas and barely at all where a
+silhouette crosses most of them, which is the same shape as every other lever
+here. Cornell is a box and a panel light; the bunny puts a dense mesh in the
+middle of nearly every block.
+
+The Sponza figures are the DIRECT PASS ONLY and were taken with MBG_RES=8, a
+shrunken hemisphere, because a full-resolution sweep of that scene is minutes.
+That is sound for this measurement -- the fractions come off the light views, not
+the hemisphere quadrature, so neither the mask's input nor the term it is
+compared against changes -- but the indirect term in those images is not
+representative. Sponza also has no emitters, so its 1.70x exercises the sun path
+alone; the emitter path is only covered by the other two scenes.
+
+#### Certain, not interpolated
+
+The first version interpolated: where the four taps agreed within an epsilon, it
+took their bilinear blend. That is an upsample with extra steps, and it puts an
+approximation in the one pass whose whole purpose is to be sharper than the grid.
+
+The version that shipped skips only where the block is entirely lit or entirely
+shadowed, and then uses exactly 1 or exactly 0 -- a value the light view would
+itself have returned. Agreement on a MIDDLE value means the block is inside a
+penumbra, and those are computed. So the cheap path is not an approximation
+standing in for the answer; it is the answer, reached without the work.
+
+It cost nothing to tighten: 1.70x against the interpolating version's 1.71x on
+Sponza, and the same wrong pixels. The reason is the next section.
+
+#### The threshold is nearly inert, and that says where the error is
+
+The fraction comes off a cam_lv_res^2 light view, so it is quantised to
+multiples of 1/64, and an epsilon below that quantum is meaningless. But
+measuring 0.1 texel against 1 texel on Sponza gave the same time to 1% and the
+SAME 26 wrong pixels. The blocks that skip are the ones whose samples agree
+EXACTLY. Tolerating variation buys nothing, which is why refusing the partial
+blocks costs nothing either.
+
+It also locates the error. **26 pixels of 262144 lose part of a thin shadow**,
+and they are not blocks where the samples disagreed and the tolerance was too
+loose. They are blocks where all four agree on exactly 1.0 and the truth between
+them differs, because the occluder is narrow enough to fall entirely between
+grid receivers. Every sample says lit. There is nothing for an epsilon to catch,
+and **no threshold fixes it** -- only a denser grid or a genuinely conservative
+test would. That is the trade this pass makes, stated precisely rather than as a
+worry.
+
+#### Two ways to fail to measure this, both of which happened
+
+**A dilation ring that refuses to skip anything.** The decision started as a 4x4
+window around the 2x2, as insurance against a seam where a refined block meets a
+skipped one. Four cells span 16 pixels at scale 4, and in an arcade that window
+almost always straddles a shadow edge, so the range test failed everywhere and
+the mask skipped nothing at all on Sponza -- while Cornell, whose blocks are
+uniform over large areas, worked fine and made the feature look correct. The
+seam is bounded by the rule itself: a skipped block is entirely lit or entirely
+shadowed, so its neighbours cannot disagree by more than the epsilon.
+
+**A silent success.** The failure above produces no artifact and no wrong pixel.
+The renderer stays exactly correct and simply does all the work, so there is
+nothing to notice in an image and the timings look like ordinary noise. What
+gave it away was that mask-on and mask-off were BIT-IDENTICAL -- which is only
+evidence because an approximation is supposed to differ. When a cheap path
+reproduces the reference exactly, suspect that it never ran.
+
 ## What this does not answer
 
 - **§8.1, the reuse radius experiment.** The gate the doc puts before everything
