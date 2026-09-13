@@ -79,14 +79,19 @@ void main() {
         // Inactive slot (a background pixel, or a block that saw nothing). Its
         // outputs still have to be written: indices are fixed by the schedule,
         // so a skipped slot would be read as last chunk's data.
-        if (tid == 0u) { irradiance[cam] = vec4(0.0); direct_out[cam] = vec4(0.0); }
+        if (tid == 0u) {
+            irradiance[cam] = vec4(0.0);
+            direct_out[cam * 2u + 0u] = vec4(0.0);
+            direct_out[cam * 2u + 1u] = vec4(0.0);
+        }
         if (u_dump != 0u) {
             uint texels0 = u_res * u_res;
             for (uint i = tid; i < texels0; i += 64u) vis_out[cam * texels0 + i] = MBG_EMPTY;
         }
         for (uint b = tid; b < nblock; b += 64u) {
-            child_w[(cam * nblock + b) * 2u + 0u] = vec4(0.0);
-            child_w[(cam * nblock + b) * 2u + 1u] = vec4(0.0);
+            child_w[(cam * nblock + b) * 3u + 0u] = vec4(0.0);
+            child_w[(cam * nblock + b) * 3u + 1u] = vec4(0.0);
+            child_w[(cam * nblock + b) * 3u + 2u] = vec4(0.0);
             child_cam[cam * nblock + b].pos = vec4(0.0);
             child_cam[cam * nblock + b].nrm = vec4(0.0);
         }
@@ -168,8 +173,22 @@ void main() {
     // Both the shadowed and the unshadowed total are carried: their ratio is the
     // scalar this camera's PARENT needs to shade a whole tile of directions from
     // one gather -- see the mass accumulation below.
-    vec3  direct = vec3(0.0);
-    float unshadowed = 0.0;
+    //
+    // THE EMITTERS AND THE SUN GET SEPARATE RATIOS, AND THAT IS NOT TIDINESS.
+    // One blended fraction was fine while every light in the scene was a panel:
+    // an area light's visible fraction is a wide, smooth penumbra, so one sample
+    // of it stands in for a whole tile of directions, which is what finding 4's
+    // split was built on. A sun breaks that assumption -- a 1.2-degree disc is
+    // visible or it is not, with a penumbra a couple of centimetres wide -- and
+    // an energy-weighted blend of the two carries the sun's near-binary answer
+    // into the panel's smooth one, because the sun has the larger irradiance and
+    // therefore the larger weight. The panel's contribution to the ceiling, the
+    // largest and smoothest term in the room, then inherited the sun's variance
+    // and the a-trous denoise turned that into streaks (implementation.md,
+    // finding 17). Kept apart, each fraction multiplies only the mass whose
+    // visibility it actually describes.
+    vec3  direct_e = vec3(0.0), direct_s = vec3(0.0);
+    float unsh_e = 0.0, unsh_s = 0.0;
     for (uint e = 0u; e < u_emitters; ++e) {
         uint ti = emitters[e];
         vec3 mag = mbg_emitter_unshadowed(g_P, g_N, tris[ti], u_two_sided != 0u,
@@ -181,7 +200,7 @@ void main() {
         // second bounce, flipping as a tile's representative moves, is the
         // horizontal banding that the indirect term used to show. The fitted
         // view spends its texels on the light instead. See lightview.glsl.
-        bool fitted = lit && lv_setup(g_P, g_N, tris[ti]);
+        bool fitted = lit && lv_setup(g_P, g_N, tris[ti], 2.0 * u_bias);
 
         if (fitted) {
             for (uint i = tid; i < u_lv_res * u_lv_res; i += 64u) {
@@ -210,8 +229,8 @@ void main() {
             // mass in it: unoccluded is the right answer for a receiver that
             // close to a light that big.
             float vis = (fitted && m.y > 1e-12) ? clamp(m.x / m.y, 0.0, 1.0) : 1.0;
-            direct += mag * vis;
-            unshadowed += dot(mag, vec3(1.0));
+            direct_e += mag * vis;
+            unsh_e += dot(mag, vec3(1.0));
         }
         barrier();
     }
@@ -226,7 +245,12 @@ void main() {
     vec3 sun_mag = mbg_sun_unshadowed(g_N);
     if (dot(sun_mag, vec3(1.0)) > 0.0) {
         uint lvt = u_lv_res * u_lv_res;
-        lv_setup_dir(g_P, g_N, u_sun_dir, u_sun_tan_r, lv_near_for(u_inv_far));
+        lv_setup_dir(g_P, g_N, u_sun_dir, u_sun_tan_r, lv_near_for(u_inv_far),
+                     2.0 * u_bias);
+        // The sun's cone is the one sampling grid in this renderer that is not
+        // decorrelated for free -- see lv_spin. The salt keeps it independent of
+        // the hemisphere's own rotation, which is driven by the same position.
+        if (u_jitter != 0u) lv_spin(mbg_jitter_angle(c.pos.xyz, 0x9E3779B9u));
         for (uint i = tid; i < lvt; i += 64u) s_lv[i] = MBG_EMPTY;
         barrier();
         memoryBarrierShared();
@@ -243,11 +267,12 @@ void main() {
             barrier();
         }
         vec2 m = s_red2[0].xy;
-        direct += sun_mag * (m.y > 1e-12 ? clamp(m.x / m.y, 0.0, 1.0) : 1.0);
-        unshadowed += dot(sun_mag, vec3(1.0));
+        direct_s = sun_mag * (m.y > 1e-12 ? clamp(m.x / m.y, 0.0, 1.0) : 1.0);
+        unsh_s = dot(sun_mag, vec3(1.0));
         barrier();
     }
 
+    vec3 direct = direct_e + direct_s;
     if (tid == 0u) acc += direct;
 
     // Only `acc` is per-thread and needs reducing. `direct` and `unshadowed`
@@ -264,11 +289,18 @@ void main() {
     }
     if (tid == 0u) {
         irradiance[cam] = vec4(s_red[0].xyz, 1.0);
-        // (direct, visible fraction). The fraction is energy weighted over every
-        // emitter, so one number answers "how much of the direct light does this
-        // neighbourhood receive" even with several lights of different colours.
-        float vis = unshadowed > 1e-12 ? dot(direct, vec3(1.0)) / unshadowed : 0.0;
-        direct_out[cam] = vec4(direct, vis);
+        // Two records per camera:
+        //   [0]  (total direct irradiance, EMITTER visible fraction)
+        //   [1]  (the sun's share of it,   SUN visible fraction)
+        // The emitter fraction is still energy weighted across every emitter, so
+        // one number answers "how much of the panel light does this neighbourhood
+        // receive" even with several lights of different colours -- they all have
+        // the same soft-penumbra character. The sun does not, which is why it is
+        // the one light with a record of its own.
+        float vis_e = unsh_e > 1e-12 ? dot(direct_e, vec3(1.0)) / unsh_e : 0.0;
+        float vis_s = unsh_s > 1e-12 ? dot(direct_s, vec3(1.0)) / unsh_s : 0.0;
+        direct_out[cam * 2u + 0u] = vec4(direct, vis_e);
+        direct_out[cam * 2u + 1u] = vec4(direct_s, vis_s);
     }
 
     if (u_block == 0u) return;
@@ -349,7 +381,8 @@ void main() {
         // exactly: one texel per tile means the hit point IS the representative,
         // so M_dir * vis + M_ind * (E - direct) = w * albedo * E.
         vec3  wsum  = vec3(0.0);     // M_ind
-        vec3  wdir  = vec3(0.0);     // M_dir
+        vec3  wdir  = vec3(0.0);     // M_emit
+        vec3  wsun  = vec3(0.0);     // M_sun
         float bestd = 1e30;
         uint  besti = MBG_EMPTY;
         for (int yy = lo_y; yy <= hi_y; ++yy) {
@@ -380,9 +413,13 @@ void main() {
                 if (abs(hden) > 1e-12) {
                     vec3 hp = g_P + hdir * (dot(ht.n.xyz, ht.p0.xyz - g_P) / hden);
                     vec3 hn = hden < 0.0 ? ht.n.xyz : -ht.n.xyz;
-                    // The sun is analytic whether or not the emitter list is
-                    // in use, so it is part of M_dir even at MBG_NEE=0.
-                    vec3 e_dir = mbg_sun_unshadowed(hn);
+                    // One mass per visibility character: the emitters' smooth
+                    // penumbra and the sun's hard one are reconstructed by
+                    // different scalars at the gather, so they cannot be summed
+                    // here. The sun is analytic whether or not the emitter list
+                    // is in use, so it has a mass even at MBG_NEE=0.
+                    wsun += mass * mbg_sun_unshadowed(hn);
+                    vec3 e_dir = vec3(0.0);
                     for (uint em = 0u; em < u_emitters; ++em)
                         e_dir += mbg_emitter_unshadowed(hp, hn, tris[emitters[em]],
                                                         u_two_sided != 0u, 2.0 * u_bias,
@@ -417,8 +454,9 @@ void main() {
                 alive = 1.0;
             }
         }
-        child_w[slot * 2u + 0u] = vec4(alive != 0.0 ? wsum : vec3(0.0), alive);
-        child_w[slot * 2u + 1u] = vec4(alive != 0.0 ? wdir : vec3(0.0), 0.0);
+        child_w[slot * 3u + 0u] = vec4(alive != 0.0 ? wsum : vec3(0.0), alive);
+        child_w[slot * 3u + 1u] = vec4(alive != 0.0 ? wdir : vec3(0.0), 0.0);
+        child_w[slot * 3u + 2u] = vec4(alive != 0.0 ? wsun : vec3(0.0), 0.0);
         child_cam[slot].pos = vec4(hit, alive);
         child_cam[slot].nrm = vec4(hn, 0.0);
     }

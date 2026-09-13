@@ -3,12 +3,13 @@
 All at the reference camera (`MBG_GTCAM=1`, 512×512, pixel-aligned against the
 two path-traced PNGs one directory up), default configuration unless noted:
 3 camera levels, GI grid 128×128, targets 16/8/8, spawn tiles 4/4, analytic
-direct term with an 8×8 light view per pixel, jitter + a-trous denoise, Reinhard.
+direct term with an 8×8 light view per pixel, jitter + 2 a-trous iterations,
+Reinhard.
 
 | File | What | Compare against |
 |---|---|---|
-| `01_direct_1bounce.png` | `MBG_BOUNCES=1 MBG_SKY=0` — direct lighting only, no free parameters at all. RMSE 0.0431 | `../CornellBoxGroundTruthDirectLighting.png` |
-| `02_gi_3bounce.png` | `MBG_SKY=0.05` — the full solve. RMSE 0.0404 | `../CornellBoxOriginalGroundTruth.png` |
+| `01_direct_1bounce.png` | `MBG_BOUNCES=1 MBG_SKY=0` — direct lighting only, no free parameters at all. RMSE 0.0430 | `../CornellBoxGroundTruthDirectLighting.png` |
+| `02_gi_3bounce.png` | `MBG_SKY=0.05` — the full solve. RMSE 0.0408 | `../CornellBoxOriginalGroundTruth.png` |
 | `03_indirect_only_3bounce_4xexposure.png` | `MBG_INDIRECT_ONLY=1 MBG_EXPOSURE=4` — the bounce term with the direct term left out, exposed 4× so it is visible on its own | nothing; it is a diagnostic |
 | `04_diff_direct_vs_reference.png` | `MBG_VIEW=11`, 4× gain. Blue = agreement, warm = error | — |
 | `05_diff_gi_vs_reference.png` | the same for the full solve. The only warm region left is the emitter panel, which is the tone-curve gap of finding 10, not transport | — |

@@ -211,16 +211,23 @@ uint mbg_hash(uint x) {
 // The hash is over the receiver's POSITION rather than its index, so the
 // rotation does not change when the chunk scheduler assigns a camera to a
 // different slot; a sweep is reproducible bit for bit either way.
+// The rotation angle for a receiver at `pos`. `salt` separates independent
+// sampling grids belonging to the same receiver -- the hemisphere and the sun's
+// cone -- so that decorrelating one does not lock it to the other.
+float mbg_jitter_angle(vec3 pos, uint salt) {
+    uint seed = mbg_hash(salt ^ floatBitsToUint(pos.x) ^
+                mbg_hash(floatBitsToUint(pos.y) ^
+                mbg_hash(floatBitsToUint(pos.z))));
+    return float(seed) * (1.0 / 4294967296.0) * 6.28318530717959;
+}
+
 void mbg_set_receiver(vec3 pos, vec3 nrm, float bias, bool jitter) {
     g_N = normalize(nrm);
     mbg_onb(g_N, g_T, g_B);
     g_P = pos + g_N * bias;
 
     if (jitter) {
-        uint seed = mbg_hash(floatBitsToUint(pos.x) ^
-                    mbg_hash(floatBitsToUint(pos.y) ^
-                    mbg_hash(floatBitsToUint(pos.z))));
-        float a = float(seed) * (1.0 / 4294967296.0) * 6.28318530717959;
+        float a = mbg_jitter_angle(pos, 0u);
         float c = cos(a), sn = sin(a);
         vec3 t2 = g_T * c + g_B * sn;
         g_B = g_B * c - g_T * sn;

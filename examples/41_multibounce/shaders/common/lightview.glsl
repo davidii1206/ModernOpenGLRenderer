@@ -44,6 +44,9 @@ vec2 lv_lo, lv_span;                // the emitter's projected bounding box
 float lv_near;
 vec3 lv_N;                          // receiver normal, for culling
 float lv_wmax;                      // the emitter's far extent along lv_F
+// How close a triangle's PLANE has to pass to the receiver before "which side of
+// it am I on" stops being a meaningful question. See lv_fill.
+float lv_peps;
 
 vec3 lv_project(vec3 d) { return vec3(dot(d, lv_R), dot(d, lv_U), dot(d, lv_F)); }
 
@@ -66,9 +69,10 @@ int lv_clip_near(vec3 src[MBG_CLIP_MAX], int n, out vec3 dst[MBG_CLIP_MAX]) {
 
 // Aim the frustum at `tr` from `P` and fit it to the emitter. False when no
 // bounded frustum exists.
-bool lv_setup(vec3 P, vec3 N, MbgTri tr) {
+bool lv_setup(vec3 P, vec3 N, MbgTri tr, float plane_eps) {
     lv_P = P;
     lv_N = N;
+    lv_peps = plane_eps;
     vec3 c = (tr.p0.xyz + tr.p1.xyz + tr.p2.xyz) / 3.0 - P;
     float cl = length(c);
     if (cl < 1e-9) return false;
@@ -118,9 +122,11 @@ bool lv_setup(vec3 P, vec3 N, MbgTri tr) {
 // for the same reason lv_setup's does: a wall running past the receiver straddles
 // w = 0 and projects to infinity. The receiver's own triangle is removed earlier
 // and more cheaply, by lv_raster_tri's receiver-plane cull.
-void lv_setup_dir(vec3 P, vec3 N, vec3 dir, float tan_r, float near_d) {
+void lv_setup_dir(vec3 P, vec3 N, vec3 dir, float tan_r, float near_d,
+                  float plane_eps) {
     lv_P = P;
     lv_N = N;
+    lv_peps = plane_eps;
     lv_F = normalize(dir);
     lv_near = near_d;
 
@@ -137,6 +143,26 @@ void lv_setup_dir(vec3 P, vec3 N, vec3 dir, float tan_r, float near_d) {
 // the depth keys are already normalized by so that it needs no uniform of its
 // own. Four orders of magnitude below the scene is far inside the camera bias.
 float lv_near_for(float inv_far) { return 1e-4 / max(inv_far, 1e-30); }
+
+// Spin the texel grid about its own axis.
+//
+// A DIRECTIONAL light needs this and an emitter does not, which is not obvious
+// until it bites. lv_setup builds its frame from the direction to the emitter's
+// centroid, so every receiver gets a different frame for free and the texel
+// grid's quantization error is already decorrelated between neighbours. The sun
+// is the same direction everywhere, so lv_setup_dir hands every receiver in the
+// scene the IDENTICAL grid -- and an error that every receiver makes together is
+// not noise, it is a pattern, exactly as in raster.glsl's mbg_set_receiver.
+//
+// Correlated error also does not average down through the recursion, which is
+// why it stayed invisible for two bounces and then drew streaks across the
+// ceiling at three (implementation.md, finding 17).
+void lv_spin(float angle) {
+    float c = cos(angle), s = sin(angle);
+    vec3 r2 = lv_R * c + lv_U * s;
+    lv_U = lv_U * c - lv_R * s;
+    lv_R = r2;
+}
 
 vec2 lv_to_px(vec2 uv, uint res) { return (uv - lv_lo) / lv_span * float(res); }
 
@@ -206,7 +232,27 @@ void lv_fill(vec2 A, vec2 B, vec2 C, vec3 pn, float pc, uint ti, uint res,
             float den = dot(pn, d);
             if (abs(den) < 1e-20) continue;
             float t = pc / den;
-            if (t <= 0.0) continue;
+            if (t <= 0.0) {
+                // A LIGHT LEAK AT EVERY CONCAVE CREASE.
+                //
+                // t <= 0 means the plane is behind the receiver, so the texel is
+                // dropped. But a receiver in a corner sits ON the adjacent wall's
+                // plane: pc is the distance to it, which is zero in exact
+                // arithmetic and a few times 1e-6 of float noise in practice, so
+                // its SIGN is decided by rounding. Half the time the wall the
+                // receiver is touching is declared to be behind it and stops
+                // occluding -- and then the sun, whose whole hemisphere on that
+                // side is wall, comes through at full strength in a single pixel.
+                // That is the white speckle that used to run down the red wall's
+                // back corner.
+                //
+                // Coverage is the geometric truth here and the sign is not, so a
+                // plane passing within the receiver's own placement tolerance is
+                // treated as what it is: an occluder at zero distance, nearest
+                // possible. Anything genuinely behind still goes.
+                if (abs(pc) > lv_peps) continue;
+                t = 0.0;
+            }
             uint key = mbg_pack_key(t * length(d), inv_far, ti);
             uint idx = uint(y) * res + uint(x);
             if (emit_pass) atomicMin(s_lv_e[idx], key);
@@ -235,6 +281,50 @@ void lv_raster_tri(uint ti, uint res, float inv_far, bool emit_pass) {
 
     vec3 pn = tr.n.xyz;
     float pc = dot(pn, v[0]);
+
+    // THE RECEIVER IS ON THIS TRIANGLE'S PLANE, AND PROJECTION CANNOT SETTLE IT.
+    //
+    // A shading point in a concave corner lies on the adjacent wall as well as on
+    // its own, and the position it lies on that wall is decided by a depth
+    // reconstruction: the pixel's depth, unprojected, plus a bias along the
+    // pixel's own normal, which for a perpendicular wall moves it not at all. At
+    // the one-pixel-wide column where the G-buffer flips from one wall to the
+    // other, that reconstruction can land a few microns OUTSIDE the room -- and
+    // from outside, the wall is behind the receiver, its projection misses the
+    // frustum entirely, and the sun shines straight through. Three pixels down
+    // the red wall's back corner, at full sun, in an image where everything
+    // around them is in shadow.
+    //
+    // No amount of care in the rasterizer fixes that, because given the position
+    // it was handed the rasterizer is right. What is wrong is the position, and
+    // the robust statement is about the PLANE rather than about the projection:
+    // a receiver within its own placement tolerance of a triangle's plane is on
+    // that surface, and everything on the far side of it is inside the material.
+    // So that half-space is marked occluded directly, at distance zero.
+    //
+    // The bounding-box test is what keeps this from being a licence to block:
+    // "the plane passes near the receiver" is satisfied by any distant triangle
+    // whose plane happens to sweep past, and only a triangle whose own extent
+    // also contains the receiver is actually the surface it is standing on. The
+    // receiver's own triangle never reaches here -- the plane cull above removes
+    // it -- and if it did, the half-space it would mark is the one below the
+    // horizon, which every consumer already discards.
+    //
+    // Only on the scene pass: the emitter pass rasterizes one triangle to find
+    // where the light reaches, and a coplanar emitter contributes nothing at all
+    // (common/emitter.glsl rejects it before any of this runs).
+    if (!emit_pass && abs(pc) <= lv_peps) {
+        vec3 lo = min(v[0], min(v[1], v[2])) - vec3(lv_peps);
+        vec3 hi = max(v[0], max(v[1], v[2])) + vec3(lv_peps);
+        if (all(lessThanEqual(lo, vec3(0.0))) && all(greaterThanEqual(hi, vec3(0.0)))) {
+            uint key = mbg_pack_key(0.0, inv_far, ti);
+            for (uint i = 0u; i < res * res; ++i) {
+                vec3 d = lv_px_to_dir(vec2(float(i % res), float(i / res)) + vec2(0.5), res);
+                if (dot(pn, d) < 0.0) atomicMin(s_lv[i], key);
+            }
+            return;
+        }
+    }
 
     int n = lv_clip_near(v, 3, cp);
     if (n < 3) return;

@@ -44,18 +44,27 @@ void main() {
     vec3 E = irradiance[cam].xyz;
     for (uint b = 0u; b < u_children; ++b) {
         uint slot = cam * u_children + b;
-        vec4 m_ind = child_w[slot * 2u + 0u];
+        vec4 m_ind = child_w[slot * 3u + 0u];
         if (m_ind.w == 0.0) continue;
-        vec4 m_dir = child_w[slot * 2u + 1u];
-        vec4 d = child_d[slot];              // (direct irradiance, visible fraction)
+        vec4 m_emit = child_w[slot * 3u + 1u];
+        vec4 m_sun  = child_w[slot * 3u + 2u];
+        vec4 d0 = child_d[slot * 2u + 0u];   // (total direct, emitter fraction)
+        vec4 d1 = child_d[slot * 2u + 1u];   // (the sun's share, sun fraction)
 
         // The direct half is reconstructed per texel by the parent and only
         // SCALED by what this child measured about visibility; the indirect half
         // is the child's irradiance with its own direct term removed, which is
         // the smooth part that a tile can legitimately stand in for. See the
         // mass accumulation in raster.comp.
-        vec3 rest = max(child_e[slot].xyz - d.xyz, vec3(0.0));
-        E += (m_ind.xyz * rest + m_dir.xyz * d.w) * 0.31830988618379;
+        //
+        // ONE SCALE FACTOR PER LIGHT CHARACTER. An emitter's visible fraction is
+        // a wide soft penumbra and survives being sampled once per tile; the
+        // sun's is 0 or 1 across a couple of centimetres and does not. Blending
+        // them into a single fraction let the sun's variance into the panel's
+        // term, which is most of the light in the room -- see raster.comp.
+        vec3 rest = max(child_e[slot].xyz - d0.xyz, vec3(0.0));
+        E += (m_ind.xyz * rest + m_emit.xyz * d0.w + m_sun.xyz * d1.w)
+             * 0.31830988618379;
     }
     irradiance[cam] = vec4(E, 1.0);
 
@@ -63,7 +72,7 @@ void main() {
         // The residual, not the total, when the image's direct term is coming
         // from direct_pixel.comp. The camera's own direct term stays in
         // irradiance[] either way, because the bounce transport above reads it.
-        vec3 img = u_split != 0u ? max(E - direct_in[cam].xyz, vec3(0.0)) : E;
+        vec3 img = u_split != 0u ? max(E - direct_in[cam * 2u].xyz, vec3(0.0)) : E;
         uint pix = u_cursor + cam;
         if (pix < uint(u_gi_size.x * u_gi_size.y))
             imageStore(u_gi, ivec2(int(pix) % u_gi_size.x, int(pix) / u_gi_size.x),

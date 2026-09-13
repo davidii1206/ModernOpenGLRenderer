@@ -115,7 +115,15 @@ struct SolveConfig {
     // A-trous iterations over the GI grid, and taps per side. Removes what the
     // jitter turned into noise; safe only because the grid carries the indirect
     // residual alone. 0 disables.
-    uint32_t  filter_iters = 3;
+    //
+    // 2, not 3, on measurement. Iteration 3 has a tap spacing of 4 cells and so
+    // reaches 8 cells out -- a third of the way across the ceiling, which is only
+    // about 23 grid rows tall at this scale because it is seen nearly edge on.
+    // At that reach the filter is no longer averaging neighbours that share a
+    // neighbourhood, and what it produces is row structure: with the sun on, the
+    // ceiling's high-pass noise goes from isotropic at 2 iterations (row/col
+    // 1.11) to plainly horizontal at 3 (1.62), for 0.0005 of RMSE.
+    uint32_t  filter_iters = 2;
     int32_t   filter_radius = 2;
     // Spread each texel's albedo mass across the four nearest spawn tiles
     // instead of assigning it to one. Removes the tile discontinuity; costs a
@@ -243,6 +251,14 @@ private:
 
     gl::Texture gi_{gl::TextureType::tex_2d};      // GI grid, RGBA32F, (E, 1)
     gl::Texture gi_tmp_{gl::TextureType::tex_2d};  // ping-pong for the denoise
+    // The denoised copy. SEPARATE FROM gi_ ON PURPOSE: the grid accumulates
+    // across frames (a sweep is chunked), so a filter that wrote back into it
+    // would re-filter every cell the chunk cursor is not currently rewriting,
+    // once per frame, forever. That is not "3 a-trous iterations", it is an
+    // unbounded number of them -- and what survives unbounded a-trous is
+    // whatever its dilated passes cannot attenuate, which is the grid's own
+    // Nyquist. See implementation.md, finding 17.
+    gl::Texture gi_disp_{gl::TextureType::tex_2d};
     gl::Texture full_{gl::TextureType::tex_2d};    // framebuffer resolution
     int gi_w_ = 0, gi_h_ = 0, full_w_ = 0, full_h_ = 0;
 

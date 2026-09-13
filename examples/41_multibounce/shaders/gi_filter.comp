@@ -20,6 +20,46 @@ layout(local_size_x = 8, local_size_y = 8) in;
 // neighbour's normal agreement and its distance from this receiver's tangent
 // plane, which is what stops it averaging across a corner or a silhouette.
 //
+// THE TAP WEIGHTS ARE BINOMIAL AND THAT IS NOT COSMETIC. An a-trous iteration
+// with spacing 2^k samples every 2^k-th cell, so it has UNITY GAIN at every
+// frequency that aliases onto DC at that spacing -- starting with the grid's own
+// Nyquist, period 2 cells. The construction only works if each iteration
+// annihilates the frequencies the next, more dilated one will alias; that is the
+// entire reason the literature's kernel is the B3 spline (1,4,6,4,1)/16, whose
+// response is exactly zero at Nyquist.
+//
+// This pass used to weight its taps 1/(1 + dx^2 + dy^2), described in the comment
+// it replaced as "B3-spline-ish". It is not: along one axis that is
+// (0.2, 0.5, 1, 0.5, 0.2), which passes 17% of Nyquist instead of 0%, and the
+// dilated iterations then pass 100% of it. So every iteration after the first
+// attenuated the smooth part of the signal and left the period-2 part alone,
+// which is amplification in everything but name -- measurably so: on the ceiling
+// at three bounces, one iteration gave a row-noise sigma of 0.09, three gave
+// 0.22 and five gave 0.71, with a spectral peak sitting exactly on two grid
+// cells. That is the horizontal streaking (implementation.md, finding 17).
+//
+// C(2R, R+d) generalizes the B3 spline to any radius -- it IS (1,4,6,4,1) at
+// R=2 -- and its response is cos^2R(w/2), identically zero at Nyquist for every
+// R. Separable, because the null has to hold along each axis independently.
+//
+// AND THE KERNEL HAS TO STAY WHOLE, which is the other half of the same problem.
+// The usual edge-aware formulation drops a rejected tap and renormalizes by the
+// weights that are left -- and a truncated binomial is not a binomial, so its
+// null is gone. On the ceiling that matters constantly: it is a thin band in
+// screen space, the dilated iterations reach +-8 cells, and taps that far out
+// land on the back wall, on a side wall or on the sky. So the null broke exactly
+// where the artifact was, some Nyquist leaked, and the next iteration passed it
+// at unity gain.
+//
+// Instead, a rejected tap is replaced by THE CENTRE'S OWN VALUE rather than
+// removed: the kernel is always the full binomial, the normalization is always
+// its full sum, and the null holds everywhere. It is also the right answer on
+// its own terms -- a tap the edge test rejects carries no information about this
+// receiver, and the least-biased thing to put there is what this receiver
+// already has. Nothing leaks across the edge, because nothing from the far side
+// is read. The cost is that a cell near a boundary is smoothed less than one in
+// the middle of a surface, which is honest: there are fewer samples there.
+//
 // This is example 40's surfel_filter.comp with its object-space cache swapped
 // for a screen-space grid, and it inherits the drawback 40 names: a filter width
 // in pixels is a different width in world units at different depths, so a
@@ -47,6 +87,14 @@ uniform float u_plane_tol;    // world units
 // The full-resolution G-buffer pixel a GI cell was sampled at -- the same
 // mapping place.comp uses, so the filter tests the receivers the solve actually
 // placed rather than an interpolation of them.
+// C(2R, R+d), built multiplicatively. R is 1..4 here, so this is exact in float.
+float gi_tap_weight(int d, int R) {
+    int k = R + d;
+    float c = 1.0;
+    for (int i = 0; i < k; ++i) c = c * float(2 * R - i) / float(i + 1);
+    return c;
+}
+
 ivec2 gi_to_pixel(ivec2 g) {
     return min(g * int(u_scale) + int(u_scale) / 2, u_size - 1);
 }
@@ -67,29 +115,35 @@ void main() {
     vec3 p0, n0;
     if (!gi_receiver(g, p0, n0)) { imageStore(u_dst, g, imageLoad(u_src, g)); return; }
 
+    vec3  c0  = imageLoad(u_src, g).rgb;
     vec3  acc = vec3(0.0);
     float wsum = 0.0;
     for (int dy = -u_radius; dy <= u_radius; ++dy) {
+        float wy = gi_tap_weight(dy, u_radius);
         for (int dx = -u_radius; dx <= u_radius; ++dx) {
+            // The tap weight is unconditional: every position in the kernel
+            // contributes, so the kernel stays binomial and so does its null.
+            float wk = wy * gi_tap_weight(dx, u_radius);
+            wsum += wk;
+
+            // How much of this tap is usable. 0 means "no information here",
+            // and what goes in its place is this receiver's own value.
             ivec2 q = g + ivec2(dx, dy) * u_stride;
-            if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, u_gi_size))) continue;
-
-            vec3 p1, n1;
-            if (!gi_receiver(q, p1, n1)) continue;
-
-            float wn = max(dot(n0, n1), 0.0);
-            wn *= wn; wn *= wn;                                    // ^4
-            float wp = max(1.0 - abs(dot(p1 - p0, n0)) / u_plane_tol, 0.0);
-            // A small B3-spline-ish falloff so the taps nearest the centre count
-            // most; with a-trous the far taps are already sparse.
-            float wd = 1.0 / (1.0 + float(dx * dx + dy * dy));
-            float w = wn * wp * wd;
-            if (w <= 0.0) continue;
-
-            acc += imageLoad(u_src, q).rgb * w;
-            wsum += w;
+            float conf = 0.0;
+            vec3  val = c0;
+            if (all(greaterThanEqual(q, ivec2(0))) && all(lessThan(q, u_gi_size))) {
+                vec3 p1, n1;
+                if (gi_receiver(q, p1, n1)) {
+                    float wn = max(dot(n0, n1), 0.0);
+                    wn *= wn; wn *= wn;                            // ^4
+                    float wp = max(1.0 - abs(dot(p1 - p0, n0)) / u_plane_tol, 0.0);
+                    conf = wn * wp;
+                    if (conf > 0.0) val = mix(c0, imageLoad(u_src, q).rgb, conf);
+                }
+            }
+            acc += val * wk;
         }
     }
 
-    imageStore(u_dst, g, wsum > 1e-8 ? vec4(acc / wsum, 1.0) : imageLoad(u_src, g));
+    imageStore(u_dst, g, vec4(acc / wsum, 1.0));
 }

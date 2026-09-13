@@ -89,7 +89,7 @@ void main() {
         // scale -- an emitter below the horizon or turned away.
         vec3 mag = mbg_emitter_unshadowed(P, N, tr, u_two_sided != 0u, 2.0 * u_bias,
                                           u_emissive);
-        bool lit = dot(mag, vec3(1.0)) > 0.0 && lv_setup(P, N, tr);
+        bool lit = dot(mag, vec3(1.0)) > 0.0 && lv_setup(P, N, tr, 2.0 * u_bias);
 
         if (lit) {
             for (uint i = tid; i < texels; i += 64u) {
@@ -145,7 +145,14 @@ void main() {
     // direction, hard-edged -- which is why it is the half that moved here.
     vec3 sun_mag = mbg_sun_unshadowed(N);
     if (dot(sun_mag, vec3(1.0)) > 0.0) {
-        lv_setup_dir(P, N, u_sun_dir, u_sun_tan_r, lv_near_for(u_inv_far));
+        // Deliberately NOT spun per receiver, unlike the secondary cameras'.
+        // Nothing averages this pass: its output is the image's sharpest term
+        // and goes straight to the screen. An unrotated grid gives a penumbra
+        // that ramps smoothly as the receiver moves across it, which is what a
+        // shadow edge should look like; a rotated one would trade that ramp for
+        // per-pixel grain with no filter downstream to take it back out.
+        lv_setup_dir(P, N, u_sun_dir, u_sun_tan_r, lv_near_for(u_inv_far),
+                     2.0 * u_bias);
         for (uint i = tid; i < texels; i += 64u) s_lv[i] = MBG_EMPTY;
         barrier();
         memoryBarrierShared();

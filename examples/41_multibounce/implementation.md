@@ -40,7 +40,7 @@ reload sees it.
 | `MBG_BUDGET=n` | level-1 cameras per frame. The sweep is split into `ceil(pixels/budget)` chunks; the budget is clamped down if the camera tree would exceed 512 MB |
 | `MBG_RES=n` / `MBG_RES2/3/4=n` | hemi-octahedral target edge per level, 2–32 (defaults 16/8/8/8) |
 | `MBG_JITTER=0\|1` | rotate each receiver's tangent frame by a hash of its position (default 1). **Load-bearing**; see finding 14 |
-| `MBG_FILTER=n` / `MBG_FILTER_R=n` | a-trous denoise iterations over the GI grid and taps per side (default 3, 2) |
+| `MBG_FILTER=n` / `MBG_FILTER_R=n` | a-trous denoise iterations over the GI grid and taps per side (default 2, 2); see finding 17 |
 | `MBG_LV_RES=n` | edge of the secondary cameras' light view (default 8) |
 | `MBG_INDIRECT_ONLY=1` | composite the bounce term alone, for inspecting it |
 | `MBG_BLOCK=n` / `MBG_BLOCK2/3=n` | spawn tile edge in texels. **1 spawns a child per texel — the unabridged recursion** |
@@ -227,12 +227,18 @@ no environment.
 
 | | RMSE | roughness vs reference | cameras/sweep | sweep |
 |---|---|---|---|---|
-| 1 bounce vs the direct reference | **0.0431** | 0.91× | 1.6e4 + 262k direct | 0.7 s + 6.8 s direct |
-| 3 bounces vs the full-GI reference (sky 0.05) | **0.0404** | 0.81× | 1.3e6 + 262k direct | 48 s + 7.0 s direct |
+| 1 bounce vs the direct reference | **0.0430** | 0.91× | 1.6e4 + 262k direct | 0.7 s + 7.5 s direct |
+| 3 bounces vs the full-GI reference (sky 0.05) | **0.0408** | 0.68× | 1.3e6 + 262k direct | 50 s + 7.5 s direct |
 
 Both moved with finding 16 (the light view now clips to its own frustum): the
 full-GI number was **0.0532** before it and the per-frame direct pass was
 **15.6 s**. Every table below this one that predates it is marked.
+
+The roughness column reads 0.68× at three bounces, i.e. this image is noticeably
+SMOOTHER than the path-traced reference. That is the denoise, and it is the
+honest cost of it — the reference's column is its own Monte Carlo noise floor,
+which a filtered estimate has no reason to reproduce. Finding 17 is about the
+case where the same filter stopped being honest.
 
 ### Where the time goes
 
@@ -245,8 +251,8 @@ numbers**; the camera and texel counts are what scale.
 | indirect, 1 bounce | 0.55 s | 1.6e4 cameras, 4.2e6 texels |
 | indirect, 2 bounces | 8.0 s | 2.8e5 cameras, 2.1e7 texels |
 | **indirect, 3 bounces** | **37 s** | 1.3e6 cameras, 8.8e7 texels, 4.2e7 triangle-rasters |
-| direct, per frame | 7.0 s | 262k fitted light views |
-| direct, per frame, **with the sun** | 8.0 s | + 262k cone views, one rasterization each |
+| direct, per frame | 7.5 s | 262k fitted light views |
+| direct, per frame, **with the sun** | 8.4 s | + 262k cone views, one rasterization each |
 | everything else per frame | 13 ms | G-buffer, denoise, upsample, display |
 
 The sun costs **15%** of the per-pixel direct pass, for one more light view per
@@ -895,6 +901,140 @@ anything wrong. The 31 gates did not catch it either: every one of them is eithe
 unoccluded or fully occluded, and a fractional penumbra error has nowhere to show
 up in a binary answer. What caught it was a light small enough to make the same
 mistake three orders of magnitude bigger.
+
+### 17. The denoise was amplifying exactly what it was supposed to remove
+
+Reported as "horizontal light streaks on the ceiling", and it was four separate
+bugs in `gi_filter.comp` stacking up. None of them was visible before there was a
+sun, because none of them creates noise — they all mishandle noise, and the
+emitter alone did not produce enough to notice.
+
+The signature that identified it: the ceiling's high-pass noise was strongly
+**row-correlated** (row-mean σ 0.26 against a column-mean σ 0.13) with a spectral
+peak sitting on exactly **two grid cells**, and it got *worse* with more
+iterations — 0.09 at one, 0.22 at three, 0.71 at five. A denoiser whose output
+degrades monotonically in its own iteration count is not tuned wrong, it is
+wrong.
+
+Two cells is the grid's Nyquist, and that is the tell. An a-trous iteration with
+tap spacing 2^k samples every 2^k-th cell, so it has **unity gain** at the
+frequencies that alias onto DC at that spacing — Nyquist first among them. The
+construction only works if each iteration annihilates what the next, more dilated
+one will alias. That is the entire reason the literature's kernel is the B3
+spline (1,4,6,4,1)/16, whose response is exactly zero there.
+
+1. **The kernel was not a B3 spline.** It was `1/(1 + dx² + dy²)`, which the
+   comment beside it called "B3-spline-ish". Along one axis that is
+   (0.2, 0.5, 1, 0.5, 0.2): it passes **17%** of Nyquist, and the dilated
+   iterations then pass 100% of it. Replaced with C(2R, R+d) — which *is*
+   (1,4,6,4,1) at R=2 and generalizes to any radius, with response cos^2R(ω/2),
+   identically zero at Nyquist. Separable, because the null has to hold per axis.
+2. **The kernel was truncated at every edge.** A rejected tap was dropped and the
+   weights renormalized, and a truncated binomial is not a binomial, so the null
+   went away exactly where the artifact was: the ceiling is a thin band in screen
+   space, the dilated iterations reach ±8 cells, and taps that far out land on
+   the back wall or the sky. Now a rejected tap is replaced by **the centre's own
+   value**: the kernel is always whole, the null always holds, and nothing leaks
+   across the edge because nothing from the far side is read.
+3. **The filter wrote back into the grid it was filtering.** The GI image
+   accumulates across frames — a sweep is chunked — so in interactive use every
+   cell the chunk cursor was not currently rewriting got re-filtered once per
+   frame, forever. That is not "3 iterations", it is an unbounded number of them,
+   converging on the filter's own fixed point, which is precisely the content its
+   dilated passes cannot attenuate. `gi_disp_` now holds the denoised copy and
+   `gi_` keeps the raw solve. (This one is invisible to `MBG_SOLVE`/`MBG_BENCH`,
+   which filter once — it only bites the live view, which is where it was seen.)
+4. **Three iterations was one too many.** With the kernel fixed, the third
+   iteration's tap spacing of 4 still reaches 8 cells, a third of the way across
+   a ceiling that is ~23 grid rows tall because it is seen nearly edge on. At
+   that reach it is no longer averaging neighbours that share a neighbourhood:
+
+   | iterations | ceiling row σ | col σ | row/col | full-GI RMSE |
+   |---|---|---|---|---|
+   | 3 | 0.174 | 0.107 | 1.62 | 0.0403 |
+   | **2** | **0.125** | 0.113 | **1.11** | 0.0408 |
+
+   Isotropic instead of plainly horizontal, for 0.0005 of RMSE. The default is
+   now 2.
+
+After all four, with the sun on, the ceiling's row σ is **0.119 against a column
+σ of 0.279** — the anisotropy is not reduced, it is reversed, which is what
+"there is no horizontal structure left" looks like in this measurement.
+
+### 18. One visible fraction cannot serve two lights of different size
+
+The other half of the same report, and a genuine transport error rather than a
+filtering one.
+
+Finding 4 split the spawn tile's mass in two so that the fast-varying factor
+(the geometric falloff) was reconstructed per texel and only the slow one (the
+visible fraction) was clustered. That rests on an assumption nobody wrote down
+because nothing violated it: **an area light's visible fraction is slow.**
+Cornell's panel subtends thirty degrees, its penumbrae are tens of centimetres
+wide, and one sample of that per tile is fine.
+
+A sun is not slow. A 1.2° disc is visible or it is not, across a couple of
+centimetres. And the child reported a single fraction, energy weighted across
+every light — so with the sun carrying the larger irradiance and therefore the
+larger weight, **the panel's smooth contribution was being multiplied by the
+sun's near-binary answer.** The panel bouncing off the floor is most of the light
+on the ceiling, so most of the light on the ceiling inherited the sun's variance,
+and finding 17's filter turned that into the streaks.
+
+The fix is finding 4's own logic applied one level further in: one mass per
+visibility *character*, not one per light and not one for all of them.
+
+| | mass at the parent | scaled by |
+|---|---|---|
+| `M_ind` | albedo × solid angle | the child's indirect remainder |
+| `M_emit` | unshadowed **emitter** irradiance at each texel's hit point | the child's emitter fraction |
+| `M_sun` | unshadowed **sun** irradiance at each texel's hit point | the child's sun fraction |
+
+Costs one more `vec4` per child and one more per camera (`kWeightBytes` 32→48,
+`kDirectBytes` 16→32) and nothing in time. Every emitter still shares one
+fraction: they all have the same soft-penumbra character, which is the property
+the clustering actually depends on. The sun is the one light with a record of its
+own because it is the one light that does not.
+
+What this does **not** fix is the sun term's own variance — `M_sun` is still
+scaled by one sample of a binary function per tile. Measured: quadrupling the
+level-1 children (`MBG_BLOCK=2`, 4× the cost) moves the unfiltered ceiling noise
+only 2.9 → 2.2, so the remaining variance is spread down the whole recursion
+rather than concentrated at the top, and buying it off with more children is not
+the lever. The lever that would work is a sun visibility evaluated per texel
+instead of per tile, which needs something the parent does not have.
+
+### 19. A receiver in a concave corner can be outside the room
+
+The second artifact in the same report: a handful of white pixels running down
+the red wall's back corner, at full sun, in a column where everything around
+them is in shadow. Three of them in the 512² frame — and they were the sun's,
+not the panel's: the indirect-only render had none.
+
+A shading point in a corner lies on the adjacent wall as well as on its own, and
+*where* it lies on that wall is decided by a depth reconstruction: the pixel's
+depth, unprojected, plus a bias along the pixel's own normal — which for a
+perpendicular wall moves it not at all. At the one-pixel column where the
+G-buffer flips from one wall to the other, that reconstruction can land a few
+microns **outside the room**. From outside, the wall is behind the receiver, its
+projection misses the light view entirely, and the sun shines straight through.
+
+The rasterizer is not wrong here; given the position it was handed it is right.
+The position is wrong, and no amount of care in the projection fixes it — which
+is why the first attempt (relaxing `lv_fill`'s `t <= 0` rejection when the plane
+passes within the receiver's own placement tolerance) changed nothing. When the
+receiver is outside, the wall does not project into the cone *at all*.
+
+So the robust statement has to be about the plane rather than the projection: a
+receiver within its placement tolerance of a triangle's plane is on that surface,
+and everything on the far side of it is inside the material. `lv_raster_tri` now
+marks that half-space occluded directly, at distance zero, with a bounding-box
+test to keep it honest — "the plane passes near the receiver" is satisfied by any
+distant triangle whose plane happens to sweep past, and only a triangle whose own
+extent also contains the receiver is the surface being stood on.
+
+Zero isolated bright pixels remain anywhere in the frame, by the same scan that
+found the original three.
 
 ## What this does not answer
 

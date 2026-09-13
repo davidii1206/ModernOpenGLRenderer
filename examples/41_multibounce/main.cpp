@@ -64,7 +64,7 @@
 //   MBG_LV_RES=8            edge of the secondary cameras' light view
 //   MBG_INDIRECT_ONLY=1     composite the bounce term alone, for inspecting it
 //   MBG_JITTER=1            rotate each receiver's tangent frame (decorrelate)
-//   MBG_FILTER=3            a-trous denoise iterations over the GI grid
+//   MBG_FILTER=2            a-trous denoise iterations over the GI grid
 //   MBG_FILTER_R=2          taps per side for that filter
 //   MBG_SCALE=4             GI grid = framebuffer / scale; 1 == one camera/pixel
 //   MBG_BUDGET=4096         level-1 cameras per frame

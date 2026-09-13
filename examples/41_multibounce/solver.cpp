@@ -33,8 +33,13 @@ uint32_t snap_block(uint32_t res, uint32_t block) {
 // geometric in the tile count. Rather than let a slider allocate 8 GB, the
 // budget is clamped and the clamp is reported.
 constexpr std::size_t kMaxCameraBytes = 512ull * 1024ull * 1024ull;
-constexpr std::size_t kCamBytes = 32, kIrradBytes = 16, kDirectBytes = 16,
-                      kWeightBytes = 32;
+// Per camera: the camera itself, its irradiance, and TWO direct records -- the
+// total with the emitters' visible fraction, and the sun's share with the sun's.
+// Per child: three masses (indirect, emitter-direct, sun-direct). See
+// raster.comp: the two lights' visibility varies at completely different rates
+// and cannot share one scale factor.
+constexpr std::size_t kCamBytes = 32, kIrradBytes = 16, kDirectBytes = 32,
+                      kWeightBytes = 48;
 
 } // namespace
 
@@ -140,6 +145,7 @@ void Solver::configure(const SolveConfig& cfg_in, int fb_w, int fb_h) {
     // silently keep the old size.
     make_image(gi_, gi_w_, gi_h_);
     make_image(gi_tmp_, gi_w_, gi_h_);
+    make_image(gi_disp_, gi_w_, gi_h_);
     make_image(full_, fb_w, fb_h);
     full_w_ = fb_w;
     full_h_ = fb_h;
@@ -155,6 +161,7 @@ void Solver::clear_image() {
     const float zero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     if (gi_.handle()) glClearTexImage(gi_.handle(), 0, GL_RGBA, GL_FLOAT, zero);
     if (gi_tmp_.handle()) glClearTexImage(gi_tmp_.handle(), 0, GL_RGBA, GL_FLOAT, zero);
+    if (gi_disp_.handle()) glClearTexImage(gi_disp_.handle(), 0, GL_RGBA, GL_FLOAT, zero);
     if (full_.handle()) glClearTexImage(full_.handle(), 0, GL_RGBA, GL_FLOAT, zero);
 }
 
@@ -399,19 +406,30 @@ void Solver::filter(const GBuffer& gb, const gfx::Camera& cam, const SolveConfig
 
     // A-trous: the tap spacing doubles each iteration, so three passes of a 5x5
     // kernel reach as far as 17x17 for a ninth of the taps.
-    for (uint32_t i = 0; i < cfg.filter_iters; ++i) {
-        const bool even = (i % 2) == 0;
-        (even ? gi_ : gi_tmp_).bind_image(0, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA32F);
-        (even ? gi_tmp_ : gi_).bind_image(1, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA32F);
+    //
+    // gi_ IS READ ONCE, BY THE FIRST ITERATION, AND NEVER WRITTEN. The grid is an
+    // accumulation: a sweep is split into chunks, so most of it was written
+    // several frames ago and is not touched again until the cursor comes round.
+    // Filtering in place therefore does not run the configured number of
+    // iterations on a cell, it runs that many EVERY FRAME the cell sits there --
+    // and an a-trous chain applied without bound converges to its own fixed
+    // point, which is whatever the dilated passes have unity gain on. That is
+    // the grid's Nyquist, period two cells, and on the ceiling it showed as
+    // horizontal streaks that grew with the iteration count instead of shrinking
+    // (implementation.md, finding 17).
+    //
+    // The ping-pong is arranged so the LAST iteration lands in gi_disp_, which
+    // is what upsample() reads; no copy-back, and gi_ keeps the raw solve.
+    const uint32_t n = cfg.filter_iters;
+    for (uint32_t i = 0; i < n; ++i) {
+        const gl::Texture& src = i == 0 ? gi_ : (((n - i) % 2 == 0) ? gi_disp_ : gi_tmp_);
+        gl::Texture& dst = ((n - 1 - i) % 2 == 0) ? gi_disp_ : gi_tmp_;
+        src.bind_image(0, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA32F);
+        dst.bind_image(1, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA32F);
         filter_.set("u_stride", int(1u << i));
         gl::dispatch_compute(uint32_t((gi_w_ + 7) / 8), uint32_t((gi_h_ + 7) / 8), 1);
         gl::memory_barrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
     }
-    // An odd iteration count leaves the result in the scratch image; copy it back
-    // so the rest of the frame does not need to know which one is live.
-    if (cfg.filter_iters % 2 == 1)
-        glCopyImageSubData(gi_tmp_.handle(), GL_TEXTURE_2D, 0, 0, 0, 0,
-                           gi_.handle(), GL_TEXTURE_2D, 0, 0, 0, 0, gi_w_, gi_h_, 1);
 }
 
 void Solver::upsample(const GBuffer& gb, const gfx::Camera& cam, const SolveConfig& cfg) {
@@ -419,7 +437,9 @@ void Solver::upsample(const GBuffer& gb, const gfx::Camera& cam, const SolveConf
     ScopedPass p(t_upsample_);
     upsample_.use();
     gb.bind_textures();
-    gi_.bind_image(0, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA32F);
+    // The denoised copy when there is one, the raw grid otherwise.
+    (cfg.filter_iters > 0 ? gi_disp_ : gi_).bind_image(0, 0, GL_FALSE, 0,
+                                                      GL_READ_ONLY, GL_RGBA32F);
     full_.bind_image(1, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA32F);
     upsample_.set("u_size", glm::ivec2(gb.width, gb.height));
     upsample_.set("u_gi_size", glm::ivec2(gi_w_, gi_h_));
