@@ -2,19 +2,19 @@
 
 All at the reference camera (`MBG_GTCAM=1`, 512×512, pixel-aligned against the
 two path-traced PNGs one directory up), default configuration unless noted:
-3 camera levels (the cap), GI grid 171×171, targets 16/8/8, the single-sample
-path estimator at 20 paths with roulette at 0.15, analytic direct term with an
+3 camera levels (the cap), GI grid 128×128, targets 16/8/8, the single-sample
+path estimator at 40 paths with roulette at 0.15, analytic direct term with an
 8×8 light view per pixel, jitter + 2 a-trous iterations, Reinhard.
 
-One complete sweep is **1.20e6 cameras / 7.9e7 texels**, split into 8 chunks. On
-llvmpipe (software GL, 4 CPU threads, shared container) that took **55 s**, or
-61 s with the sun; those numbers are a property of this machine and not of the
-method, and the counts beside them are what to scale with.
+One complete sweep is **1.33e6 cameras / 8.8e7 texels / 4.2e7 triangle-rasters**,
+split into 4 chunks. On llvmpipe (software GL, 4 CPU threads, shared container)
+that took **51 s**; that number is a property of this machine and not of the
+method, and the counts beside it are what to scale with.
 
 | File | What | Compare against |
 |---|---|---|
 | `01_direct_1bounce.png` | `MBG_BOUNCES=1 MBG_SKY=0` — direct lighting only, no free parameters at all. RMSE 0.0430 | `../CornellBoxGroundTruthDirectLighting.png` |
-| `02_gi_3bounce.png` | `MBG_SKY=0.05` — the full solve. RMSE 0.0375 | `../CornellBoxOriginalGroundTruth.png` |
+| `02_gi_3bounce.png` | `MBG_SKY=0.05` — the full solve. RMSE 0.0402 | `../CornellBoxOriginalGroundTruth.png` |
 | `03_indirect_only_3bounce_4xexposure.png` | `MBG_INDIRECT_ONLY=1 MBG_EXPOSURE=4` — the bounce term with the direct term left out, exposed 4× so it is visible on its own | nothing; it is a diagnostic |
 | `04_diff_direct_vs_reference.png` | `MBG_VIEW=11`, 4× gain. Blue = agreement, warm = error | — |
 | `05_diff_gi_vs_reference.png` | the same for the full solve. The only warm region left is the emitter panel, which is the tone-curve gap of finding 10, not transport | — |

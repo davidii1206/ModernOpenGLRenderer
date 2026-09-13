@@ -64,7 +64,7 @@
 //   MBG_MODEL=path.glb      CornellBoxOriginal.glb; the references only match it
 //   MBG_BOUNCES=3           camera levels; 1 == direct only (capped at
 //                           kMaxLevels, currently 3)
-//   MBG_PATHS=20            single-sample continuation: split this many ways at
+//   MBG_PATHS=40            single-sample continuation: split this many ways at
 //                           the primary hit, branch factor 1 below it, so cost
 //                           is paths x bounces. 0 = the branching tile estimator
 //   MBG_RR=0.15             Russian-roulette threshold on path throughput; 0 off
@@ -80,8 +80,7 @@
 //   MBG_JITTER=1            rotate each receiver's tangent frame (decorrelate)
 //   MBG_FILTER=2            a-trous denoise iterations over the GI grid
 //   MBG_FILTER_R=2          taps per side for that filter
-//   MBG_SCALE=3             GI grid = framebuffer / scale; 1 == one camera/pixel.
-//                           The knob that resolves creases -- see finding 21
+//   MBG_SCALE=4             GI grid = framebuffer / scale; 1 == one camera/pixel
 //   MBG_BUDGET=4096         level-1 cameras per frame
 //   MBG_RES=16              level-1 target edge; MBG_RES2/3 for deeper levels
 //   MBG_BLOCK=8             spawn tile edge; 1 == a child per texel
@@ -630,7 +629,7 @@ int main() {
                     int pa = int(cfg.paths);
                     bool path_mode = pa != 0;
                     if (ImGui::Checkbox("Single-sample continuation", &path_mode))
-                        cfg.paths = path_mode ? 20u : 0u;
+                        cfg.paths = path_mode ? 40u : 0u;
                     if (cfg.paths) {
                         pa = int(cfg.paths);
                         if (ImGui::SliderInt("Paths (split at primary hit)", &pa, 1, 256))

@@ -36,10 +36,10 @@ reload sees it.
 | `MBG_GATE=all` or a comma list | run the analytic gates and exit. Names: `quad`, `closed`, `rect`, `occ`, `oracle`, `texeldir`, `series`, `paths`. `MBG_GATE_VERBOSE=1` prints each rasterizer/oracle disagreement |
 | `MBG_MODEL=path.glb` | model to load (default `CornellBoxOriginal.glb`). The two reference PNGs only match that one |
 | `MBG_BOUNCES=n` | camera levels, 1–`kMaxLevels`. **3 is the cap** (solver.hpp); 1 = direct only |
-| `MBG_PATHS=n` | **single-sample continuation**: split this many ways at the primary hit, branch factor 1 below it, so the cost is `paths × bounces` instead of `K^bounces` (default 20; paths saturate well before that, see finding 21). `0` selects the branching tile estimator; see finding 20 |
+| `MBG_PATHS=n` | **single-sample continuation**: split this many ways at the primary hit, branch factor 1 below it, so the cost is `paths × bounces` instead of `K^bounces` (default 40, the split that costs exactly what the branching tree costs at 3 bounces; 20 measures the same for half the cameras, see finding 21). `0` selects the branching tile estimator; see finding 20 |
 | `MBG_RR=f` | Russian-roulette threshold on path throughput (default 0.15). Below it a path survives with probability `throughput/f` and is divided by it. 0 disables |
 | `MBG_IMPORTANCE=0\|1` | draw the continuation from the micro-buffer's radiance rather than from `cos × dΩ × albedo` alone (default 1) |
-| `MBG_SCALE=n` | GI grid = framebuffer / n (default 3). **1 = one camera per pixel**, the doc's correctness reference. The knob that resolves creases — see finding 21 |
+| `MBG_SCALE=n` | GI grid = framebuffer / n (default 4). **1 = one camera per pixel**, the doc's correctness reference. Finer resolves creases and costs silhouettes — see finding 21 |
 | `MBG_BUDGET=n` | level-1 cameras per frame. The sweep is split into `ceil(pixels/budget)` chunks; the budget is clamped down if the camera tree would exceed 512 MB |
 | `MBG_RES=n` / `MBG_RES2/3/4=n` | hemi-octahedral target edge per level, 2–32 (defaults 16/8/8/8) |
 | `MBG_JITTER=0\|1` | rotate each receiver's tangent frame by a hash of its position (default 1). **Load-bearing**; see finding 14 |
@@ -231,13 +231,13 @@ thing to scale.
 
 ### The default configuration
 
-`MBG_BOUNCES=3`, `MBG_SCALE=3` (GI 171×171), 20 paths, targets 16/8/8, analytic
+`MBG_BOUNCES=3`, `MBG_SCALE=4` (GI 128×128), 40 paths, targets 16/8/8, analytic
 direct with an 8×8 light view per pixel, jitter + denoise on, no environment.
 
 | | RMSE | roughness vs reference | cameras/sweep |
 |---|---|---|---|
-| 1 bounce vs the direct reference | **0.0430** | 0.91× | 2.9e4 + 262k direct |
-| 3 bounces vs the full-GI reference (sky 0.05) | **0.0375** | 0.75× | 1.2e6 + 262k direct |
+| 1 bounce vs the direct reference | **0.0430** | 0.91× | 1.6e4 + 262k direct |
+| 3 bounces vs the full-GI reference (sky 0.05) | **0.0402** | 0.67× | 1.3e6 + 262k direct |
 
 At one bounce there is no recursion and the two estimators are the same code.
 
@@ -277,17 +277,16 @@ spread is under 1% and the comparisons are sound; *across* batches the clock
 means nothing. The camera and texel counts are exact and hardware independent,
 and they are the thing to scale with.
 
-**At the shipped configuration** — 3 bounces, 20 paths, GI grid 171×171 — one
-complete sweep. (The rows below it are the scale-4 batch that finding 20 and
-finding 21 compare against, kept because they are one env var apart.)
+**At the shipped configuration** — 3 bounces, 40 paths, GI grid 128×128 — one
+complete sweep, three runs in one batch, spread under 1%:
 
 | | time | work |
 |---|---|---|
-| **indirect, 3 bounces, scale 3, path 20** | **55.5 s** | 1.20e6 cameras, 7.9e7 texels |
-| indirect, 3 bounces, scale 4, path 40 | 51.4 s | 1.33e6 cameras, 8.8e7 texels, 4.2e7 triangle-rasters |
+| **indirect, 3 bounces, path 40** | **51.4 s** | 1.33e6 cameras, 8.8e7 texels, 4.2e7 triangle-rasters |
+| indirect, 3 bounces, path 20 (same quality) | ~26 s | 0.67e6 cameras |
 | indirect, 3 bounces, branching | 52.5 s | 1.33e6 cameras, 8.8e7 texels |
 | indirect, 3 bounces, path 64 | 81.7 s | 2.11e6 cameras, 1.38e8 texels |
-| indirect, 3 bounces, **with the sun** | 61 s | + one cone raster per camera |
+| indirect, 3 bounces, **with the sun** | ~57 s | + one cone raster per camera |
 | direct, per frame | 7.5 s | 262k fitted light views |
 | direct, per frame, **with the sun** | 8.4 s | + 262k cone views, one rasterization each |
 | everything else, per frame | 13 ms | G-buffer, denoise, upsample, display |
@@ -1252,12 +1251,15 @@ already dominated by the tone curve, on the scene most flattering to deep
 interreflection there is -- a closed white box. There is nothing there worth
 paying for, and the cap says so.
 
-### 21. The soft crease is the grid, not the denoise — and paths were starving it
+### 21. The soft crease is the grid — and buying it with a finer grid is a bad trade
 
 Reported as "the denoiser blends stuff across an edge", most visibly along the
-top of the room, where the path-traced reference has a clean line. The symptom is
-real and the attribution is not, which took one ablation to establish. Profile
-down the ceiling/back-wall crease, rows of flat approach before the drop:
+top of the room, where the path-traced reference has a clean line. Half of this
+finding is a diagnosis that held up and half is a change that was shipped, looked
+worse, and was reverted. Both halves are the point.
+
+**The diagnosis.** It is not the denoise. Profile down the ceiling/back-wall
+crease, rows of flat approach before the drop:
 
 | | flat rows before the crease |
 |---|---|
@@ -1268,59 +1270,60 @@ down the ceiling/back-wall crease, rows of flat approach before the drop:
 | path-traced reference | 2 |
 
 Switching the denoise off makes it *worse*. What halves it is halving the grid
-block, which says the cause is resolution.
+block, which says the cause is resolution. The contact darkening at a corner is
+two or three pixels wide; at scale 4 the grid's nearest sample sits at a block
+centre two pixels away — and its value there is right, 69 against the reference's
+69 — while the reference then falls 69 → 67 → 61 → 59 over the next three pixels,
+where we have no sample at all. The bilateral upsample correctly rejects the tap
+across the crease, so the stencil collapses to that one grid row and holds it
+flat: a shelf one block wide, then a cliff at the geometric edge.
 
-**Why no upsample can fix it.** The contact darkening at a corner is two or three
-pixels wide. At scale 4 the GI grid's nearest sample to the crease sits at a
-block centre two pixels away, and its value there is right — 69 against the
-reference's 69. The reference then falls 69 → 67 → 61 → 59 over the next three
-pixels, and we have no sample in that interval at all. The bilateral upsample
-rejects the tap across the crease (perpendicular normal, correctly), so the
-stencil collapses to that one grid row and holds it flat: a shelf the width of
-one block, then a cliff at the geometric edge.
+**A gradient fit does not help, and the reason is the useful part.** Fit a plane
+to the taps that survive the geometric test and evaluate it at the pixel, so the
+interpolation continues the trend instead of clamping against the cut. Measured:
+RMSE identical to four digits, profile unchanged. The grid's own values
+approaching the corner are 70, 69, 69, 69 — there is no gradient at grid scale to
+extrapolate, because the falloff happens entirely *between* the last two samples.
+The information is absent, not attenuated. Reverted.
 
-A gradient fit was the obvious fix and was tried: fit a plane to the taps that
-survive the geometric test and evaluate it at the pixel, so the interpolation
-continues the trend instead of clamping against the cut. It measured as a
-**no-op** — RMSE identical to four digits, profile unchanged — for the reason
-that makes this finding worth writing down. The grid's own values along the
-ceiling approaching the corner are 70, 69, 69, 69: there is no gradient at grid
-scale to extrapolate, because the falloff happens entirely *between* the last two
-samples. The information is not attenuated, it is absent. The fit was reverted.
+**So the grid was made finer, and that was the mistake.** Paths and grid pixels
+are both sampling rates and they do not saturate together — 40, 64 and 256 paths
+at scale 4 all score RMSE 0.0402, while grid resolution was still moving
+everything. Scale 3 with 20 paths measured better than the scale-4 default on
+every number that was being watched:
 
-**So the budget has to move, and it turns out there was slack.** Finding 20 left
-the split at 40 paths with the grid at scale 4. Both are sampling rates, and they
-do not saturate at the same point:
-
-| | cameras/sweep | RMSE | crease flat rows | whole-image noise |
+| | cameras/sweep | RMSE | crease flat rows | ceiling patch |
 |---|---|---|---|---|
-| scale 4, 40 paths (old default) | 1.33e6 | 0.0402 | 6 | 3.88 |
-| scale 4, 64 paths | 2.11e6 | 0.0402 | 6 | — |
-| scale 4, 256 paths | 8.40e6 | 0.0402 | 6 | — |
-| scale 2, 10 paths | 1.38e6 | 0.0392 | 2 | 4.08 |
-| **scale 3, 20 paths (new default)** | **1.20e6** | **0.0375** | **2** | 4.08 |
-| scale 3, 32 paths | 1.90e6 | 0.0375 | 2 | 4.10 |
-| scale 2, 40 paths | 5.31e6 | 0.0392 | 2 | — |
+| scale 4, 40 paths | 1.33e6 | 0.0402 | 6 | 1.40 |
+| scale 3, 20 paths | 1.20e6 | 0.0375 | 2 | 1.33 |
 
-**Paths saturate and grid pixels do not.** 40 → 64 → 256 paths at scale 4 does
-not move RMSE in the fourth digit; 20 → 32 paths at scale 3 does not either. The
-hemisphere is adequately sampled well before 20, and everything past that is
-spent on a quantity that has stopped responding. Grid resolution had not stopped
-responding, because it is the only thing that resolves a crease.
+Fewer cameras, better RMSE, a crease profile matching the reference. It was
+shipped, and it looked worse — reported immediately, and correctly.
 
-Moving to **scale 3 with 20 paths** costs 10% FEWER cameras than the old default
-and is better on every axis that was measured: RMSE 0.0402 → 0.0375, the crease
-profile from a shelf-and-cliff to the reference's ramp, and the ceiling patch
-from 0.95 to 0.88. The one thing that moves the wrong way is whole-image
-high-pass noise, 3.88 → 4.08 (5%), which is the honest cost — half the paths per
-receiver, and it shows faintly as speckle along the crease line itself, where the
-denoiser is weakest because its kernel is truncated there (finding 17).
+**What no aggregate metric here reports is the silhouette.** At a diagonal edge
+the reconstruction is per grid block, and scale 4's softness was the only thing
+hiding that. Make the grid finer and the indirect resolves sharply enough for the
+block structure to become visible as stair-steps down the ceiling/side-wall
+diagonal, plus a bright fringe along the vertical corner. It is not specific to
+the non-power-of-two grid: scale 3 shows it at 20 *and* 40 paths, and so does
+scale 2. Nor is it the path count: scale 4 at 20 paths has a clean diagonal.
 
-The remaining gap to the reference is that last 5%: a crease is the one place
-where the filter has neighbours on only one side, so it averages along the line
-but not across it. Fixing that properly means an anisotropic kernel steered by
-the local structure, which is a real piece of machinery and not this example's
-next problem.
+So the trade is a soft crease against a stepped silhouette, and the stepped
+silhouette is worse. **Default is back at scale 4, 40 paths** — the crease stays
+soft, and that is now a known and measured cost rather than an unexamined one.
+
+Two things survive the revert:
+
+- **Paths saturate at about half the default.** 20 paths at scale 4 scores
+  0.0403 against 40's 0.0402, with whole-image noise 3.86 against 3.88, for
+  **half the cameras**. `MBG_PATHS=20` is a free 2× on the solve. It is not the
+  default only because 40 is the split that costs exactly what the branching
+  estimator costs, which is the comparison finding 20 rests on.
+- **The real fix is not more grid.** The crease needs the upsample to behave at a
+  silhouette and the denoise to average *along* an edge it cannot average across
+  — an anisotropic kernel steered by local structure. That is a real piece of
+  machinery, and it is the thing to build if this matters, rather than spending
+  4× the cameras to trade one artifact for another.
 
 ## What this does not answer
 

@@ -55,16 +55,13 @@ struct SolveConfig {
     uint32_t bounces = 3;          // camera levels; 1 == direct only
     // GI grid = framebuffer / scale.
     //
-    // 3, not 4, and the reason is finding 21: this is the knob that resolves a
-    // CREASE. The contact darkening where two surfaces meet is two or three
-    // pixels wide, so at scale 4 the grid's nearest sample to a corner sits at a
-    // block centre two pixels away and the upsample has nothing closer to
-    // interpolate toward -- it clamps, and the ceiling/wall line comes out as a
-    // flat shelf and then a cliff where a path trace shows a smooth ramp.
-    // Nothing downstream can recover it; the feature is below the grid's
-    // Nyquist. Measured with the denoise switched off entirely, the shelf is
-    // WIDER, which is what rules the denoise out as the cause.
-    uint32_t scale   = 3;
+    // 4, and finding 21 is the record of trying to make it finer and putting it
+    // back. A finer grid does resolve the crease it was supposed to -- and it
+    // makes SILHOUETTES worse, because scale 4's softness was the only thing
+    // hiding the upsample's per-block structure along a diagonal edge. Trading a
+    // soft crease for a stepped silhouette is a bad trade, and it is one that no
+    // aggregate metric in this file reports.
+    uint32_t scale   = 4;
     uint32_t budget  = 4096;       // level-1 cameras per frame
 
     // The resolution ladder of section 6.2 / 4.1: near cameras get the
@@ -112,23 +109,21 @@ struct SolveConfig {
     // representative's visibility. That one is deterministic, which is why every
     // gate runs on it, and it is the doc's variant A as written.
     //
-    // 20, because PATHS SATURATE AND GRID PIXELS DO NOT (finding 21). At scale 3,
-    // 20 paths and 32 paths score the same RMSE to four digits and the same
-    // whole-image noise, for 58% more cameras -- the hemisphere is adequately
-    // sampled well before 20 and everything past it is spent on a quantity that
-    // has stopped moving. Grid resolution has not stopped moving, because it is
-    // what resolves creases, so the budget goes there instead.
+    // 40, which is not a round number and is not meant to be: at the three-bounce
+    // cap it is the split that costs EXACTLY what the branching tree costs. The
+    // tree spawns 16 then 4, so a primary hit carries 1 + 16 + 64 = 81 cameras;
+    // a path split of S carries 1 + 2S, and 1 + 2*40 = 81. Same cameras, same
+    // texels, same triangle-rasters, to the unit -- which is the comparison
+    // finding 20 defaults on, and at equal cost the path estimator wins on every
+    // axis that is not a tie.
     //
-    // Together with scale 3 that is 1.20e6 cameras a sweep against the 1.33e6
-    // the old scale-4/40-path default used: fewer cameras, RMSE 0.0375 against
-    // 0.0402, and a crease profile that matches the path-traced reference.
-    //
-    // 41 is also, coincidentally, close to the split that costs exactly what the
-    // branching tree costs at this depth (the tree carries 1 + 16 + 64 = 81
-    // cameras per primary hit, a split of S carries 1 + 2S, so S = 40 ties at
-    // scale 4). That comparison is in finding 20 and still runs with
-    // MBG_SCALE=4 MBG_PATHS=40 MBG_PATHS=0; it is not what this default is for.
-    uint32_t  paths = 20;
+    // PATHS SATURATE WELL BELOW THIS. 40, 64 and 256 score the same RMSE to four
+    // digits, and 20 scores 0.0403 against 40's 0.0402 for HALF the cameras with
+    // the same whole-image noise (3.86 against 3.88). MBG_PATHS=20 is therefore
+    // a free 2x on the solve if the equal-cost comparison is not what is wanted;
+    // it is not the default only because the default is the configuration the
+    // branching estimator is measured against.
+    uint32_t  paths = 40;
     // Russian roulette threshold on the path throughput (the running product of
     // what each bounce reflects, near enough). Below it a path survives with
     // probability throughput/threshold and is divided by that probability, so
