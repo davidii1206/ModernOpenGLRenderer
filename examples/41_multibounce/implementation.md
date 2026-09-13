@@ -1452,6 +1452,85 @@ of the slowness, not a separate bug.
 llvmpipe, where local memory is just stack and this whole effect is invisible. A
 software rasterizer and a GPU do not rank the same implementation the same way.
 
+### 23. Inverting the hemisphere deletes the octahedral clipping, and fixes the GPU's gates
+
+The same inversion as finding 22, applied to the hemisphere rasterizer that is
+the core of the technique: one texel per thread, each asking which triangle is
+nearest along its own direction, instead of one triangle per thread atomicMin-ing
+every texel it covers.
+
+**It deletes this file's longest argument.** Everything hemi.glsl says about the
+folds — that the map is only piecewise projective, that a triangle must be cut at
+x=0, y=0 and the horizon before its edges are straight, that the two pieces need
+an overlap tolerance or a fold texel falls through the crack (finding 1) — is a
+consequence of PROJECTING. None of it is a property of the visibility question. A
+direction either lies in a triangle's cone or it does not. With no projection
+there is nothing to clip and no fold to fall into.
+
+`s_vis` stays in shared memory, unlike the light view's buffer: the quadrature
+reads only its own texels, but the tent-weighted spawn reads a neighbourhood. The
+atomics go — each texel is written once, by the thread that owns it.
+
+| | before | after |
+|---|---|---|
+| per camera | 1.86 µs | **0.68 µs** |
+| complete sweep, default config | 3600 ms | **1000 ms** |
+
+#### Two things the gates caught that the image did not
+
+**The half-space rule does not belong in the hemisphere.** Carrying finding 19's
+rule across cost 480 disputed texels and *half the energy* in the `oracle` gate.
+The rule is a deliberate departure from what a ray cast reports — it declares the
+far side of a plane the receiver sits on to be solid, because a receiver
+reconstructed from a depth buffer can land microns outside a wall and a ray would
+then correctly find nothing in the way. The light view needs that, because the
+sun's shadow is one direction wide. The hemisphere must not have it, because
+`oracle` holds this buffer against a CPU ray cast texel for texel and a rule ray
+casting does not share makes them disagree by construction. Nor does it need it:
+the camera's own triangle is already excluded, because its plane sits `bias`
+below the origin so every upper-hemisphere direction gives t < 0. Removed:
+**0 disagreements in 65536 texels.**
+
+**acos was costing four digits, and atan2 was free.** The last two failures were
+`closed`'s worst orientation — a camera sealed inside an emitter, where twelve
+analytic terms have to cancel to exactly πL — reading 1.67e-4 against a 1.57e-4
+tolerance. `MBG_LV_RES` did not move it and `MBG_NEE=0` dropped it to 7.5e-8, so
+it was never the rasterizer: it was float precision in Lambert's formula.
+
+`acos(dot(a,b))` is ill-conditioned exactly where that formula spends its time.
+Its derivative is -1/sqrt(1-x²), so as adjacent edges of a polygon seen from near
+its own plane approach parallel, the angle loses most of its significant bits.
+`atan2(|a×b|, a·b)` is well conditioned over the whole range, and both arguments
+were already being computed one line above.
+
+| | acos | atan2 |
+|---|---|---|
+| `closed`, worst orientation | 1.67e-4 | **3.14e-7** |
+| `closed`, E inside emitter (relative) | 4.1e-5 | **1.0e-8** |
+
+Better than the llvmpipe numbers this file was written against (1.41e-4), which
+is the point: that gate only ever passed there because the two libraries round
+`acos` differently near the ends of its range. **35/35 gates now pass on the
+GPU**, where the first run on real hardware failed five.
+
+#### The whole arc, on an RTX 3060
+
+| | first GPU run | now |
+|---|---|---|
+| Raster L1 | 21.4 ms | 6.8 ms |
+| Raster L2 | 582 ms | 141 ms |
+| Raster L3 | 375 ms | 84 ms |
+| Direct/px | 2317 ms | 33 ms |
+| complete sweep | ~31 s, and the default budget crashed | **1.0 s** |
+| gates | 30/35 | **35/35** |
+
+(The per-pass rows are not directly comparable — the "now" column runs eight
+times the cameras per chunk, because the default `MBG_BUDGET` is usable again.
+The sweep row is like for like.)
+
+RMSE 0.0430 against the direct reference and 0.0400 against the full-GI one,
+both unchanged throughout. With the sun, a sweep is 1.10 s.
+
 ## What this does not answer
 
 - **§8.1, the reuse radius experiment.** The gate the doc puts before everything

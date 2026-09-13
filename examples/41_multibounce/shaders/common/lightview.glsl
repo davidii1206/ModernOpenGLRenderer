@@ -406,37 +406,7 @@ uint lv_texel_key(uint ti, vec3 d, float inv_far) {
             return dot(pn, d) < 0.0 ? mbg_pack_key(0.0, inv_far, ti) : MBG_EMPTY;
     }
 
-    // The three edge planes through the receiver. `o` is the triple product,
-    // which is the solid angle's orientation; a triangle seen edge on has o ~ 0
-    // and subtends nothing.
-    vec3 e0 = cross(v0, v1);
-    vec3 e1 = cross(v1, v2);
-    vec3 e2 = cross(v2, v0);
-    float o = dot(e0, v2);
-    if (abs(o) < 1e-20) return MBG_EMPTY;
-    float sgn = o < 0.0 ? -1.0 : 1.0;
-    float b0 = dot(d, e0) * sgn;
-    float b1 = dot(d, e1) * sgn;
-    float b2 = dot(d, e2) * sgn;
-    // INCLUSIVE, WITH A RELATIVE TOLERANCE, and it is not optional -- this was
-    // written without one first and the `occ` gate caught it.
-    //
-    // A texel direction can land EXACTLY on the edge two triangles share, and
-    // that is the common case rather than a corner case: a quad is two triangles
-    // split along a diagonal, and a blocker's diagonal runs straight through the
-    // middle of a light view aimed past it. On that line all three products are
-    // zero plus float noise, and if both pieces round the wrong way the texel is
-    // left empty -- so an opaque panel develops a one-texel-wide slit and the
-    // light comes through it. Measured: 5.4% of an emitter leaking through a
-    // blocker that covers it twice over, falling as 1/res, which is the
-    // signature of a defect on a line rather than over an area.
-    //
-    // Letting the two pieces overlap by a hair is free, because both compute the
-    // same depth from the same plane and the min resolves them identically. The
-    // scale is the products' own magnitude, so it is dimensionless and needs no
-    // tuning -- the same argument mbg_fill makes for its own eps.
-    float tol = -1e-6 * (abs(b0) + abs(b1) + abs(b2) + 1e-30);
-    if (b0 < tol || b1 < tol || b2 < tol) return MBG_EMPTY;
+if (!mbg_cone_contains(v0, v1, v2, d)) return MBG_EMPTY;
 
     float den = dot(pn, d);
     if (abs(den) < 1e-20) return MBG_EMPTY;

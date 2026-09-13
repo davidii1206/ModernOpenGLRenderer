@@ -111,11 +111,7 @@ void main() {
 
     uint texels = u_res * u_res;
 
-    mbg_clear_vis(tid, 64u);
-    barrier();
-    memoryBarrierShared();
-
-    for (uint t = tid; t < u_tri_count; t += 64u) mbg_raster_tri(t);
+    mbg_resolve_vis(tid, 64u, u_tri_count);
     barrier();
     memoryBarrierShared();
 

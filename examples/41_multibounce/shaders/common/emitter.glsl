@@ -80,7 +80,19 @@ vec3 mbg_emitter_unshadowed(vec3 pos, vec3 nrm, MbgTri tr, bool two_sided,
         vec3 x = cross(a, b);
         float len = length(x);
         if (len < 1e-9) continue;
-        sum += acos(clamp(dot(a, b), -1.0, 1.0)) * dot(nrm, x / len);
+        // atan2(|a x b|, a . b), NOT acos(a . b), and the difference is
+        // measurable. acos is ill-conditioned exactly where this formula spends
+        // its time: its derivative is -1/sqrt(1-x^2), so as adjacent edges of a
+        // polygon seen from near its own plane approach parallel, the angle
+        // loses most of its significant bits. atan2 is well conditioned over the
+        // whole range, and both of its arguments are already sitting here.
+        //
+        // Worth 1.67e-4 to 2.7e-6 on the `closed` gate's worst orientation --
+        // a camera sealed inside an emitter, where twelve of these terms have to
+        // cancel to exactly PI*L. That gate failed on NVIDIA and passed on
+        // llvmpipe purely because the two libraries round acos differently near
+        // the ends of its range.
+        sum += atan(len, dot(a, b)) * dot(nrm, x / len);
     }
     return tr.emission.xyz * emissive_scale * (0.5 * abs(sum));
 }

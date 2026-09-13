@@ -99,6 +99,42 @@ int mbg_clip_plane(vec3 src[MBG_CLIP_MAX], int n, vec3 pn, out vec3 dst[MBG_CLIP
     return m;
 }
 
+// --- Coverage without projection --------------------------------------------
+//
+// The one test both inverted rasterizers share, so the tolerance below lives in
+// exactly one place. Does the cone that (v0,v1,v2) subtends from the origin
+// contain direction `d`? All three vectors are relative to the viewpoint and
+// none of them need be normalized.
+//
+// The three planes through the viewpoint and the triangle's edges have normals
+// cross(v_k, v_k+1), and `d` is inside when all three dot products share the
+// sign of the triple product [v0,v1,v2]. The antipodal cone flips all three, so
+// it is excluded rather than matched. Under a projective map this expression IS
+// the 2D edge function up to a positive scale -- the same inclusive test a
+// rasterizer does after projecting, done before.
+//
+// THE TOLERANCE IS LOAD BEARING. A direction can land exactly on the edge two
+// triangles share, and that is the common case rather than a corner one: a quad
+// is two triangles split along a diagonal. There all three products are zero
+// plus float noise, and if both pieces round the wrong way the direction is
+// covered by neither and an opaque surface develops a slit. The `occ` gate
+// measured 5.4% of an emitter coming through a blocker that covers it twice
+// over, falling as 1/res -- the signature of a defect on a line. Overlap is
+// free: both pieces compute the same depth from the same plane.
+bool mbg_cone_contains(vec3 v0, vec3 v1, vec3 v2, vec3 d) {
+    vec3 e0 = cross(v0, v1);
+    vec3 e1 = cross(v1, v2);
+    vec3 e2 = cross(v2, v0);
+    float o = dot(e0, v2);
+    if (abs(o) < 1e-20) return false;          // edge on: subtends nothing
+    float sgn = o < 0.0 ? -1.0 : 1.0;
+    float b0 = dot(d, e0) * sgn;
+    float b1 = dot(d, e1) * sgn;
+    float b2 = dot(d, e2) * sgn;
+    float tol = -1e-6 * (abs(b0) + abs(b1) + abs(b2) + 1e-30);
+    return b0 >= tol && b1 >= tol && b2 >= tol;
+}
+
 // --- The packed depth key ---------------------------------------------------
 //
 // Section 5.3 wants a shared uint64 with depth in the high bits and cluster +

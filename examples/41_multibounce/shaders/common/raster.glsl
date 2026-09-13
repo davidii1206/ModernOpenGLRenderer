@@ -158,6 +158,77 @@ void mbg_raster_tri(uint ti) {
     }
 }
 
+// --- The hemisphere, inverted ------------------------------------------------
+//
+// One texel per thread, each asking which triangle is nearest along its own
+// direction, instead of one triangle per thread atomicMin-ing every texel it
+// covers. Same depth sort, opposite loop order -- implementation.md finding 22,
+// and lv_mass_texel in lightview.glsl for the version that came first.
+//
+// AND IT DELETES THE OCTAHEDRAL CLIPPING ENTIRELY. Everything this file argues
+// about the folds -- that the map is only piecewise projective, that a triangle
+// must be cut at x=0, y=0 and the horizon before its edges are straight, that
+// the two pieces need an overlap tolerance or a fold texel falls through the
+// crack -- is a consequence of PROJECTING. None of it is a property of the
+// visibility question. A direction either lies in a triangle's cone or it does
+// not, and mbg_cone_contains answers that without a projection, so there is
+// nothing to clip and no fold to fall into. mbg_raster_tri and mbg_fill stay for
+// the gates to compare against, but nothing in a frame calls them.
+//
+// s_vis still lives in shared memory, unlike the light view's buffer: the
+// quadrature reads only its own texels, but the tent-weighted spawn reads a
+// neighbourhood, so the winners have to be visible across the workgroup. What
+// goes away is the atomics -- each texel is written once, by the thread that
+// owns it.
+uint mbg_tri_key(uint ti, vec3 d) {
+    MbgTri tr = tris[ti];
+    vec3 v0 = tr.p0.xyz - g_P;
+    vec3 v1 = tr.p1.xyz - g_P;
+    vec3 v2 = tr.p2.xyz - g_P;
+
+    vec3  pn = tr.n.xyz;
+    float pc = dot(pn, v0);
+
+    // NO HALF-SPACE RULE HERE, unlike the light view's lv_texel_key.
+    //
+    // That rule (finding 19) is a deliberate departure from what a ray cast
+    // reports: it declares the far side of a plane the receiver sits on to be
+    // solid, because a receiver reconstructed from a depth buffer can land
+    // microns outside a wall and a ray would then correctly find nothing in the
+    // way. The light view needs it, because the sun's shadow is one direction
+    // wide and a single leaked pixel is visible.
+    //
+    // The hemisphere must not have it, because the oracle gate holds this
+    // buffer against a CPU ray cast texel for texel, and a rule that ray casting
+    // does not share makes them disagree by construction -- 480 texels and half
+    // the energy in dispute when it was in here. Nor does it need it: the
+    // camera's own triangle is excluded already, because its plane sits `bias`
+    // below the origin, so every upper-hemisphere direction gives t < 0.
+
+    if (!mbg_cone_contains(v0, v1, v2, d)) return MBG_EMPTY;
+
+    float den = dot(pn, d);
+    if (abs(den) < 1e-20) return MBG_EMPTY;
+    float t = pc / den;
+    if (t <= 0.0) return MBG_EMPTY;
+    return mbg_pack_key(t * length(d), u_inv_far, ti);
+}
+
+// Fill s_vis for this thread's texels. Replaces clear + rasterize + barrier.
+void mbg_resolve_vis(uint tid, uint stride, uint tri_count) {
+    uint n = u_res * u_res;
+    for (uint i = tid; i < n; i += stride) {
+        vec3 d = mbg_to_world(mbg_px_to_dir(vec2(float(i % u_res), float(i / u_res))
+                                            + vec2(0.5), u_res));
+        uint best = MBG_EMPTY;
+        for (uint t = 0u; t < tri_count; ++t) {
+            uint k = mbg_tri_key(t, d);
+            if (k < best) best = k;
+        }
+        s_vis[i] = best;
+    }
+}
+
 // --- The direct term, analytically ------------------------------------------
 //
 // Doc section 3, non-goals: "No correct area-light soft shadows from the GI
