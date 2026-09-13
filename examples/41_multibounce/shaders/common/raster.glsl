@@ -46,118 +46,6 @@ vec3 g_P, g_T, g_B, g_N;      // the camera, set once per workgroup
 vec3 mbg_to_local(vec3 w) { return vec3(dot(w, g_T), dot(w, g_B), dot(w, g_N)); }
 vec3 mbg_to_world(vec3 l) { return g_T * l.x + g_B * l.y + g_N * l.z; }
 
-// Fill one straight-edged triangle of the projected polygon.
-//
-// Depth is EVALUATED, not interpolated: for the texel's direction w and the
-// triangle's plane (pn, pc) in camera-local coordinates the hit parameter is
-// exactly pc / dot(pn, w). That is the same cost as setting up an interpolant
-// and it removes a whole class of precision question from a reference renderer.
-void mbg_fill(vec2 A, vec2 B, vec2 C, vec3 pn, float pc, uint ti) {
-    float area2 = (B.x - A.x) * (C.y - A.y) - (B.y - A.y) * (C.x - A.x);
-    if (abs(area2) < 1e-14) return;
-    float s = area2 < 0.0 ? -1.0 : 1.0;   // orientation, so one test works for both
-
-    // THE FOLD TOLERANCE. A texel centre can land EXACTLY on an octahedral fold:
-    // at an even target edge, texel (i,i) and texel (i, res-1-i) have t.x or t.y
-    // identically zero. A triangle spanning that fold is split there into two
-    // pieces whose shared edge passes exactly through the centre, so both edge
-    // functions evaluate to zero plus float noise -- and if both pieces round the
-    // wrong way, the texel is left empty and the camera sees a hole in a solid
-    // wall.
-    //
-    // Measured before this tolerance existed: 3 empty texels in 65536 over 64
-    // Cornell cameras, every one of them on a fold (the oracle gate prints them
-    // with MBG_GATE_VERBOSE=1). Small, but it is a hole in a visibility buffer,
-    // and the same geometry at a different orientation is free to make it a
-    // bigger one.
-    //
-    // The fix is to let the two pieces OVERLAP by a hair instead of risking a
-    // gap between them. atomicMin makes double coverage free -- both pieces
-    // compute the same depth from the same plane -- so the asymmetry is entirely
-    // in our favour. The tolerance scales with the piece's own area because the
-    // edge functions are products of pixel coordinates and their noise floor
-    // scales the same way.
-    float eps = 1e-5 * abs(area2) + 1e-6;
-
-    vec2 lo = min(A, min(B, C));
-    vec2 hi = max(A, max(B, C));
-    int res = int(u_res);
-    int x0 = clamp(int(floor(lo.x)), 0, res - 1);
-    int x1 = clamp(int(ceil (hi.x)), 0, res - 1);
-    int y0 = clamp(int(floor(lo.y)), 0, res - 1);
-    int y1 = clamp(int(ceil (hi.y)), 0, res - 1);
-
-    for (int y = y0; y <= y1; ++y) {
-        for (int x = x0; x <= x1; ++x) {
-            vec2 p = vec2(float(x) + 0.5, float(y) + 0.5);
-            // Inclusive on every edge, with the fold tolerance above. Shared
-            // edges between fan triangles, and between the four quadrant pieces
-            // of one triangle, are therefore covered twice -- which atomicMin
-            // resolves to the same value. A top-left rule would avoid the double
-            // write and open a one-texel crack instead, and a crack in a
-            // visibility buffer is a light leak.
-            float w0 = ((C.x - B.x) * (p.y - B.y) - (C.y - B.y) * (p.x - B.x)) * s;
-            float w1 = ((A.x - C.x) * (p.y - C.y) - (A.y - C.y) * (p.x - C.x)) * s;
-            float w2 = ((B.x - A.x) * (p.y - A.y) - (B.y - A.y) * (p.x - A.x)) * s;
-            if (w0 < -eps || w1 < -eps || w2 < -eps) continue;
-
-            vec3 w = mbg_px_to_dir(p, u_res);
-            float denom = dot(pn, w);
-            if (abs(denom) < 1e-20) continue;
-            float t = pc / denom;
-            if (t <= 0.0) continue;                    // behind the camera
-            atomicMin(s_vis[uint(y) * u_res + uint(x)],
-                      mbg_pack_key(t * length(w), u_inv_far, ti));
-        }
-    }
-}
-
-void mbg_raster_tri(uint ti) {
-    MbgTri tr = tris[ti];
-
-    vec3 v[MBG_CLIP_MAX];
-    v[0] = mbg_to_local(tr.p0.xyz - g_P);
-    v[1] = mbg_to_local(tr.p1.xyz - g_P);
-    v[2] = mbg_to_local(tr.p2.xyz - g_P);
-
-    vec3  pn = mbg_to_local(tr.n.xyz);   // rotation only: still unit, still the plane normal
-    float pc = dot(pn, v[0]);
-
-    // The horizon. The camera sits ON a surface, so its own triangle passes
-    // through the origin; u_bias has already pushed the origin off that plane,
-    // and this clip then removes it entirely along with everything below.
-    vec3 hemi[MBG_CLIP_MAX];
-    int nh = mbg_clip_plane(v, 3, vec3(0.0, 0.0, 1.0), hemi);
-    if (nh < 3) return;
-
-    for (int q = 0; q < 4; ++q) {
-        float sx = (q & 1) == 0 ? 1.0 : -1.0;
-        float sy = (q & 2) == 0 ? 1.0 : -1.0;
-
-        vec3 cx[MBG_CLIP_MAX];
-        int nx = mbg_clip_plane(hemi, nh, vec3(sx, 0.0, 0.0), cx);
-        if (nx < 3) continue;
-        vec3 cy[MBG_CLIP_MAX];
-        int ny = mbg_clip_plane(cx, nx, vec3(0.0, sy, 0.0), cy);
-        if (ny < 3) continue;
-
-        vec2 px[MBG_CLIP_MAX];
-        bool ok = true;
-        for (int i = 0; i < ny; ++i) {
-            float L;
-            vec2 e = mbg_project(cy[i], sx, sy, L);
-            // L <= 0 means the vertex is at or behind the centre of projection,
-            // i.e. the geometry touches the camera origin. u_bias exists so this
-            // does not happen; dropping the piece is the safe failure.
-            if (!(L > 1e-12)) { ok = false; break; }
-            px[i] = mbg_square_to_px(e, u_res);
-        }
-        if (!ok) continue;
-
-        for (int k = 1; k + 1 < ny; ++k) mbg_fill(px[0], px[k], px[k + 1], pn, pc, ti);
-    }
-}
-
 // --- The hemisphere, inverted ------------------------------------------------
 //
 // One texel per thread, each asking which triangle is nearest along its own
@@ -180,7 +68,7 @@ void mbg_raster_tri(uint ti) {
 // neighbourhood, so the winners have to be visible across the workgroup. What
 // goes away is the atomics -- each texel is written once, by the thread that
 // owns it.
-uint mbg_tri_key(uint ti, vec3 d) {
+bool mbg_tri_hit(uint ti, vec3 d, out float dist) {
     MbgTri tr = tris[ti];
     vec3 v0 = tr.p0.xyz - g_P;
     vec3 v1 = tr.p1.xyz - g_P;
@@ -205,13 +93,16 @@ uint mbg_tri_key(uint ti, vec3 d) {
     // camera's own triangle is excluded already, because its plane sits `bias`
     // below the origin, so every upper-hemisphere direction gives t < 0.
 
-    if (!mbg_cone_contains(v0, v1, v2, d)) return MBG_EMPTY;
+    if (!mbg_cone_contains(v0, v1, v2, d)) return false;
 
     float den = dot(pn, d);
-    if (abs(den) < 1e-20) return MBG_EMPTY;
+    if (abs(den) < 1e-20) return false;
     float t = pc / den;
-    if (t <= 0.0) return MBG_EMPTY;
-    return mbg_pack_key(t * length(d), u_inv_far, ti);
+    if (t <= 0.0) return false;                  // behind the camera
+    // The ray parameter, not a distance: every triangle here is compared along
+    // the SAME d, so the scale factor |d| is common and cancels.
+    dist = t;
+    return true;
 }
 
 // Fill s_vis for this thread's texels. Replaces clear + rasterize + barrier.
@@ -220,10 +111,11 @@ void mbg_resolve_vis(uint tid, uint stride, uint tri_count) {
     for (uint i = tid; i < n; i += stride) {
         vec3 d = mbg_to_world(mbg_px_to_dir(vec2(float(i % u_res), float(i / u_res))
                                             + vec2(0.5), u_res));
-        uint best = MBG_EMPTY;
+        uint  best = MBG_EMPTY;
+        float bestd = 1e30;
         for (uint t = 0u; t < tri_count; ++t) {
-            uint k = mbg_tri_key(t, d);
-            if (k < best) best = k;
+            float dist;
+            if (mbg_tri_hit(t, d, dist) && dist < bestd) { bestd = dist; best = t; }
         }
         s_vis[i] = best;
     }

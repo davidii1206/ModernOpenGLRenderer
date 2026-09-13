@@ -128,7 +128,7 @@ void main() {
             uint key = s_vis[i];
             float v = 0.0;
             if (key != MBG_EMPTY && u_emitters != 0u) {
-                MbgTri ht = tris[mbg_key_tri(key)];
+                MbgTri ht = tris[key];
                 vec3 hdir = mbg_to_world(quad[i].xyz);
                 float hden = dot(ht.n.xyz, hdir);
                 if (abs(hden) > 1e-12) {
@@ -161,7 +161,7 @@ void main() {
         // answered the only question a sky needs answered; all that is left is
         // to ask the dome what colour it is (common/sky.glsl).
         if (key == MBG_EMPTY) { acc += mbg_sky_dome(mbg_to_world(q.xyz)) * q.w; continue; }
-        MbgTri tr = tris[mbg_key_tri(key)];
+        MbgTri tr = tris[key];
         // emission.w marks a triangle whose direct term is added analytically
         // below; taking it from the quadrature as well would double it.
         if (u_emitters != 0u && tr.emission.w != 0.0) continue;
@@ -212,7 +212,7 @@ void main() {
         // Same depth sort with the loops nested the other way -- lv_mass_texel
         // in common/lightview.glsl, and implementation.md finding 22.
         s_red2[tid] = vec4(fitted ? lv_mass_texel(u_lv_res, g_N, ti, u_tri_count,
-                                                  u_inv_far, tid, 64u)
+                                                  tid, 64u)
                                   : vec2(0.0), 0.0, 0.0);
         barrier();
         for (uint r = 32u; r > 0u; r >>= 1u) {
@@ -247,7 +247,7 @@ void main() {
         // the hemisphere's own rotation, which is driven by the same position.
         if (u_jitter != 0u) lv_spin(mbg_jitter_angle(c.pos.xyz, 0x9E3779B9u));
         s_red2[tid] = vec4(lv_mass_disc_texel(u_lv_res, g_N, u_sun_cos_r, u_tri_count,
-                                              u_inv_far, tid, 64u),
+                                              tid, 64u),
                            0.0, 0.0);
         barrier();
         for (uint r = 32u; r > 0u; r >>= 1u) {
@@ -345,7 +345,7 @@ void main() {
             s_cdf[i] = 0.0;
             uint key = s_vis[i];
             if (key == MBG_EMPTY || u_importance == 0u) continue;
-            MbgTri ht = tris[mbg_key_tri(key)];
+            MbgTri ht = tris[key];
             vec3 hdir = mbg_to_world(quad[i].xyz);
             float hden = dot(ht.n.xyz, hdir);
             if (abs(hden) <= 1e-12) continue;
@@ -386,7 +386,7 @@ void main() {
             uint key = s_vis[i];
             float f = 0.0;
             if (key != MBG_EMPTY) {
-                vec3 alb = tris[mbg_key_tri(key)].albedo.xyz;
+                vec3 alb = tris[key].albedo.xyz;
                 f = quad[i].w * dot(alb, vec3(1.0 / 3.0)) * (s_cdf[i] + dbar);
             }
             s_cdf[i] = f;
@@ -411,7 +411,7 @@ void main() {
                 float f = s_cdf[i] - (i > 0u ? s_cdf[i - 1u] : 0.0);
                 uint key = s_vis[i];
                 if (f > 0.0 && key != MBG_EMPTY) {
-                    MbgTri ht = tris[mbg_key_tri(key)];
+                    MbgTri ht = tris[key];
                     vec3 hdir = mbg_to_world(quad[i].xyz);
                     float hden = dot(ht.n.xyz, hdir);
                     if (abs(hden) > 1e-12) {
@@ -601,7 +601,7 @@ void main() {
                 uint idx = uint(yy) * u_res + uint(xx);
                 uint key = s_vis[idx];
                 if (key == MBG_EMPTY) continue;
-                MbgTri ht = tris[mbg_key_tri(key)];
+                MbgTri ht = tris[key];
                 vec3 mass = (wx * wy) * quad[idx].w * ht.albedo.xyz;
                 wsum += mass;
 
@@ -643,7 +643,7 @@ void main() {
         vec3 hit = vec3(0.0), hn = vec3(0.0);
         float alive = 0.0;
         if (besti != MBG_EMPTY) {
-            MbgTri tr = tris[mbg_key_tri(s_vis[besti])];
+            MbgTri tr = tris[s_vis[besti]];
             vec3 dir = mbg_to_world(quad[besti].xyz);
             float denom = dot(tr.n.xyz, dir);
             if (abs(denom) > 1e-12) {

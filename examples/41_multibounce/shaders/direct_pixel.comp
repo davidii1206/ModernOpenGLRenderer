@@ -111,7 +111,7 @@ void main() {
         // See lv_mass_texel in common/lightview.glsl for why this is the same
         // depth sort with the loops nested the other way.
         s_lvred[tid] = vec4(lit ? lv_mass_texel(u_lv_res, N, ti, u_tri_count,
-                                                u_inv_far, tid, 64u)
+                                                tid, 64u)
                                 : vec2(0.0),
                             0.0, 0.0);
         barrier();
@@ -158,7 +158,7 @@ void main() {
         lv_setup_dir(P, N, u_sun_dir, u_sun_tan_r, lv_near_for(u_inv_far),
                      2.0 * u_bias);
         s_lvred[tid] = vec4(lv_mass_disc_texel(u_lv_res, N, u_sun_cos_r, u_tri_count,
-                                               u_inv_far, tid, 64u),
+                                               tid, 64u),
                             0.0, 0.0);
         barrier();
         for (uint r = 32u; r > 0u; r >>= 1u) {

@@ -86,7 +86,7 @@ double total_area(const std::vector<Tri>& tris) {
 bool Scene::build(const std::vector<Tri>& tris) {
     if (tris.size() > kMaxTris) {
         gllib::logf(gllib::LogLevel::error,
-                    "%zu triangles exceeds the %u the 32-bit visibility key allows",
+                    "%zu triangles exceeds the %u the visibility key allows",
                     tris.size(), kMaxTris);
         return false;
     }

@@ -135,31 +135,26 @@ bool mbg_cone_contains(vec3 v0, vec3 v1, vec3 v2, vec3 d) {
     return b0 >= tol && b1 >= tol && b2 >= tol;
 }
 
-// --- The packed depth key ---------------------------------------------------
+// --- The visibility key ------------------------------------------------------
 //
-// Section 5.3 wants a shared uint64 with depth in the high bits and cluster +
-// triangle ID in the low bits, resolved with atomicMin. GLSL has no portable
-// 64-bit shared atomic (NV_shader_atomic_int64 and its AMD counterpart are both
-// vendor extensions), so this example packs into 32:
+// A TRIANGLE INDEX, AND NOTHING ELSE. Section 5.3 wants a shared uint64 with
+// depth in the high bits and the triangle ID in the low bits, resolved with
+// atomicMin, and this example used to pack that into 32 bits -- depth16 << 16 |
+// tri16 -- because GLSL has no portable 64-bit shared atomic. That capped the
+// scene at 65535 triangles, which the Cornell bunny (69483) already exceeds.
 //
-//     key = (depth16 << 16) | triangle_index16
+// The cap is gone because the ATOMIC is gone. Inverting the rasterizers
+// (findings 22 and 23) gave each texel to one thread, so the nearest triangle is
+// found by comparing full-precision floats in a register and written once. The
+// depth never needs to survive into shared memory: every consumer of this buffer
+// -- the quadrature, the spawn, the oracle dump -- asks only which triangle won.
 //
-// which caps the scene at 65535 triangles (asserted on the host) and quantizes
-// depth to 1/65535 of the far distance. Both are fine here and neither is
-// fundamental: the same kernel with a uint64 key and a wider ID field is the
-// production form. Ties break to the lowest triangle index, so the winner is
-// fully determined by the atomic and the image is bit-reproducible across runs.
+// So the key is the index, the sentinel is the all-ones word, and the scene
+// limit is 4 billion triangles rather than 65 thousand. No extension needed.
 #define MBG_EMPTY 0xFFFFFFFFu
 
-// Every pass that packs a key needs the same far distance, so it is declared
-// with the key rather than in one of the rasterizers.
+// Every pass that measures a distance needs the same far reference, so it is
+// declared here rather than in one of the rasterizers.
 uniform float u_inv_far;
-
-uint mbg_pack_key(float dist, float inv_far, uint tri) {
-    uint d = uint(clamp(dist * inv_far, 0.0, 1.0) * 65535.0 + 0.5);
-    return (d << 16) | (tri & 0xFFFFu);
-}
-
-uint mbg_key_tri(uint key) { return key & 0xFFFFu; }
 
 #endif

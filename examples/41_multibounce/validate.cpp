@@ -455,7 +455,7 @@ bool run_gates(const std::string& names, Solver& solver, const SolveConfig& base
                     lost_weight += double(q.texels[i].w);
                     continue;
                 }
-                const uint32_t gt = key & 0xFFFFu;
+                const uint32_t gt = key;
                 if (int(gt) == best) continue;
                 // A different triangle at the same distance is a tie on a shared
                 // edge or a coplanar seam, which the atomic is free to break

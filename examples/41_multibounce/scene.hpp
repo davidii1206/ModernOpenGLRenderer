@@ -100,7 +100,7 @@ public:
     // being picked up by the hemisphere raster. See raster.comp.
     uint32_t emitter_count() const { return emitter_count_; }
 
-    static constexpr uint32_t kMaxTris = 65535;
+    static constexpr uint32_t kMaxTris = 0xFFFFFFFEu;   // MBG_EMPTY is the sentinel
 
 private:
     gl::Buffer buf_{gl::BufferType::shader, gl::BufferUsage::static_draw};
