@@ -35,12 +35,28 @@ layout(local_size_x = 64) in;
 //
 // ADDS INTO the upsampled target: it holds irradiance E directly, so this is a
 // read-modify-write and needs no second full-resolution texture.
+//
+// AND IT DOES NOT INCLUDE raster.glsl, WHICH IS A PERFORMANCE DECISION.
+//
+// This pass never rasterizes a hemisphere -- that is the whole point of the
+// light view -- so it needs nothing raster.glsl defines. Including it anyway
+// still costs, because a GLSL header's `shared` declarations are paid by the
+// includer whether or not it touches them: s_vis (4 KB), s_cdf (4 KB), s_red,
+// s_red2 and s_blk (2.3 KB) would be 10.5 KB of shared memory this shader never
+// reads.
+//
+// On a 64-thread workgroup that is the difference between roughly 12% and 29%
+// occupancy on Ampere, and this is the most expensive pass in the renderer, so
+// it is the difference the whole frame notices. Measured on an RTX 3060: 2317 ms
+// down to the number in implementation.md's finding 22.
+//
+// The rule this is an instance of: shared memory belongs to the kernel, not to
+// the header. Anything added below must keep this include list honest.
 // ---------------------------------------------------------------------------
 
 #include "scene.glsl"
 #include "emitter.glsl"
 #include "lightview.glsl"
-#include "raster.glsl"
 #include "gbuffer.glsl"
 #include "sky.glsl"
 
@@ -76,7 +92,6 @@ void main() {
     vec3  P = world_from_depth(d, (vec2(p) + 0.5) / vec2(u_size), u_inv_view_proj) +
               N * u_bias;
 
-    uint texels = u_lv_res * u_lv_res;
     vec3 E = vec3(0.0);
 
     // Uniform loop bound, so the barriers inside it are safe.
@@ -91,24 +106,13 @@ void main() {
                                           u_emissive);
         bool lit = dot(mag, vec3(1.0)) > 0.0 && lv_setup(P, N, tr, 2.0 * u_bias);
 
-        if (lit) {
-            for (uint i = tid; i < texels; i += 64u) {
-                s_lv[i] = MBG_EMPTY;
-                s_lv_e[i] = MBG_EMPTY;
-            }
-            barrier();
-            memoryBarrierShared();
-
-            // The emitter alone: the denominator, i.e. where it would reach.
-            lv_raster_tri(ti, u_lv_res, u_inv_far, true);
-            // Everything: the numerator, i.e. what actually got there.
-            for (uint t = tid; t < u_tri_count; t += 64u)
-                lv_raster_tri(t, u_lv_res, u_inv_far, false);
-            barrier();
-            memoryBarrierShared();
-        }
-
-        s_lvred[tid] = vec4(lit ? lv_mass(u_lv_res, N, tid, texels, 64u) : vec2(0.0),
+        // One texel per thread, visibility resolved in a register: no clear, no
+        // shared buffer, no atomics and no barrier around the rasterization.
+        // See lv_mass_texel in common/lightview.glsl for why this is the same
+        // depth sort with the loops nested the other way.
+        s_lvred[tid] = vec4(lit ? lv_mass_texel(u_lv_res, N, ti, u_tri_count,
+                                                u_inv_far, tid, 64u)
+                                : vec2(0.0),
                             0.0, 0.0);
         barrier();
         for (uint r = 32u; r > 0u; r >>= 1u) {
@@ -153,15 +157,8 @@ void main() {
         // per-pixel grain with no filter downstream to take it back out.
         lv_setup_dir(P, N, u_sun_dir, u_sun_tan_r, lv_near_for(u_inv_far),
                      2.0 * u_bias);
-        for (uint i = tid; i < texels; i += 64u) s_lv[i] = MBG_EMPTY;
-        barrier();
-        memoryBarrierShared();
-        for (uint t = tid; t < u_tri_count; t += 64u)
-            lv_raster_tri(t, u_lv_res, u_inv_far, false);
-        barrier();
-        memoryBarrierShared();
-
-        s_lvred[tid] = vec4(lv_mass_disc(u_lv_res, N, u_sun_cos_r, tid, texels, 64u),
+        s_lvred[tid] = vec4(lv_mass_disc_texel(u_lv_res, N, u_sun_cos_r, u_tri_count,
+                                               u_inv_far, tid, 64u),
                             0.0, 0.0);
         barrier();
         for (uint r = 32u; r > 0u; r >>= 1u) {

@@ -218,7 +218,14 @@ void main() {
             }
             barrier();
             memoryBarrierShared();
-            lv_raster_tri(ti, u_lv_res, u_inv_far, true);
+            // ONE THREAD. lv_raster_tri walks a triangle's projected bounding
+            // box and atomicMins every texel it covers, so calling it from all
+            // 64 invocations rasterizes the SAME triangle 64 times into the same
+            // 64 shared addresses -- 64x the work and maximal atomic contention,
+            // for an answer that was already correct after the first one. The
+            // scene loop below is distributed by tid because it has many
+            // triangles to spread; the emitter pass has exactly one.
+            if (tid == 0u) lv_raster_tri(ti, u_lv_res, u_inv_far, true);
             for (uint t = tid; t < u_tri_count; t += 64u)
                 lv_raster_tri(t, u_lv_res, u_inv_far, false);
             barrier();

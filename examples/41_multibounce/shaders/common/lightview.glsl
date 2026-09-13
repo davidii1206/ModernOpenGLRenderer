@@ -341,6 +341,152 @@ void lv_raster_tri(uint ti, uint res, float inv_far, bool emit_pass) {
         lv_fill(px[0], px[k], px[k + 1], pn, pc, ti, res, inv_far, emit_pass);
 }
 
+// --- The inverted path: one texel per thread, no shared buffer ---------------
+//
+// SAME DEPTH SORT, OPPOSITE LOOP ORDER. lv_raster_tri walks a triangle and
+// atomicMins every texel it covers, so the parallelism is over TRIANGLES and the
+// work inside each one is over texels, walked serially in a single lane. With 32
+// triangles and 64 threads that means half the workgroup idles at the barrier
+// while the critical path is whatever the largest triangle's bounding box costs
+// one thread. Measured on an RTX 3060: the per-pixel direct pass scales almost
+// linearly with texel count -- 806 ms at a 4x4 light view, 1967 at 8x8, 6495 at
+// 16x16 -- which is that serial walk and nothing else.
+//
+// Inverting it gives each thread ONE TEXEL and asks, for that direction, which
+// triangle is nearest. Perfectly balanced, and the winner lives in a register,
+// so the shared visibility buffer, its atomics and the barriers around them all
+// disappear.
+//
+// IT IS STILL RASTERIZATION, NOT A RAY CAST. lv_texel_key below decides coverage
+// with the same edge test a rasterizer uses, evaluated before the projection
+// instead of after: the three planes through the receiver and the triangle's
+// edges have normals cross(v_k, v_k+1), and a direction is inside the triangle's
+// cone exactly when all three dot products share the sign of the triple product
+// [v0,v1,v2]. After a projective map that expression IS the 2D edge function, up
+// to a positive scale -- the same inclusive test, resolved by the same depth
+// comparison. What changes is the order the loops are nested in.
+//
+// It also deletes the clipping. lv_raster_tri has to clip against the near plane
+// and the four frustum sides before it can project, which is five
+// Sutherland-Hodgman passes over dynamically indexed vec3[MBG_CLIP_MAX] arrays --
+// arrays a GPU puts in local memory. Here there is nothing to clip: the only
+// directions ever tested are texel centres, which are inside the frustum by
+// construction, and the sign test handles the near plane on its own.
+//
+// The shape it leaves behind is the one culling wants. Every triangle is now an
+// independent, side-effect-free test against a direction, so a future frustum or
+// cluster cull just shortens the inner loop.
+
+// Does triangle `ti` cover direction `d` from lv_P, and at what packed depth?
+// MBG_EMPTY when it does not. `d` need not be normalized.
+uint lv_texel_key(uint ti, vec3 d, float inv_far) {
+    MbgTri tr = tris[ti];
+    vec3 v0 = tr.p0.xyz - lv_P;
+    vec3 v1 = tr.p1.xyz - lv_P;
+    vec3 v2 = tr.p2.xyz - lv_P;
+
+    // The same two culls lv_raster_tri opens with, for the same reasons: a
+    // triangle wholly behind the receiver's own plane cannot be between it and
+    // anything, and one wholly beyond the light cannot be in front of it.
+    vec3 h = vec3(dot(lv_N, v0), dot(lv_N, v1), dot(lv_N, v2));
+    if (all(lessThan(h, vec3(0.0)))) return MBG_EMPTY;
+    vec3 w = vec3(dot(v0, lv_F), dot(v1, lv_F), dot(v2, lv_F));
+    if (all(greaterThan(w, vec3(lv_wmax)))) return MBG_EMPTY;
+
+    vec3  pn = tr.n.xyz;
+    float pc = dot(pn, v0);
+
+    // The receiver is ON this triangle's plane: everything on the far side of it
+    // is inside the material. Finding 19 -- without this the sun leaks through
+    // concave creases where the reconstructed position lands microns outside.
+    if (abs(pc) <= lv_peps) {
+        vec3 lo = min(v0, min(v1, v2)) - vec3(lv_peps);
+        vec3 hi = max(v0, max(v1, v2)) + vec3(lv_peps);
+        if (all(lessThanEqual(lo, vec3(0.0))) && all(greaterThanEqual(hi, vec3(0.0))))
+            return dot(pn, d) < 0.0 ? mbg_pack_key(0.0, inv_far, ti) : MBG_EMPTY;
+    }
+
+    // The three edge planes through the receiver. `o` is the triple product,
+    // which is the solid angle's orientation; a triangle seen edge on has o ~ 0
+    // and subtends nothing.
+    vec3 e0 = cross(v0, v1);
+    vec3 e1 = cross(v1, v2);
+    vec3 e2 = cross(v2, v0);
+    float o = dot(e0, v2);
+    if (abs(o) < 1e-20) return MBG_EMPTY;
+    float sgn = o < 0.0 ? -1.0 : 1.0;
+    // Inclusive on every edge, so a shared edge is covered by both triangles and
+    // resolves to the same depth -- the crack-free rule mbg_fill argues for, and
+    // free here because there is no tolerance to tune.
+    if (dot(d, e0) * sgn < 0.0) return MBG_EMPTY;
+    if (dot(d, e1) * sgn < 0.0) return MBG_EMPTY;
+    if (dot(d, e2) * sgn < 0.0) return MBG_EMPTY;
+
+    float den = dot(pn, d);
+    if (abs(den) < 1e-20) return MBG_EMPTY;
+    float t = pc / den;
+    if (t <= 0.0) return MBG_EMPTY;              // behind the receiver
+    return mbg_pack_key(t * length(d), inv_far, ti);
+}
+
+// (visible, total) over this thread's texels, computing the visibility as it
+// goes. Replaces clear + two rasterizations + lv_mass with one pass.
+//
+// The emitter is tested FIRST and the scene loop is skipped when it does not
+// reach this texel, which the rasterized version could not do: it had to fill
+// the whole scene into the buffer before it knew.
+vec2 lv_mass_texel(uint res, vec3 N, uint emit_ti, uint tri_count, float inv_far,
+                   uint lo, uint stride) {
+    vec2 m = vec2(0.0);
+    uint n = res * res;
+    for (uint i = lo; i < n; i += stride) {
+        vec3 d = lv_px_to_dir(vec2(float(i % res), float(i / res)) + vec2(0.5), res);
+        float cosr = dot(N, d);
+        if (cosr <= 0.0) continue;
+
+        uint ke = lv_texel_key(emit_ti, d, inv_far);
+        if (ke == MBG_EMPTY) continue;
+
+        uint kv = MBG_EMPTY;
+        for (uint t = 0u; t < tri_count; ++t) {
+            uint k = lv_texel_key(t, d, inv_far);
+            if (k < kv) kv = k;
+        }
+
+        float l2 = dot(d, d);
+        float w = cosr / (l2 * l2);
+        m.y += w;
+        // One key step of tolerance, for an emitter coplanar with a surface.
+        if (kv == MBG_EMPTY || (kv >> 16u) + 1u >= (ke >> 16u)) m.x += w;
+    }
+    return m;
+}
+
+// The sun's disc, same inversion. It needs only "is anything in the way", not
+// which thing, so the scene loop stops at the first blocker.
+vec2 lv_mass_disc_texel(uint res, vec3 N, float cos_r, uint tri_count, float inv_far,
+                        uint lo, uint stride) {
+    vec2 m = vec2(0.0);
+    uint n = res * res;
+    for (uint i = lo; i < n; i += stride) {
+        vec3 d = lv_px_to_dir(vec2(float(i % res), float(i / res)) + vec2(0.5), res);
+        float l = length(d);
+        if (dot(d, lv_F) < cos_r * l) continue;
+        float cosr = dot(N, d);
+        if (cosr <= 0.0) continue;
+
+        bool blocked = false;
+        for (uint t = 0u; t < tri_count; ++t) {
+            if (lv_texel_key(t, d, inv_far) != MBG_EMPTY) { blocked = true; break; }
+        }
+
+        float w = cosr / (l * l * l * l);
+        m.y += w;
+        if (!blocked) m.x += w;
+    }
+    return m;
+}
+
 // (visible, total) contribution mass over this thread's texels.
 //
 // Weighted by the receiver cosine and the projection's own solid angle: for a

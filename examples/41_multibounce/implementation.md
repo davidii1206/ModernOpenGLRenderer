@@ -1325,6 +1325,81 @@ Two things survive the revert:
   machinery, and it is the thing to build if this matters, rather than spending
   4× the cameras to trade one artifact for another.
 
+### 22. The light view was local-memory bound, and the loop order was why
+
+First measurements on real hardware (RTX 3060, against the llvmpipe numbers
+everything above was taken on), and the headline is that the per-pixel direct
+pass cost **2570 ms of a 3657 ms frame** — on a GPU, for 262k pixels of Cornell.
+A 4-thread software rasterizer was within 3x of it. Something was wrong, and it
+was not the thing it looked like.
+
+**Two guesses that measured as no-ops**, both kept because they are strictly less
+work, neither the cause:
+
+- `direct_pixel.comp` included `raster.glsl` and so declared 10.5 KB of shared
+  memory (`s_vis`, `s_cdf`, the reductions) it never touched — on paper the
+  difference between ~12% and ~29% occupancy. Removing it changed nothing: the
+  driver already dead-strips unused shared storage.
+- the emitter pass ran `lv_raster_tri` from all 64 invocations with no `tid`
+  guard, rasterizing one triangle 64 times into the same 64 shared addresses.
+  Guarding it changed nothing either: NVIDIA warp-aggregates same-address shared
+  atomics, so it cost about two warps, not 64x.
+
+**What found it was a scaling measurement, not a hypothesis.** `MBG_DIRECT_RES`
+scales texels per light view while leaving per-triangle setup fixed:
+
+| light view | texels | Direct/px |
+|---|---|---|
+| 4x4 | 16 | 806 ms |
+| 8x8 | 64 | 1967 ms |
+| 16x16 | 256 | 6495 ms |
+
+Almost linear in texels. So the cost was `lv_fill`'s inner loop — and `lv_fill`
+walks a triangle's projected bounding box **serially in one lane**, while the
+parallelism is spread across triangles. 32 triangles over 64 threads: half the
+workgroup idles at the barrier, and the critical path is whatever the largest
+triangle costs one thread.
+
+Worse, each of those threads carried `vec3[MBG_CLIP_MAX]` arrays through five
+Sutherland-Hodgman passes (near plane plus four frustum sides), dynamically
+indexed — which a GPU puts in **local memory**, i.e. off-chip. Roughly 720 bytes
+per thread, 46 KB of local traffic per workgroup, every access a global
+transaction.
+
+**The fix inverts the loops.** Each thread takes ONE texel and asks which
+triangle is nearest along it. Perfectly balanced; the winner lives in a register,
+so the shared visibility buffer, its atomics and the barriers around them all
+disappear; and there is nothing left to clip, because the only directions ever
+tested are texel centres, which are inside the frustum by construction.
+
+It is the same depth sort, not a ray cast. `lv_texel_key` decides coverage with
+the rasterizer's own edge test evaluated before the projection instead of after:
+the planes through the receiver and the triangle's edges have normals
+`cross(v_k, v_k+1)`, and a direction is inside the cone exactly when all three
+dot products share the sign of the triple product `[v0,v1,v2]`. Under a
+projective map that expression *is* the 2D edge function up to a positive scale.
+
+| | Direct/px | whole frame |
+|---|---|---|
+| rasterized, bbox per thread | 2570 ms | 3657 ms |
+| **inverted, texel per thread** | **20.7 ms** | **871 ms** |
+
+**124x**, and the image is the same one: RMSE against the direct reference 0.0429
+either way, roughness 0.91x either way, maximum pixel difference 4.3/255 with
+nothing over 8, and the penumbra still ramps 14-13-12-11-10-9-8-6-5-4-3-2-1-0
+instead of stepping. The residual differences are the old edge tolerance, which
+the inverted test does not need.
+
+Two things follow. The shape left behind is what culling wants — every triangle
+is now an independent side-effect-free test against a direction, so a frustum or
+cluster cull just shortens the inner loop. And `raster.comp` still rasterizes its
+light views the old way; Raster L2 and L3 are now the entire remaining frame
+cost, and the same inversion applies to them.
+
+**A caution about the numbers above this finding.** They were all taken on
+llvmpipe, where local memory is just stack and this whole effect is invisible. A
+software rasterizer and a GPU do not rank the same implementation the same way.
+
 ## What this does not answer
 
 - **§8.1, the reuse radius experiment.** The gate the doc puts before everything
