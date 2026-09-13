@@ -43,6 +43,7 @@ layout(local_size_x = 128) in;
 #include "surfel.glsl"
 #include "micro.glsl"
 #include "pack.glsl"
+#include "fmm.glsl"
 
 layout(std430, binding = 4) writeonly buffer IrradDst { vec4 irrad_dst[]; };
 layout(std430, binding = 6) readonly  buffer Lout     { vec4 lout[]; };
@@ -114,6 +115,13 @@ uniform uint  u_bucket_base;     // vec4 offset of this tier's bucket table
 // length arrived through the indirect dispatch rather than through u_slice.
 uniform uint  u_lod;
 uniform uint  u_lod_base;        // index of this tier's region in lod_list
+// The FMM's far field: the local expansion downswept to this receiver's own leaf
+// cell, evaluated per bucket. 0 keeps the per-block outgoing radiance that a
+// visibility march samples.
+uniform uint  u_fmm;
+uniform uint  u_fmm_interp;      // trilinear Lsh from the 8 nearest centres
+uniform uint  u_fmm_slot_base;
+uniform uint  u_fmm_coeff_base;
 uniform float u_horizon;         // identical to bf_radiance.comp
 uniform float u_plane_bias;      // identical to bf_radiance.comp
 uniform float u_self_cos;        // identical to bf_radiance.comp
@@ -303,6 +311,49 @@ vec3 sgi_env(vec3 w) {
     vec3 L = mix(u_sky_ground, u_sky, clamp(w.y * 0.5 + 0.5, 0.0, 1.0));
     if (dot(w, u_sun_dir) >= u_sun_cos) L += u_sun;
     return L;
+}
+
+// The local expansion at a receiver, spec section 3.2's evaluation step.
+//
+// Trilinear across the 8 nearest CELL CENTRES, which is step 7 and which finding
+// 57 could not do before: the thing being interpolated now is the incident field
+// at the receiver, which varies smoothly with where the receiver stands, rather
+// than the outgoing radiance of whichever block a march stopped in. Cells with
+// no expansion are dropped from the average and the weights renormalized, so a
+// receiver at the edge of the occupied set leans on the cells that exist instead
+// of being pulled toward zero.
+bool sgi_fmm_expansion(vec3 p, out vec3 c[9]) {
+    for (uint k = 0u; k < 9u; ++k) c[k] = vec3(0.0);
+
+    const vec3 g = (p - u_grid_min) / u_cell - vec3(0.5);   // cell-centre lattice
+    const ivec3 b = ivec3(floor(g));
+    const vec3  f = g - vec3(b);
+
+    float wsum = 0.0;
+    const uint n = u_fmm_interp != 0u ? 8u : 1u;
+    for (uint i = 0u; i < n; ++i) {
+        ivec3 o;
+        float w;
+        if (u_fmm_interp != 0u) {
+            o = ivec3(int(i & 1u), int((i >> 1u) & 1u), int((i >> 2u) & 1u));
+            const vec3 t = mix(vec3(1.0) - f, f, vec3(o));
+            w = t.x * t.y * t.z;
+        } else {
+            // Nearest cell: the one the receiver is actually in.
+            o = ivec3(greaterThanEqual(f, vec3(0.5)));
+            w = 1.0;
+        }
+        if (w <= 0.0) continue;
+        const int sl = sgi_fmm_slot_at(b + o, u_grid_res, u_fmm_slot_base);
+        if (sl < 0) continue;
+        vec3 e[9];
+        sgi_fmm_load(e, u_fmm_lsh_off, u_fmm_coeff_base, uint(sl));
+        for (uint k = 0u; k < 9u; ++k) c[k] += w * e[k];
+        wsum += w;
+    }
+    if (wsum <= 1e-6) return false;
+    for (uint k = 0u; k < 9u; ++k) c[k] /= wsum;
+    return true;
 }
 
 void main() {
@@ -649,6 +700,31 @@ void main() {
         const vec3 ld0 = bucket[u_bucket_base + b * 2u + 0u].xyz;         // tangent-frame direction
         const vec3 wd  = normalize(T * ld0.x + B * ld0.y + nP * ld0.z);
         far_L = sgi_env(wd);
+
+        // The FMM's far field. The V-list and every coarser level are already
+        // summed into this receiver's leaf expansion, so there is nothing to
+        // march for and nothing to blend: evaluate the field in the bucket's own
+        // direction and add it to the sky, which the expansion does not carry.
+        //
+        // Clamped at zero rather than windowed. An order-2 fit of a near-delta
+        // source rings, and the spec's own advice is to handle the visible
+        // symptom for free here instead of attenuating band 2 in every cell to
+        // fix a minority of them.
+        if (u_fmm != 0u) {
+            vec3 e[9];
+            if (sgi_fmm_expansion(posP, e))
+                far_L += max(sgi_sh2_eval(e, wd), vec3(0.0));
+            // The sky is still the thing a wall has to stop, so the macro march
+            // below stays -- but under the FMM it only decides whether this
+            // bucket sees sky, and never replaces the expansion.
+            if (u_far_occ != 0u && u_near > 0.0) {
+                float t_sky = 0.0;
+                if (sgi_far_block(posP + nP * u_macro_cell, wd, u_near, 3.4e38, t_sky) >= 0)
+                    far_L -= sgi_env(wd);
+            }
+            break;
+        }
+
         if (u_far_occ == 0u || u_near <= 0.0) break;
         // Lift the origin a full macro block off the receiver's own plane before
         // marching. A macro block is 4 cells -- wider than the near horizon --

@@ -101,6 +101,10 @@ bool Solver::init() {
     radiance_  = Pipeline::compute("shaders/bf_radiance.comp");
     micro_     = Pipeline::compute("shaders/bf_micro.comp");
     lod_prog_  = Pipeline::compute("shaders/lod_tier.comp");
+    p2m_       = Pipeline::compute("shaders/fmm_p2m.comp");
+    m2m_       = Pipeline::compute("shaders/fmm_m2m.comp");
+    m2l_       = Pipeline::compute("shaders/fmm_m2l.comp");
+    l2l_       = Pipeline::compute("shaders/fmm_l2l.comp");
     direct_    = Pipeline::compute("shaders/nee_direct.comp");
     blk_prog_  = Pipeline::compute("shaders/blk_rad.comp");
     timer_     = std::make_unique<PassTimer>("Solve");
@@ -111,6 +115,10 @@ bool Solver::init() {
 bool Solver::poll() {
     bool changed = lout_prog_.poll();
     changed |= lod_prog_.poll();
+    changed |= p2m_.poll();
+    changed |= m2m_.poll();
+    changed |= m2l_.poll();
+    changed |= l2l_.poll();
     changed |= radiance_.poll();
     changed |= micro_.poll();
     changed |= blk_prog_.poll();
@@ -172,6 +180,95 @@ bool Solver::nee_active(const SolveConfig& cfg) const {
            ((emitters_ != nullptr && emitters_->count() > 0) || cfg.sun_is_nee_light());
 }
 
+// Passes 3-5 of the pipeline: the upsweep, the M2L, and the downsweep. Run once
+// per sweep, immediately after lout, because the multipole is a function of
+// outgoing radiance and nothing else.
+//
+// The whole tree is rebuilt every sweep rather than updated. Spec section 7 is
+// emphatic about this: a partially updated local expansion is spatially
+// inconsistent and reads as blotching, which is far worse than latency, and
+// these three passes are cheap next to pass 6 by design.
+void Solver::run_fmm(SurfelSet& set, const SolveConfig& cfg) {
+    if (fmm_ == nullptr || !fmm_->valid() || grid_ == nullptr) return;
+    if (!p2m_.valid() || !m2m_.valid() || !m2l_.valid() || !l2l_.valid()) return;
+
+    set.bind();
+    grid_->bind();
+    fmm_->bind();
+    b_lout_.bind_base(kBindLout);
+
+    const uint32_t L = fmm_->levels();
+    auto groups = [](uint32_t n) { return (n + 63u) / 64u; };
+    auto regions = [&](const Pipeline& p) {
+        p.set("u_fmm_cell_off", fmm_->cell_off());
+        p.set("u_fmm_ilm_off", fmm_->ilm_off());
+        p.set("u_fmm_lsh_off", fmm_->lsh_off());
+    };
+
+    // P2M at the leaves. This also clears Lsh at level 0; M2M clears it above.
+    {
+        const FmmTree::Level& lv = fmm_->level(0);
+        p2m_.use();
+        regions(p2m_);
+        p2m_.set("u_slots", lv.slots);
+        p2m_.set("u_slot_base", lv.slot_base);
+        p2m_.set("u_coeff_base", lv.coeff_base);
+        p2m_.set("u_two_sided", cfg.two_sided ? 1u : 0u);
+        gl::dispatch_compute(groups(lv.slots), 1, 1);
+        gl::memory_barrier(GL_SHADER_STORAGE_BARRIER_BIT);
+    }
+
+    // M2M upward. Every level must be complete before the next reads it, so the
+    // barrier is inside the loop and not after it.
+    for (uint32_t l = 1; l < L; ++l) {
+        const FmmTree::Level& lv = fmm_->level(l);
+        const FmmTree::Level& ch = fmm_->level(l - 1);
+        m2m_.use();
+        regions(m2m_);
+        m2m_.set("u_slots", lv.slots);
+        m2m_.set("u_coeff_base", lv.coeff_base);
+        m2m_.set("u_res", lv.res);
+        m2m_.set("u_child_slot_base", ch.slot_base);
+        m2m_.set("u_child_coeff_base", ch.coeff_base);
+        m2m_.set("u_child_res", ch.res);
+        gl::dispatch_compute(groups(lv.slots), 1, 1);
+        gl::memory_barrier(GL_SHADER_STORAGE_BARRIER_BIT);
+    }
+
+    // M2L at every level. Independent between levels -- each reads its own Ilm
+    // and writes its own Lsh -- so one barrier at the end covers all of them.
+    for (uint32_t l = 0; l < L; ++l) {
+        const FmmTree::Level& lv = fmm_->level(l);
+        m2l_.use();
+        regions(m2l_);
+        m2l_.set("u_slots", lv.slots);
+        m2l_.set("u_slot_base", lv.slot_base);
+        m2l_.set("u_coeff_base", lv.coeff_base);
+        m2l_.set("u_res", lv.res);
+        m2l_.set("u_h", grid_->cell() * float(1u << l));
+        gl::dispatch_compute(groups(lv.slots), 1, 1);
+    }
+    gl::memory_barrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+    // L2L downward, parent into child, so the leaf ends up carrying every level
+    // of the expansion. Top-down and barriered per level for the same reason the
+    // upsweep is.
+    for (uint32_t l = L - 1; l-- > 0;) {
+        const FmmTree::Level& lv = fmm_->level(l);
+        const FmmTree::Level& pa = fmm_->level(l + 1);
+        l2l_.use();
+        regions(l2l_);
+        l2l_.set("u_slots", lv.slots);
+        l2l_.set("u_coeff_base", lv.coeff_base);
+        l2l_.set("u_res", lv.res);
+        l2l_.set("u_parent_slot_base", pa.slot_base);
+        l2l_.set("u_parent_coeff_base", pa.coeff_base);
+        l2l_.set("u_parent_res", pa.res);
+        gl::dispatch_compute(groups(lv.slots), 1, 1);
+        gl::memory_barrier(GL_SHADER_STORAGE_BARRIER_BIT);
+    }
+}
+
 void Solver::run_lout(SurfelSet& set, const SolveConfig& cfg) {
     set.bind();
     b_lout_.bind_base(kBindLout);
@@ -212,6 +309,8 @@ void Solver::run_lout(SurfelSet& set, const SolveConfig& cfg) {
         gl::dispatch_compute((set.count() + 255u) / 256u, 1, 1);
         gl::memory_barrier(GL_SHADER_STORAGE_BARRIER_BIT);
     }
+
+    if (cfg.fmm) run_fmm(set, cfg);
 }
 
 // The direct term is a function of geometry and emission only -- it does not
@@ -423,6 +522,17 @@ void Solver::dispatch(SurfelSet& set, const SolveConfig& cfg,
             micro_.set("u_radius", set.radius());
             micro_.set("u_far_occ", cfg.far_occlusion ? 1u : 0u);
             micro_.set("u_far_order", uint32_t(cfg.far_order));
+        const bool fmm = cfg.fmm && fmm_ != nullptr && fmm_->valid();
+        micro_.set("u_fmm", fmm ? 1u : 0u);
+        micro_.set("u_fmm_interp", cfg.fmm_interp ? 1u : 0u);
+        micro_.set("u_fmm_slot_base", fmm ? fmm_->level(0).slot_base : 0u);
+        micro_.set("u_fmm_coeff_base", fmm ? fmm_->level(0).coeff_base : 0u);
+        if (fmm) {
+            fmm_->bind();
+            micro_.set("u_fmm_cell_off", fmm_->cell_off());
+            micro_.set("u_fmm_ilm_off", fmm_->ilm_off());
+            micro_.set("u_fmm_lsh_off", fmm_->lsh_off());
+        }
             b_blk_.bind_base(kBindBlkRad);
         } else {
             micro_.set("u_far_occ", 0u);

@@ -1,0 +1,53 @@
+#version 460 core
+layout(local_size_x = 64) in;
+
+// ---------------------------------------------------------------------------
+// M2M. Spec section 3.2, in its entirety:
+//
+//     parent.Ilm[lm] += child.Ilm[lm]
+//
+// Intensity is linear, so this is exact summation: no cone union, no merge
+// heuristic, no degenerate "omnidirectional" case. Revision 2's cone merge was
+// the one place the design's linearity premise was violated and it biased bright
+// in exactly the configuration that matters -- a cell holding a wall and its
+// opposite face.
+//
+// One thread per occupied PARENT cell, gathering its eight children. The Lsh
+// half is cleared here too: every level's local expansion is rebuilt from
+// scratch each sweep, and a stale one would quietly accumulate.
+// ---------------------------------------------------------------------------
+
+#include "fmm.glsl"
+
+uniform uint  u_slots;
+uniform uint  u_coeff_base;        // this (parent) level
+uniform ivec3 u_res;               // this level's resolution
+uniform uint  u_child_slot_base;
+uniform uint  u_child_coeff_base;
+uniform ivec3 u_child_res;
+
+void main() {
+    const uint s = gl_GlobalInvocationID.x;
+    if (s >= u_slots) return;
+
+    const ivec3 p = sgi_fmm_coord(sgi_fmm_cell(u_coeff_base, s), u_res);
+
+    vec3 acc[9];
+    for (uint k = 0u; k < 9u; ++k) acc[k] = vec3(0.0);
+
+    for (int dz = 0; dz < 2; ++dz)
+        for (int dy = 0; dy < 2; ++dy)
+            for (int dx = 0; dx < 2; ++dx) {
+                const int cs = sgi_fmm_slot_at(p * 2 + ivec3(dx, dy, dz),
+                                               u_child_res, u_child_slot_base);
+                if (cs < 0) continue;
+                vec3 c[9];
+                sgi_fmm_load(c, u_fmm_ilm_off, u_child_coeff_base, uint(cs));
+                for (uint k = 0u; k < 9u; ++k) acc[k] += c[k];
+            }
+
+    sgi_fmm_store(acc, u_fmm_ilm_off, u_coeff_base, s);
+    vec3 zero[9];
+    for (uint k = 0u; k < 9u; ++k) zero[k] = vec3(0.0);
+    sgi_fmm_store(zero, u_fmm_lsh_off, u_coeff_base, s);
+}

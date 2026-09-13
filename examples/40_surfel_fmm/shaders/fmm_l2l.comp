@@ -1,0 +1,40 @@
+#version 460 core
+layout(local_size_x = 64) in;
+
+// ---------------------------------------------------------------------------
+// L2L. Spec section 3.2:
+//
+//     child.Lsh[lm] += parent.Lsh[lm]
+//
+// A value copy, not a Taylor re-centring, which the spec is explicit about --
+// and explicit about the consequence: the local expansion is piecewise constant
+// over each cell, so the far field is discontinuous at every cell boundary and
+// shows as a blocky modulation on a grid. The fix is trilinear interpolation of
+// Lsh at EVALUATION time (step 7), not a gradient stored here.
+//
+// One thread per occupied CHILD cell, pulling from its parent. A push would need
+// atomics and would be no more exact.
+// ---------------------------------------------------------------------------
+
+#include "fmm.glsl"
+
+uniform uint  u_slots;
+uniform uint  u_coeff_base;         // this (child) level
+uniform ivec3 u_res;
+uniform uint  u_parent_slot_base;
+uniform uint  u_parent_coeff_base;
+uniform ivec3 u_parent_res;
+
+void main() {
+    const uint s = gl_GlobalInvocationID.x;
+    if (s >= u_slots) return;
+
+    const ivec3 c  = sgi_fmm_coord(sgi_fmm_cell(u_coeff_base, s), u_res);
+    const int   ps = sgi_fmm_slot_at(c / 2, u_parent_res, u_parent_slot_base);
+    if (ps < 0) return;
+
+    vec3 p[9];
+    sgi_fmm_load(p, u_fmm_lsh_off, u_parent_coeff_base, uint(ps));
+
+    sgi_fmm_add(p, u_fmm_lsh_off, u_coeff_base, s);
+}

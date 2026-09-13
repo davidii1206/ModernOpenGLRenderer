@@ -6,6 +6,7 @@ add_executable(40_surfel_fmm
     direct.cpp
     cuts.cpp
     brute.cpp
+    fmm.cpp
     screen.cpp
     validate.cpp
 )

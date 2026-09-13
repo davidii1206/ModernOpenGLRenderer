@@ -1,0 +1,78 @@
+#version 460 core
+layout(local_size_x = 64) in;
+
+// ---------------------------------------------------------------------------
+// P2M. Spec section 3.2: surfels to a multipole, expanded about the CELL CENTRE.
+//
+//     I(w) = a * L_out * max(0, n . w)          [W/sr]
+//
+// and the clamped cosine has the EXACT order-2 SH projection ahat_l * Y_lm(n),
+// so a cell's whole emission is nine RGB coefficients however its normals are
+// distributed. That is the property the old normal cone was reaching for and
+// could not provide linearly.
+//
+// One thread per occupied leaf cell, gathering its OWN surfels -- the entries
+// carrying kCellOwner, which the grid places first in each cell's range. A
+// gather, not a scatter: no atomics, exact summation, and the same answer every
+// run, which is what lets the whole chain be asserted against the analytic
+// point-to-point transfer.
+// ---------------------------------------------------------------------------
+
+#include "surfel.glsl"
+#include "fmm.glsl"
+
+layout(std430, binding = 8)  readonly buffer CellSC   { uvec2 cell_sc[]; };
+layout(std430, binding = 9)  readonly buffer CellItem { uint  cell_item[]; };
+// L_out per surfel, already formed by bf_lout.comp. Reading it rather than
+// re-forming L_e + albedo*E/pi keeps sgi_outgoing() the single place that /pi
+// can go missing -- which is the failure surfel.glsl singles out as the one that
+// survives every energy check because it is consistent.
+layout(std430, binding = 6)  readonly buffer Lout { vec4 lout[]; };
+
+uniform uint  u_slots;
+uniform uint  u_slot_base;
+uniform uint  u_coeff_base;
+uniform uint  u_two_sided;
+
+void main() {
+    const uint s = gl_GlobalInvocationID.x;
+    if (s >= u_slots) return;
+
+    const uint  c  = sgi_fmm_cell(u_coeff_base, s);
+    const uvec2 sc = cell_sc[c];
+    const uint  n  = sgi_cell_owners(sc);
+
+    vec3 acc[9];
+    for (uint k = 0u; k < 9u; ++k) acc[k] = vec3(0.0);
+
+    for (uint e = 0u; e < n; ++e) {
+        const uint j = sgi_cell_index(cell_item[sc.x + e]);
+        const vec3 L = max(lout[j].rgb, vec3(0.0));
+        if (dot(L, L) <= 0.0) continue;
+        const vec3 nj = surfel_normal(j);
+        const float a = surfel_area(j);
+
+        // Radiant intensity is linear in the surfel's area and outgoing
+        // radiance, so this sum IS the cluster's intensity -- no averaging, no
+        // denominator, and nothing to normalize later. The per-block far field
+        // this replaces carried a weight precisely because it stored a mean.
+        float y[9];
+        sgi_sh2_basis(nj, y);
+        for (uint k = 0u; k < 9u; ++k)
+            acc[k] += (a * sgi_sh2_ahat(k) * y[k]) * L;
+
+        // A two-sided surfel emits from both faces, so it is two clamped
+        // cosines back to back.
+        if (u_two_sided != 0u || surfel_double_sided(j)) {
+            float yb[9];
+            sgi_sh2_basis(-nj, yb);
+            for (uint k = 0u; k < 9u; ++k)
+                acc[k] += (a * sgi_sh2_ahat(k) * yb[k]) * L;
+        }
+    }
+
+    sgi_fmm_store(acc, u_fmm_ilm_off, u_coeff_base, s);
+    vec3 zero[9];
+    for (uint k = 0u; k < 9u; ++k) zero[k] = vec3(0.0);
+    sgi_fmm_store(zero, u_fmm_lsh_off, u_coeff_base, s);
+}

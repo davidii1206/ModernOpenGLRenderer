@@ -1,0 +1,74 @@
+#version 460 core
+layout(local_size_x = 64) in;
+
+// ---------------------------------------------------------------------------
+// M2L. The FMM core, spec section 3.2.
+//
+// For each of the 189 source cells in the target's V-list:
+//
+//     d   = S.centre - T.centre
+//     I   = max(0, evalSH(S.Ilm, -dir))       W/sr toward T
+//     T.Lsh[lm] += (I / r^2) * Y_lm(dir)
+//
+// The V-list is the 6x6x6 box of the parent's neighbourhood minus the target's
+// own 27-cell U-list, which the microbuffer resolves instead. That is what makes
+// the near and far fields DISJOINT BY CONSTRUCTION -- no horizon to tune, no
+// blend region, and no surfel counted twice.
+//
+// No soft clamp in the denominator. Expanding about the cell CENTRE, not a
+// drifting centroid, restores the stencil's own guarantee that r >= 2h, so there
+// is no singularity to suppress and no bias from suppressing it.
+// ---------------------------------------------------------------------------
+
+#include "fmm.glsl"
+
+uniform uint  u_slots;
+uniform uint  u_slot_base;
+uniform uint  u_coeff_base;
+uniform ivec3 u_res;
+uniform float u_h;            // this level's cell edge, world units
+
+void main() {
+    const uint s = gl_GlobalInvocationID.x;
+    if (s >= u_slots) return;
+
+    const ivec3 t = sgi_fmm_coord(sgi_fmm_cell(u_coeff_base, s), u_res);
+    // Parent-relative position: the 6x6x6 box is centred on the PARENT, so which
+    // half of the parent the target sits in shifts the offsets by one.
+    const ivec3 b = t & ivec3(1);
+
+    vec3 acc[9];
+    for (uint k = 0u; k < 9u; ++k) acc[k] = vec3(0.0);
+
+    for (int dz = -2 - b.z; dz <= 3 - b.z; ++dz)
+    for (int dy = -2 - b.y; dy <= 3 - b.y; ++dy)
+    for (int dx = -2 - b.x; dx <= 3 - b.x; ++dx) {
+        // The U-list, which is the near field's.
+        if (max(max(abs(dx), abs(dy)), abs(dz)) <= 1) continue;
+
+        const int ss = sgi_fmm_slot_at(t + ivec3(dx, dy, dz), u_res, u_slot_base);
+        if (ss < 0) continue;
+
+        const vec3  d   = vec3(dx, dy, dz) * u_h;
+        const float r2  = dot(d, d);
+        const vec3  dir = d * inversesqrt(r2);
+
+        vec3 src[9];
+        sgi_fmm_load(src, u_fmm_ilm_off, u_coeff_base, uint(ss));
+
+        // Intensity radiated from S toward T, then the same direction's basis on
+        // the target side. Clamped at zero: an order-2 fit of a clamped cosine
+        // rings, and a negative intensity is not a physical source.
+        float yb[9], yt[9];
+        sgi_sh2_basis(-dir, yb);
+        sgi_sh2_basis( dir, yt);
+        vec3 I = vec3(0.0);
+        for (uint k = 0u; k < 9u; ++k) I += src[k] * yb[k];
+        I = max(I, vec3(0.0));
+
+        const vec3 w = I / r2;
+        for (uint k = 0u; k < 9u; ++k) acc[k] += w * yt[k];
+    }
+
+    sgi_fmm_add(acc, u_fmm_lsh_off, u_coeff_base, s);
+}

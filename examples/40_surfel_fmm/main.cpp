@@ -55,6 +55,10 @@
 //                           the FMM's U-list horizon (finding 44). Non-zero also
 //                           switches the solve to the U-list walk (finding 47)
 //   SGI_FAR_OCC=1           march the macro bitmask for the far field's radiance
+//   SGI_FMM=0               the real far field: P2M/M2M, a 189-cell V-list M2L
+//                           and an L2L downsweep, evaluated per bucket from the
+//                           receiver's own local expansion (spec 3.2)
+//   SGI_FMM_TRI=1           trilinear Lsh from the 8 nearest cell centres (step 7)
 //   SGI_LOD=0               camera-distance LOD: three microbuffer resolutions
 //                           (ms, ms/2, ms/4) chosen by projected size, spec 6.1
 //   SGI_LOD_PX=1            projected size in px that still earns the top tier
@@ -74,6 +78,7 @@
 #include "brute.hpp"
 #include "screen.hpp"
 #include "grid.hpp"
+#include "fmm.hpp"
 #include "direct.hpp"
 #include "cuts.hpp"
 #include "validate.hpp"
@@ -164,6 +169,8 @@ struct EnvOpts {
     float neeskip = 0.0f;        // SGI_NEE_SKIP  cache-agreement margin, 0 = off
     float nearspac = 0.0f;       // SGI_NEAR      occlusion horizon in SPACINGS, 0 = unlimited
     bool  farocc = true;         // SGI_FAR_OCC   march the macro bitmask for the far field
+    bool  fmm = false;           // SGI_FMM       V-list M2L + L2L far field (3.2)
+    bool  fmmtri = true;         // SGI_FMM_TRI   trilinear Lsh at evaluation (step 7)
     bool  lod = false;           // SGI_LOD       camera-distance microbuffer tiers (6.1)
     float lodpx = 1.0f;          // SGI_LOD_PX    projected px that still earns the top tier
     int   farorder = 1;          // SGI_FAR_ORDER SH bands in the far field: 0 or 1
@@ -258,6 +265,8 @@ EnvOpts read_env() {
     if (const char* v = getenv("SGI_NEAR"))     o.nearspac = float(atof(v));
     if (const char* v = getenv("SGI_FAR_OCC"))  o.farocc = atoi(v) != 0;
     if (const char* v = getenv("SGI_LOD"))      o.lod = atoi(v) != 0;
+    if (const char* v = getenv("SGI_FMM"))      o.fmm = atoi(v) != 0;
+    if (const char* v = getenv("SGI_FMM_TRI"))  o.fmmtri = atoi(v) != 0;
     if (const char* v = getenv("SGI_LOD_PX"))   o.lodpx = float(atof(v));
     if (const char* v = getenv("SGI_FAR_ORDER")) o.farorder = atoi(v);
     if (const char* v = getenv("SGI_EYE"))      o.eye = v;
@@ -365,6 +374,7 @@ int main() {
     // Static set, so the grid is built once. It is Tier 1's candidate lookup and
     // Tier 2's ray-traversal structure both.
     SurfelGrid grid;
+    FmmTree    fmm;
     // Emitter proxies for next event estimation: the direct term is split out
     // of the microbuffer, which resolves this panel with about 4 of 256 buckets.
     EmitterSet emitters;
@@ -403,9 +413,10 @@ int main() {
         scene.build(tris, target_surfels, env.seed);
         apply_base_color_textures(scene, tris, *model);
         grid.build(scene, env.cell);
+        fmm.build(scene, grid);
         emitters.build(tris);
         cuts.build(scene, tris);
-        solver.attach(&grid, &emitters, &cuts);
+        solver.attach(&grid, &emitters, &cuts, &fmm);
         solver.reset(scene);
         current_model = path;
         const Bounds& b = scene.bounds();
@@ -418,9 +429,10 @@ int main() {
     };
 
     grid.build(scene, env.cell);
+    fmm.build(scene, grid);
     emitters.build(tris);
     cuts.build(scene, tris);
-    solver.attach(&grid, &emitters, &cuts);
+    solver.attach(&grid, &emitters, &cuts, &fmm);
 
     // Every .glb next to the binary and in the repo's data directory, so the GUI
     // can switch scenes without an env var. Sponza is the reason: it is the only
@@ -491,6 +503,8 @@ int main() {
     cfg.nee_skip = env.neeskip;
     cfg.near_radius = env.nearspac > 0.0f ? env.nearspac * scene.spacing() : 0.0f;
     cfg.far_occlusion = env.farocc;
+    cfg.fmm = env.fmm;
+    cfg.fmm_interp = env.fmmtri;
     cfg.lod = env.lod;
     cfg.lod_px = env.lodpx;
     cfg.far_order = env.farorder;

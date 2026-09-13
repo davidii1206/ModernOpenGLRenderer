@@ -25,6 +25,7 @@
 #include "gpu_util.hpp"
 #include "surfels.hpp"
 #include "grid.hpp"
+#include "fmm.hpp"
 #include "direct.hpp"
 #include "cuts.hpp"
 
@@ -61,6 +62,12 @@ struct SolveConfig {
     // microbuffer resolutions -- ms, ms/2, ms/4 -- by how large they project on
     // screen, compacted per tier, and dispatched as three kernels. Off keeps one
     // dispatch at `ms` and is bit-identical to before the tiers existed.
+    // The real far field: a local expansion carried to the receiver by P2M/M2M,
+    // a 189-cell V-list M2L, and an L2L downsweep. Off falls back to the
+    // per-block outgoing radiance a visibility march samples (findings 45-46).
+    bool fmm = false;
+    // Trilinearly interpolate Lsh from the 8 nearest cell centres, spec step 7.
+    bool fmm_interp = true;
     bool lod = false;
     glm::vec3 cam_pos{0.0f};
     // 2 * tan(fov/2) / screenHeight: world units per pixel at unit distance.
@@ -195,8 +202,9 @@ public:
     // sample. Both are static, so they are attached once rather than threaded
     // through every call.
     void attach(const SurfelGrid* grid, const EmitterSet* emitters,
-                const CutSet* cuts = nullptr) {
-        grid_ = grid; emitters_ = emitters; cuts_ = cuts; direct_dirty_ = true;
+                const CutSet* cuts = nullptr, const FmmTree* fmm = nullptr) {
+        grid_ = grid; emitters_ = emitters; cuts_ = cuts; fmm_ = fmm;
+        direct_dirty_ = true;
     }
 
     void reset(SurfelSet& set);
@@ -234,6 +242,7 @@ private:
     void ensure_buffers(const SurfelSet& set, uint32_t ms, bool tiered);
     void run_lout(SurfelSet& set, const SolveConfig& cfg);
     void run_direct(SurfelSet& set, const SolveConfig& cfg);
+    void run_fmm(SurfelSet& set, const SolveConfig& cfg);
     bool nee_active(const SolveConfig& cfg) const;
     void classify_lod(SurfelSet& set, const SolveConfig& cfg,
                       uint32_t first, uint32_t slice);
@@ -242,6 +251,7 @@ private:
     void end_sweep(SurfelSet& set, bool collect_stats);
 
     Pipeline lout_prog_, radiance_, micro_, direct_, blk_prog_, lod_prog_;
+    Pipeline p2m_, m2m_, m2l_, l2l_;
     std::unique_ptr<PassTimer> timer_;
 
     gl::Buffer b_lout_  {gl::BufferType::shader, gl::BufferUsage::dynamic_draw};
@@ -261,6 +271,7 @@ private:
     float      direct_occ_ = -1.0f;
     int        direct_cuts_ = -1;
     const SurfelGrid* grid_ = nullptr;
+    const FmmTree*    fmm_ = nullptr;
     const EmitterSet* emitters_ = nullptr;
     const CutSet*     cuts_ = nullptr;
     uint32_t   light_count_ = 0;
