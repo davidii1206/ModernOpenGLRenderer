@@ -85,6 +85,10 @@
 //   MBG_RES=16              level-1 target edge; MBG_RES2/3 for deeper levels
 //   MBG_BLOCK=8             spawn tile edge; 1 == a child per texel
 //   MBG_GTCAM=0|1|2         free | reference camera at 512^2 | at 1600x900
+//   MBG_EYE=x,y,z           an explicit camera, for scenes with no reference
+//   MBG_TARGET=x,y,z        image to match. Without it an interior scene (one
+//   MBG_FOV=deg             whose footprint dwarfs its height) is framed from
+//                           inside rather than from 2.2 radii away
 //   MBG_SOLVE=n             complete n sweeps before the first present, then hold
 //   MBG_COMPARE=0|1         print RMSE against the reference after the solve
 //   MBG_BENCH=n             n frames, print per-pass timings, exit
@@ -159,6 +163,9 @@ struct EnvOpts {
     bool  nogui = false;
     bool  compare = false;
     int   tonemap = kTonemapDefault;
+    glm::vec3 eye{0.0f}, target{0.0f};
+    float fov = 45.0f;
+    bool  have_eye = false;
     float exposure = 1.0f;
     bool  paused = false;
 };
@@ -216,6 +223,10 @@ EnvOpts read_env() {
     if (const char* v = getenv("MBG_FILTER_R")) o.cfg.filter_radius = std::max(1, atoi(v));
     if (const char* v = getenv("MBG_PLANE"))    o.cfg.plane_tol = float(atof(v));
     if (const char* v = getenv("MBG_GTCAM"))    o.gtcam = atoi(v);
+    // An explicit camera, for scenes with no reference image to match.
+    if (const char* v = getenv("MBG_EYE"))      { o.eye = parse_vec3(v, o.eye); o.have_eye = true; }
+    if (const char* v = getenv("MBG_TARGET"))   o.target = parse_vec3(v, o.target);
+    if (const char* v = getenv("MBG_FOV"))      o.fov = float(atof(v));
     if (const char* v = getenv("MBG_VIEW"))     o.view = atoi(v);
     if (const char* v = getenv("MBG_REF"))      o.gt_index = atoi(v);
     if (const char* v = getenv("MBG_SOLVE"))    u32(v, o.solve);
@@ -453,8 +464,38 @@ int main() {
                     float(window.framebuffer_width()) /
                         float(std::max(1, window.framebuffer_height())),
                     radius * 0.002f, radius * 20.0f);
-    if (env.gtcam != 0) {
+    if (env.have_eye) {
+        cam.perspective(env.fov, cam.aspect(), cam.near_clip(), cam.far_clip());
+        cam.look_at(env.eye, env.target);
+    } else if (env.gtcam != 0) {
         cam.look_at(kGtEye, kGtTarget);
+    } else if (sb.extent().x * sb.extent().z > 1.5f * sb.extent().y * sb.extent().y) {
+        // INSIDE, NOT OUTSIDE. Backing off by 2.2 radii frames a Cornell box; on
+        // an architectural interior it puts the camera outside the building
+        // looking at a blank wall, which is exactly what Sponza did. A scene
+        // wider than it is tall is a room, so stand in it: at one end of the
+        // longest horizontal axis, at eye height above the floor, looking down
+        // it.
+        //
+        // The threshold is footprint against height squared, and 1.5 rather
+        // than something rounder because Sponza is a TALL atrium -- 30 x 18
+        // across and 12 high, so its footprint is only 3.5x its height squared
+        // and a stricter rule leaves the camera outside. Cornell is 2 x 2 x 2
+        // and stays on the outside framing, where it belongs.
+        const glm::vec3 e = sb.extent();
+        const bool along_x = e.x >= e.z;
+        const float len = along_x ? e.x : e.z;
+        glm::vec3 eye = sb.center(), tgt = sb.center();
+        (along_x ? eye.x : eye.z) = (along_x ? sb.mn.x : sb.mn.z) + len * 0.12f;
+        (along_x ? tgt.x : tgt.z) = (along_x ? sb.mx.x : sb.mx.z) - len * 0.10f;
+        // Eye height off the FLOOR rather than off the centre: the bounds of an
+        // interior include its roof, and half of that is first-floor height.
+        eye.y = sb.mn.y + e.y * 0.22f;
+        tgt.y = eye.y + e.y * 0.10f;          // a little up, to catch the arches
+        // Wider than the 45 a single object wants: standing in a corridor, the
+        // interesting thing is how much of it you can see.
+        cam.perspective(60.0f, cam.aspect(), cam.near_clip(), cam.far_clip());
+        cam.look_at(eye, tgt);
     } else {
         cam.look_at(sb.center() + glm::vec3(0.0f, 0.0f, radius * 2.2f), sb.center());
     }
