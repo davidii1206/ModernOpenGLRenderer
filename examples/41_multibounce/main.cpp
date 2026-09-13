@@ -62,8 +62,9 @@
 //   MBG_GATE=all            run the analytic gates and exit (quad closed rect occ
 //                           oracle texeldir series paths)
 //   MBG_MODEL=path.glb      CornellBoxOriginal.glb; the references only match it
-//   MBG_BOUNCES=3           camera levels; 1 == direct only (up to 8)
-//   MBG_PATHS=64            single-sample continuation: split this many ways at
+//   MBG_BOUNCES=3           camera levels; 1 == direct only (capped at
+//                           kMaxLevels, currently 3)
+//   MBG_PATHS=40            single-sample continuation: split this many ways at
 //                           the primary hit, branch factor 1 below it, so cost
 //                           is paths x bounces. 0 = the branching tile estimator
 //   MBG_RR=0.15             Russian-roulette threshold on path throughput; 0 off
@@ -81,7 +82,7 @@
 //   MBG_FILTER_R=2          taps per side for that filter
 //   MBG_SCALE=4             GI grid = framebuffer / scale; 1 == one camera/pixel
 //   MBG_BUDGET=4096         level-1 cameras per frame
-//   MBG_RES=32              level-1 target edge; MBG_RES2/3/4 for deeper levels
+//   MBG_RES=16              level-1 target edge; MBG_RES2/3 for deeper levels
 //   MBG_BLOCK=8             spawn tile edge; 1 == a child per texel
 //   MBG_GTCAM=0|1|2         free | reference camera at 512^2 | at 1600x900
 //   MBG_SOLVE=n             complete n sweeps before the first present, then hold
@@ -187,7 +188,6 @@ EnvOpts read_env() {
     if (const char* v = getenv("MBG_RES"))      u32(v, o.cfg.res[0]);
     if (const char* v = getenv("MBG_RES2"))     u32(v, o.cfg.res[1]);
     if (const char* v = getenv("MBG_RES3"))     u32(v, o.cfg.res[2]);
-    if (const char* v = getenv("MBG_RES4"))     u32(v, o.cfg.res[3]);
     if (const char* v = getenv("MBG_BLOCK"))    u32(v, o.cfg.block[0]);
     if (const char* v = getenv("MBG_BLOCK2"))   u32(v, o.cfg.block[1]);
     if (const char* v = getenv("MBG_BLOCK3"))   u32(v, o.cfg.block[2]);
@@ -629,7 +629,7 @@ int main() {
                     int pa = int(cfg.paths);
                     bool path_mode = pa != 0;
                     if (ImGui::Checkbox("Single-sample continuation", &path_mode))
-                        cfg.paths = path_mode ? 64u : 0u;
+                        cfg.paths = path_mode ? 40u : 0u;
                     if (cfg.paths) {
                         pa = int(cfg.paths);
                         if (ImGui::SliderInt("Paths (split at primary hit)", &pa, 1, 256))

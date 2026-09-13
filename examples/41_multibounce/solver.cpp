@@ -286,7 +286,10 @@ void Solver::run_levels(uint32_t chunk, const Scene& scene, const SolveConfig& c
                        (cfg.direct_pixel || cfg.indirect_only);
     // Rasterize shallowest first: a level's cameras are spawned by the level
     // above it, so level l+1's camera buffer is written by level l's raster.
-    uint32_t counts[kMaxLevels] = {chunk, 0, 0, 0};
+    // Zero-initialized, then level 0 seeded: writing the trailing zeros out
+    // would have to be re-counted every time kMaxLevels moves.
+    uint32_t counts[kMaxLevels] = {};
+    counts[0] = chunk;
     for (uint32_t l = 0; l < levels_; ++l) {
         ScopedPass p(t_raster_[l]);
         raster_level(l, counts[l], scene, cfg, nullptr);

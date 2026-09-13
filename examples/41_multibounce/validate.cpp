@@ -662,7 +662,7 @@ bool run_gates(const std::string& names, Solver& solver, const SolveConfig& base
             return e * kPi * L;
         };
 
-        for (uint32_t n = 2; n <= 4; ++n) {
+        for (uint32_t n = 2; n <= kMaxLevels; ++n) {
             cfg.bounces = n;
             cfg.rr = 0.0f;
             const std::vector<glm::vec4> e = solver.solve_points(s, cfg, pos, nrm);
@@ -676,7 +676,7 @@ bool run_gates(const std::string& names, Solver& solver, const SolveConfig& base
         // threshold of 0.15 never triggers: the two runs must agree EXACTLY,
         // which also proves the roulette code path is not perturbing the stream
         // of random numbers the continuation draws from.
-        cfg.bounces = 3;
+        cfg.bounces = kMaxLevels;
         cfg.rr = 0.0f;
         const double no_rr = mean_channel(solver.solve_points(s, cfg, pos, nrm), 0);
         cfg.rr = 0.15f;
@@ -687,14 +687,14 @@ bool run_gates(const std::string& names, Solver& solver, const SolveConfig& base
         // depth kills most paths after the first bounce, and the answer must not
         // move. This is the assertion that the 1/q division is there and right;
         // without it the result comes back short by whatever fraction died.
-        cfg.bounces = 4;
+        cfg.bounces = kMaxLevels;
         cfg.rr = 0.0f;
         const double full = mean_channel(solver.solve_points(s, cfg, pos, nrm), 0);
         cfg.rr = 0.9f;
         const double rolled = mean_channel(solver.solve_points(s, cfg, pos, nrm), 0);
         r.check(8, "paths", "roulette unbiased below threshold", rolled, full, 2.5e-2);
         printf("[GATE] 8 paths   roulette at 0.9: %.6f vs %.6f unrouletted "
-               "(analytic %.6f)\n", rolled, full, series(4));
+               "(analytic %.6f)\n", rolled, full, series(kMaxLevels));
     }
 
     printf("[GATE] %d passed, %d failed\n", r.passed, r.failed);

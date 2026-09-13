@@ -35,8 +35,8 @@ reload sees it.
 |---|---|
 | `MBG_GATE=all` or a comma list | run the analytic gates and exit. Names: `quad`, `closed`, `rect`, `occ`, `oracle`, `texeldir`, `series`, `paths`. `MBG_GATE_VERBOSE=1` prints each rasterizer/oracle disagreement |
 | `MBG_MODEL=path.glb` | model to load (default `CornellBoxOriginal.glb`). The two reference PNGs only match that one |
-| `MBG_BOUNCES=n` | camera levels, 1–8. 1 = direct only |
-| `MBG_PATHS=n` | **single-sample continuation**: split this many ways at the primary hit, branch factor 1 below it, so the cost is `paths × bounces` instead of `K^bounces` (default 64). `0` selects the branching tile estimator; see finding 20 |
+| `MBG_BOUNCES=n` | camera levels, 1–`kMaxLevels`. **3 is the cap** (solver.hpp); 1 = direct only |
+| `MBG_PATHS=n` | **single-sample continuation**: split this many ways at the primary hit, branch factor 1 below it, so the cost is `paths × bounces` instead of `K^bounces` (default 40, which is the split that costs exactly what the branching tree costs at 3 bounces). `0` selects the branching tile estimator; see finding 20 |
 | `MBG_RR=f` | Russian-roulette threshold on path throughput (default 0.15). Below it a path survives with probability `throughput/f` and is divided by it. 0 disables |
 | `MBG_IMPORTANCE=0\|1` | draw the continuation from the micro-buffer's radiance rather than from `cos × dΩ × albedo` alone (default 1) |
 | `MBG_SCALE=n` | GI grid = framebuffer / n. **1 = one camera per pixel**, the doc's correctness reference |
@@ -92,7 +92,7 @@ reload sees it.
 | 6.2 | Russian roulette by throughput, importance-based spawning | ✅ both, in the path estimator — and neither is a bias trade: roulette divides survivors by their survival probability and importance sampling divides by its own pdf, so both are exactly unbiased. The `paths` gate asserts it. Finding 20 |
 | — | Single-sample continuation (branch factor 1), i.e. path tracing the recursion instead of branching it | ✅ the default; `MBG_PATHS=0` restores the doc's branching variant A |
 | 7 | Variant B: object-space cache, temporal feedback | ⬜ a separate example; this is what validates it |
-| 8.2 §1, §3 | Analytic integration gates, rasterizer vs oracle | ✅ 36 assertions, all passing |
+| 8.2 §1, §3 | Analytic integration gates, rasterizer vs oracle | ✅ 35 assertions, all passing |
 | 8.2 §6 | Variant A end to end, producing reference images | ✅ |
 | — | Sky dome and sun (not in the doc; the doc's scene is closed) | ✅ dome from the empty texels, sun analytic with a rasterized cone — finding 15 |
 
@@ -197,7 +197,7 @@ image rather than a converging one.
 
 ## Gates
 
-`MBG_GATE=all`, **36 assertions, all passing**:
+`MBG_GATE=all`, **35 assertions, all passing**:
 
 | Gate | Asserts | Result |
 |---|---|---|
@@ -208,7 +208,7 @@ image rather than a converging one.
 | `oracle` | the compute rasterizer vs a CPU ray cast, texel for texel, 64 cameras on Cornell's own surfaces | **0 disagreements in 65536 texels** (finding 1) |
 | `texeldir` | the direct term evaluated at **hit points**, integrated against the analytic answer and cross-checked per texel against a CPU ray cast | mean within 2.4e-5, worst texel within 1.5e-4 (finding 8) |
 | `series` | N camera levels in a closed box of albedo ρ read πL(1+ρ+…+ρ^(N-1)) | 5.6e-5, 3.1e-4, 2.7e-4 relative at 1, 2, 3 levels |
-| `paths` | the same series, but measured with the **stochastic** estimator: single-sample continuation, importance-sampled and rouletted, over 512 receivers × 64 paths | within **8.7e-6** at 2, 3 and 4 levels. Roulette at a threshold it cannot reach reproduces the unrouletted answer **bit for bit**; at a threshold that kills roughly half the paths per level it still lands within 8.4e-5 (finding 20) |
+| `paths` | the same series, but measured with the **stochastic** estimator: single-sample continuation, importance-sampled and rouletted, over 512 receivers × 64 paths | within **8.7e-6** at every level up to the cap. Roulette at a threshold it cannot reach reproduces the unrouletted answer **bit for bit**; at a threshold that kills roughly half the paths per level it still lands within 1.0e-4 (finding 20) |
 
 `closed` and `series` between them pin down everything a picture cannot: the
 solid-angle weights, the absence of cracks, the `/PI`, the per-tile albedo mass,
@@ -238,21 +238,20 @@ no environment.
 | | RMSE | roughness vs reference | cameras/sweep |
 |---|---|---|---|
 | 1 bounce vs the direct reference | **0.0430** | 0.91× | 1.6e4 + 262k direct |
-| 3 bounces vs the full-GI reference (sky 0.05) | **0.0402** | 0.67× | 2.1e6 + 262k direct |
+| 3 bounces vs the full-GI reference (sky 0.05) | **0.0402** | 0.67× | 1.3e6 + 262k direct |
 
 At one bounce there is no recursion and the two estimators are the same code.
 
-### The two estimators, at the depth where both are affordable
+### The two estimators, at the same budget
 
-| 3 bounces, sky 0.05 | RMSE | ceiling roughness | cameras/sweep |
-|---|---|---|---|
-| **path**, 64 paths (default) | **0.0402** | 0.97 | 2.11e6 |
-| branching tiles (`MBG_PATHS=0`) | 0.0407 | 0.91 | 1.33e6 |
+| 3 bounces, sky 0.05 | RMSE | ceiling roughness | cameras/sweep | sweep |
+|---|---|---|---|---|
+| **path**, 40 paths (default) | **0.0402** | 0.95 | 1.33e6 | 51.4 s |
+| branching tiles (`MBG_PATHS=0`) | 0.0407 | 0.91 | 1.33e6 | 52.5 s |
 
-Within noise of each other — which is the result worth having, because one of
-them is unbiased and the other is not (finding 20). The tree is cheaper per leaf
-at this depth and stops being cheaper at four bounces; see the tables in finding
-20 for what happens after that.
+40 is the split that costs exactly what the tree costs at three bounces, so this
+is the same budget spent two ways. They are a wash on every measured axis, and
+the tiebreak is that one of them is unbiased (finding 20).
 
 Both moved with finding 16 (the light view now clips to its own frustum): the
 full-GI number was **0.0532** before it and the per-frame direct pass was
@@ -274,34 +273,44 @@ numbers**; the camera and texel counts are what scale.
 
 **READ THE WORK COLUMN, NOT THE TIME COLUMN.** These numbers were taken on a
 shared container, and the same three-bounce path sweep has come back at 8.4 s and
-at 82 s depending on what else was running. Times are therefore comparable only
-*within* a batch — the rows below are grouped by the batch they were measured in
-— while the camera and texel counts are exact, hardware independent, and the
-thing to scale with.
+at 82 s depending on what else was running at the time. *Within* a batch the
+spread is under 1% and the comparisons are sound; *across* batches the clock
+means nothing. The camera and texel counts are exact and hardware independent,
+and they are the thing to scale with.
+
+**At the shipped configuration** — 3 bounces, 40 paths, GI grid 128×128 — one
+complete sweep, three runs in one batch, spread under 1%:
+
+| | time | work |
+|---|---|---|
+| **indirect, 3 bounces, path 40** | **51.4 s** | 1.33e6 cameras, 8.8e7 texels, 4.2e7 triangle-rasters |
+| indirect, 3 bounces, branching | 52.5 s | 1.33e6 cameras, 8.8e7 texels |
+| indirect, 3 bounces, path 64 | 81.7 s | 2.11e6 cameras, 1.38e8 texels |
+| indirect, 3 bounces, path 40, **with the sun** | ~57 s | + one cone raster per camera |
+| direct, per frame | 7.5 s | 262k fitted light views |
+| direct, per frame, **with the sun** | 8.4 s | + 262k cone views, one rasterization each |
+| everything else, per frame | 13 ms | G-buffer, denoise, upsample, display |
+
+A sweep is four chunks, so a frame in steady state is about 13 s of solve plus
+the per-frame direct pass.
+
+**Beyond the cap**, measured with `kMaxLevels` raised, for the record that
+justifies the estimator:
 
 | | time | work |
 |---|---|---|
 | **branching, one batch** | | |
-| 3 bounces | 45 s | 1.33e6 cameras, 8.8e7 texels |
 | 4 bounces | 182 s | 5.52e6 cameras, 3.57e8 texels |
 | 5 bounces | **707 s** | 2.23e7 cameras, 1.43e9 texels |
-| **path, one batch** | | |
-| 3 bounces | 15 s | 2.11e6 cameras, 1.38e8 texels |
-| 4 bounces | 11 s | 3.16e6 cameras, 2.06e8 texels |
+| **path 64, one batch** | | |
 | 5 bounces | 13 s | 4.21e6 cameras, 2.73e8 texels |
 | 8 bounces | **20 s** | 7.36e6 cameras, 4.74e8 texels |
-| **per frame, independent of the sweep** | | |
-| direct | 7.5 s | 262k fitted light views |
-| direct, **with the sun** | 8.4 s | + 262k cone views, one rasterization each |
-| everything else | 13 ms | G-buffer, denoise, upsample, display |
 
-The branching batch is ×4.0 then ×3.9 per bounce, which is the level-2 tile count
-and nothing else — the exponent, measured. The path batch is flat to within its
-own noise across 3→8 bounces while the camera count rises 3.5×, which is the
-linear term, also measured, and the fact that its 3-bounce row reads *higher*
-than its 4-bounce row is a fair statement of how much to trust any single number
-here. Both shapes are what the counts predict; neither depends on the clock being
-trustworthy.
+The branching rows are ×3.9 per bounce, which is the level-2 tile count and
+nothing else — the exponent, measured. The path rows are flat to within their own
+noise across 5→8 bounces while the camera count rises 1.75×. Both shapes are what
+the camera counts predict, which is the point: the counts are exact and the clock
+is not.
 
 The sun costs **15%** of the per-pixel direct pass, for one more light view per
 pixel against the emitter's two rasterizations — and buys a light whose shadow is
@@ -1085,6 +1094,12 @@ found the original three.
 
 ### 20. Branch factor 1: the recursion is a path tracer, not a tree
 
+**This renderer is capped at three bounces** (`kMaxLevels`, solver.hpp), so what
+follows is partly an argument about a constraint that is no longer binding. It is
+kept because it is why the estimator below is the default at three bounces too,
+and because raising the cap is now a one-line change rather than a rewrite. The
+four-, five- and eight-bounce rows were measured with it at 8.
+
 The doc's variant A branches. Every camera spawns K children, so a depth-D solve
 costs K^D cameras, and every lever section 6.2 offers -- resolution falloff,
 coarser tiles -- shrinks **K**. Shrinking the base of an exponent buys one or two
@@ -1119,6 +1134,31 @@ than selling the change as a free win. At D=3 the tree is genuinely cheaper per
 leaf -- 16 level-1 cameras serve 64 leaves, where 64 paths do not share anything
 -- so 81 cameras against 129. At D=4 it is 337 against 193, at D=5 1361 against
 257, and at D=8 it is **195×**. The tree is better exactly until it isn't.
+
+Which means that **at the three-bounce cap the exponential argument decides
+nothing**, and the comparison has to be made at equal cost instead. It can be
+made exactly: the tree carries 1 + 16 + 64 = 81 cameras per primary hit, a path
+split of S carries 1 + 2S, and 1 + 2×40 = 81. Same cameras, same texels, same
+triangle-rasters, to the unit — so `MBG_PATHS=40` is the branching estimator's
+own budget spent the other way.
+
+| 3 bounces, sky 0.05, 1.33e6 cameras/sweep either way | RMSE | ceiling roughness | sweep |
+|---|---|---|---|
+| **path, 40 (default)** | **0.0402** | 0.95 | **51.4 s** |
+| branching tiles (`MBG_PATHS=0`) | 0.0407 | 0.91 | 52.5 s |
+| path, 64 | 0.0402 | 0.97 | 81.7 s |
+
+Three runs each, same batch, spread under 1%. At its own budget the path
+estimator is a hair faster, a hair more accurate, and a hair noisier on the
+ceiling — which is to say the three of them are a wash, and the tiebreak is that
+one estimator is unbiased and the other is not. The tile clustering is an
+approximation that more cameras do not remove; see the paragraph below, and the
+sun's visibility in finding 18, which the tile estimator could only approximate
+and this one gets exactly right by construction.
+
+(`MBG_PATHS=64` is the same quality for 1.6× the cameras, which is the useful
+negative: past the point where the hemisphere is adequately sampled, more paths
+buy nothing at a fixed bounce count. They buy depth, and depth is capped.)
 
 Three things make one sample per bounce good enough to keep:
 
@@ -1185,12 +1225,12 @@ roulette at a threshold it cannot reach must reproduce the unrouletted answer
 **bit for bit**. Fixing it dropped the ceiling's high-pass noise from 1.40 to
 0.97 at no cost.
 
-#### What the depth buys, now that depth is affordable
+#### What the depth buys -- which is what set the cap
 
 Finding 5 recorded that the full-GI reference only matches with `MBG_SKY=0.05`
 and could not say what the 0.05 was standing in for -- the obvious candidate
 being the bounces variant A truncates. That question needed eight bounces, and
-eight bounces cost twelve hours. It now costs one sweep:
+eight bounces cost twelve hours. Once it cost one sweep, it could be asked:
 
 | bounces | RMSE, sky 0 | RMSE, sky 0.05 |
 |---|---|---|
@@ -1204,6 +1244,12 @@ direction, that no amount of transport reproduces, is a world background -- and
 the Cornell box is open on +z, so the reference render's own environment shines
 straight in. `MBG_SKY=0.05` was never a fudge for missing light; it was the
 missing light, and the sky dome of finding 15 is the same thing spelled properly.
+
+And that measurement is what makes the three-bounce cap a decision rather than a
+concession. Bounces four through eight move the error by 7% of a number that is
+already dominated by the tone curve, on the scene most flattering to deep
+interreflection there is -- a closed white box. There is nothing there worth
+paying for, and the cap says so.
 
 ## What this does not answer
 

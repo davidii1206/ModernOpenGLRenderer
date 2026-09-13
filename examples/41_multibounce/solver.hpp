@@ -39,13 +39,17 @@
 
 namespace mbg {
 
-// 8, since the path estimator made depth affordable. The branching recursion
-// could not use more than about four -- 4^4 children per primary hit is 256
-// cameras at the deepest level for each one at the top -- so the cap used to be
-// "one past what the doc terminates at, to check that the 4th bounce changes
-// nothing". With branch factor 1 the cost is paths x depth, so the question
-// "what does bounce 7 contribute" is one this example can now answer by asking.
-constexpr uint32_t kMaxLevels = 8;
+// 3: the doc's variant A terminates at bounce 3 and that is where this renderer
+// is being run, so it is where the schedule stops.
+//
+// THIS CONSTANT IS THE ONLY THING HOLDING IT THERE. The path estimator's cost is
+// paths x depth (finding 20), so raising this is affordable in a way it never
+// was under the branching recursion -- and finding 20's own tables, which go to
+// eight bounces, were measured with it at 8. Raise it and the arrays below
+// extend with 8x8 targets; nothing else needs to change. What does NOT survive
+// the raise is the `paths` gate's level counts and the ImGui slider's range,
+// both of which are written against this number rather than against a literal.
+constexpr uint32_t kMaxLevels = 3;
 
 struct SolveConfig {
     uint32_t bounces = 3;          // camera levels; 1 == direct only
@@ -62,7 +66,7 @@ struct SolveConfig {
     // problem: once each receiver's frame is rotated and the grid is denoised,
     // 16x16, 32x32 and 64x64 produce the same image to within 0.0001 RMSE.
     // See implementation.md, finding 14.
-    std::array<uint32_t, kMaxLevels> res{{16, 8, 8, 8, 8, 8, 8, 8}};
+    std::array<uint32_t, kMaxLevels> res{{16, 8, 8}};
     // Tile edge for spawning the next level, in texels of THIS level's target.
     // 1 spawns per texel (the unabridged recursion); the terminal level ignores
     // it. res/block must be an integer, and configure() snaps it down until it
@@ -81,7 +85,7 @@ struct SolveConfig {
     // 4 at a 16-wide target is 16 children, which is where finding 4's
     // measurement put it -- that finding is about how many children there are,
     // not how many texels each covers.
-    std::array<uint32_t, kMaxLevels> block{{4, 4, 4, 4, 4, 4, 4, 4}};
+    std::array<uint32_t, kMaxLevels> block{{4, 4, 4}};
 
     // --- The estimator -------------------------------------------------------
     //
@@ -97,10 +101,24 @@ struct SolveConfig {
     // representative's visibility. That one is deterministic, which is why every
     // gate runs on it, and it is the doc's variant A as written.
     //
-    // 64 at the default. The split is where the variance of the whole solve is
-    // decided -- below it each path is a single sample and nothing averages it
-    // but its 63 siblings.
-    uint32_t  paths = 64;
+    // 40, which is not a round number and is not meant to be: at the three-bounce
+    // cap it is the split that costs EXACTLY what the branching tree costs. The
+    // tree spawns 16 then 4, so a primary hit carries 1 + 16 + 64 = 81 cameras;
+    // a path split of S carries 1 + 2S, and 1 + 2*40 = 81. Same cameras, same
+    // texels, same triangle-rasters, to the unit.
+    //
+    // Which is the comparison worth defaulting on, because at equal cost the
+    // path estimator wins on every axis that is not a tie (implementation.md,
+    // finding 20): RMSE 0.0402 against 0.0407, ceiling roughness 0.95 against
+    // 0.91, wall clock 51.4 s against 52.5 s -- and it is unbiased, where the
+    // tree's tile clustering is an approximation that more samples do not
+    // remove. The cap took the exponential argument away; this is what is left,
+    // and it still points the same way.
+    //
+    // Raise kMaxLevels and this number stops meaning anything special -- the
+    // equal-cost split at four bounces is 168, at five 680 -- so treat it as the
+    // three-bounce answer rather than a constant.
+    uint32_t  paths = 40;
     // Russian roulette threshold on the path throughput (the running product of
     // what each bounce reflects, near enough). Below it a path survives with
     // probability throughput/threshold and is divided by that probability, so
@@ -108,9 +126,11 @@ struct SolveConfig {
     // and scene-dependent rather than pinned to `bounces`. 0 disables it.
     //
     // 0.15 never fires within three bounces off Cornell's walls (0.73^3 = 0.39),
-    // which is deliberate: the default configuration is still exactly the solve
-    // it was, and roulette only starts deciding things at the depths that were
-    // previously unreachable.
+    // so at the current kMaxLevels it is inert by construction and the solve is
+    // exactly the solve it would be without it. It is kept, and gated, because
+    // it costs nothing when dormant and it is the thing that makes raising
+    // kMaxLevels safe -- without it, depth is unbounded work for energy that is
+    // already below the tone curve's resolution.
     float     rr = 0.15f;
     // Draw the continuation direction from the micro-buffer's own radiance --
     // cos * dOmega * albedo * (unshadowed direct irradiance at the hit) --
@@ -309,10 +329,7 @@ private:
 
     PassTimer t_place_{"Place"};
     std::array<PassTimer, kMaxLevels> t_raster_{
-        PassTimer{"Raster L1"}, PassTimer{"Raster L2"},
-        PassTimer{"Raster L3"}, PassTimer{"Raster L4"},
-        PassTimer{"Raster L5"}, PassTimer{"Raster L6"},
-        PassTimer{"Raster L7"}, PassTimer{"Raster L8"}};
+        PassTimer{"Raster L1"}, PassTimer{"Raster L2"}, PassTimer{"Raster L3"}};
     PassTimer t_gather_{"Resolve"};
     PassTimer t_upsample_{"Upsample"};
     PassTimer t_direct_{"Direct/px"};
