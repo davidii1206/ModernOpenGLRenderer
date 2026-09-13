@@ -180,10 +180,17 @@ double mean_channel(const std::vector<glm::vec4>& e, int ch) {
 
 } // namespace
 
-bool run_gates(const std::string& names, Solver& solver, const SolveConfig& base,
+bool run_gates(const std::string& names, Solver& solver, const SolveConfig& base_in,
                const Scene& scene, const std::vector<Tri>& tris) {
     Report r;
     printf("[GATE] running: %s\n", names.c_str());
+    // The oracle and texeldir gates rebuild the receiver's frame on the CPU with
+    // mbg_onb's exact arithmetic, so the shader must not rotate it underneath
+    // them. Every gate runs unjittered for that reason; the rotation changes
+    // which directions are sampled, never how much energy the set carries, which
+    // is what these assertions are about.
+    SolveConfig base = base_in;
+    base.jitter = false;
 
     // --- 1. The quadrature table --------------------------------------------
     //

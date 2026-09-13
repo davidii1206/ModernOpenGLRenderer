@@ -53,6 +53,9 @@
 //   MBG_DIRECT_RES=16       edge of the per-pixel pass's light view
 //   MBG_LV_RES=8            edge of the secondary cameras' light view
 //   MBG_INDIRECT_ONLY=1     composite the bounce term alone, for inspecting it
+//   MBG_JITTER=1            rotate each receiver's tangent frame (decorrelate)
+//   MBG_FILTER=3            a-trous denoise iterations over the GI grid
+//   MBG_FILTER_R=2          taps per side for that filter
 //   MBG_SCALE=4             GI grid = framebuffer / scale; 1 == one camera/pixel
 //   MBG_BUDGET=4096         level-1 cameras per frame
 //   MBG_RES=32              level-1 target edge; MBG_RES2/3/4 for deeper levels
@@ -161,6 +164,9 @@ EnvOpts read_env() {
     if (const char* v = getenv("MBG_DIRECT_RES")) u32(v, o.cfg.direct_res);
     if (const char* v = getenv("MBG_LV_RES"))    u32(v, o.cfg.cam_lv_res);
     if (const char* v = getenv("MBG_INDIRECT_ONLY")) o.cfg.indirect_only = atoi(v) != 0;
+    if (const char* v = getenv("MBG_JITTER"))   o.cfg.jitter = atoi(v) != 0;
+    if (const char* v = getenv("MBG_FILTER"))   u32(v, o.cfg.filter_iters);
+    if (const char* v = getenv("MBG_FILTER_R")) o.cfg.filter_radius = std::max(1, atoi(v));
     if (const char* v = getenv("MBG_PLANE"))    o.cfg.plane_tol = float(atof(v));
     if (const char* v = getenv("MBG_GTCAM"))    o.gtcam = atoi(v);
     if (const char* v = getenv("MBG_VIEW"))     o.view = atoi(v);
@@ -429,7 +435,8 @@ int main() {
     PassTimer* const solver_timers[] = {&solver.t_place(), &solver.t_raster(0),
                                         &solver.t_raster(1), &solver.t_raster(2),
                                         &solver.t_raster(3), &solver.t_gather(),
-                                        &solver.t_upsample(), &solver.t_direct()};
+                                        &solver.t_upsample(), &solver.t_direct(),
+                                        &solver.t_filter()};
 
     // --- State ---------------------------------------------------------------
 
@@ -526,6 +533,10 @@ int main() {
         } else {
             solver.step(gbuf, cam, scene, cfg);
         }
+        // Denoise the grid before it is upsampled. Display only: the solve is
+        // still iterating on the unfiltered values, so transport and every gate
+        // are untouched -- the same split example 40 makes.
+        solver.filter(gbuf, cam, cfg);
         solver.upsample(gbuf, cam, cfg);
         // The image's direct term, per pixel, composited onto the upsampled
         // indirect. Outside the pass above and with its own timer: PassTimer
@@ -606,6 +617,13 @@ int main() {
                 ImGui::Checkbox("Force two-sided emitters", &cfg.two_sided);
                 ImGui::Checkbox("Analytic direct term", &cfg.nee);
                 ImGui::Checkbox("Tent-weighted spawn tiles", &cfg.tent);
+                ImGui::Checkbox("Jitter receiver frames", &cfg.jitter);
+                {
+                    int fi = int(cfg.filter_iters);
+                    if (ImGui::SliderInt("GI denoise iters", &fi, 0, 6))
+                        cfg.filter_iters = uint32_t(fi);
+                    ImGui::SliderInt("GI denoise radius", &cfg.filter_radius, 1, 4);
+                }
                 ImGui::Checkbox("Indirect only (diagnostic)", &cfg.indirect_only);
                 ImGui::Checkbox("Direct term per pixel", &cfg.direct_pixel);
                 if (cfg.direct_pixel) {

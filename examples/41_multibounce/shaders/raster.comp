@@ -61,6 +61,7 @@ uniform uint  u_dump;         // 1 = dump visibility keys, 2 = dump per-texel di
 uniform uint  u_emitters;     // analytic emitter count; 0 = take direct from the raster
 uniform uint  u_tent;         // 1 = tent-weighted spawn tiles, 0 = hard tiles
 uniform uint  u_lv_res;       // light-view edge for this level's direct term
+uniform uint  u_jitter;       // 1 = rotate each receiver's tangent frame
 
 void main() {
     uint cam = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
@@ -92,9 +93,7 @@ void main() {
         return;
     }
 
-    g_N = normalize(c.nrm.xyz);
-    mbg_onb(g_N, g_T, g_B);
-    g_P = c.pos.xyz + g_N * u_bias;
+    mbg_set_receiver(c.pos.xyz, c.nrm.xyz, u_bias, u_jitter != 0u);
 
     uint texels = u_res * u_res;
 

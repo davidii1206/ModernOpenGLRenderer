@@ -22,12 +22,12 @@
 
 uniform uint  u_res;          // hemisphere target edge, texels
 
-// 64x64. The doc's near-camera tier is 32, which is not enough: see
-// implementation.md finding 14. 4096 texels is 16 KB of shared memory, and the
-// array is sized once for every level, so a level-3 camera with a 8x8 target
-// reserves the same 16 KB and costs occupancy it does not use. A production
-// version would compile a variant per tier; this one keeps a single kernel.
-#define MBG_MAX_TEXELS 4096
+// The largest target any level may use. The default schedule needs 256, but the
+// buffer is sized for the cap so MBG_RES can be raised without a recompile --
+// and a level-3 camera with an 8x8 target reserves the same 4 KB either way,
+// because the array is sized once for every level. A production version would
+// compile a variant per tier; this one keeps a single kernel.
+#define MBG_MAX_TEXELS 1024
 shared uint s_vis[MBG_MAX_TEXELS];
 shared vec4 s_red[64];
 shared vec4 s_red2[64];
@@ -183,10 +183,49 @@ void mbg_clear_vis(uint tid, uint stride) {
     for (uint i = tid; i < texels; i += stride) s_vis[i] = MBG_EMPTY;
 }
 
-void mbg_set_receiver(vec3 pos, vec3 nrm, float bias) {
+// 32-bit integer hash (Chris Wellons' triple32-style mix). Only used to pick a
+// rotation, so the bar is "decorrelated between neighbours", not randomness.
+uint mbg_hash(uint x) {
+    x ^= x >> 16; x *= 0x7feb352du;
+    x ^= x >> 15; x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+// THE TANGENT FRAME IS ROTATED PER RECEIVER, AND THAT IS NOT A DETAIL.
+//
+// Every receiver sampling the hemisphere with the SAME texel grid means every
+// receiver makes the same quadrature error, and an error that all of them make
+// together is not noise -- it is a pattern. A scene feature crosses a texel
+// boundary at the same place for a whole row of receivers and their sums step
+// together, which is why the indirect term came out banded rather than grainy
+// (implementation.md, finding 14).
+//
+// Rotating each receiver's frame by a hash of its own position decorrelates
+// them: the same error becomes spatial noise, which anything that averages
+// neighbours removes. Example 40 reaches the same conclusion about its own
+// microbuffer in one line of common/micro.glsl -- "the coherent octahedral
+// banding on a flat wall becomes spatial noise instead of a pattern" -- and is
+// the reason it gets clean indirect out of 8x8 buckets.
+//
+// The hash is over the receiver's POSITION rather than its index, so the
+// rotation does not change when the chunk scheduler assigns a camera to a
+// different slot; a sweep is reproducible bit for bit either way.
+void mbg_set_receiver(vec3 pos, vec3 nrm, float bias, bool jitter) {
     g_N = normalize(nrm);
     mbg_onb(g_N, g_T, g_B);
     g_P = pos + g_N * bias;
+
+    if (jitter) {
+        uint seed = mbg_hash(floatBitsToUint(pos.x) ^
+                    mbg_hash(floatBitsToUint(pos.y) ^
+                    mbg_hash(floatBitsToUint(pos.z))));
+        float a = float(seed) * (1.0 / 4294967296.0) * 6.28318530717959;
+        float c = cos(a), sn = sin(a);
+        vec3 t2 = g_T * c + g_B * sn;
+        g_B = g_B * c - g_T * sn;
+        g_T = t2;
+    }
 }
 
 #endif

@@ -28,7 +28,7 @@
 
 namespace mbg {
 
-bool run_gates(const std::string& names, Solver& solver, const SolveConfig& cfg,
+bool run_gates(const std::string& names, Solver& solver, const SolveConfig& base_in,
                const Scene& scene, const std::vector<Tri>& tris);
 
 } // namespace mbg

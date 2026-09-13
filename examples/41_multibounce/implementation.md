@@ -38,7 +38,9 @@ reload sees it.
 | `MBG_BOUNCES=n` | camera levels, 1–4. 1 = direct only |
 | `MBG_SCALE=n` | GI grid = framebuffer / n. **1 = one camera per pixel**, the doc's correctness reference |
 | `MBG_BUDGET=n` | level-1 cameras per frame. The sweep is split into `ceil(pixels/budget)` chunks; the budget is clamped down if the camera tree would exceed 512 MB |
-| `MBG_RES=n` / `MBG_RES2/3/4=n` | hemi-octahedral target edge per level, 2–64 (defaults 64/8/8/8; see finding 14) |
+| `MBG_RES=n` / `MBG_RES2/3/4=n` | hemi-octahedral target edge per level, 2–32 (defaults 16/8/8/8) |
+| `MBG_JITTER=0\|1` | rotate each receiver's tangent frame by a hash of its position (default 1). **Load-bearing**; see finding 14 |
+| `MBG_FILTER=n` / `MBG_FILTER_R=n` | a-trous denoise iterations over the GI grid and taps per side (default 3, 2) |
 | `MBG_LV_RES=n` | edge of the secondary cameras' light view (default 8) |
 | `MBG_INDIRECT_ONLY=1` | composite the bounce term alone, for inspecting it |
 | `MBG_BLOCK=n` / `MBG_BLOCK2/3=n` | spawn tile edge in texels. **1 spawns a child per texel — the unabridged recursion** |
@@ -215,8 +217,30 @@ direct with 16 visibility samples, tent weights on.
 
 | | RMSE | roughness vs reference | cameras/sweep | sweep |
 |---|---|---|---|---|
-| 1 bounce vs the direct reference | **0.0431** | 0.91× | 1.6e4 + 262k direct | 0.4 s + 16 s direct |
-| 3 bounces vs the full-GI reference (sky 0.05) | **0.0526** | 0.98× | 1.3e6 + 262k direct | 45 s + 16 s direct |
+| 1 bounce vs the direct reference | **0.0430** | 0.91× | 1.6e4 + 262k direct | 0.5 s + 15.6 s direct |
+| 3 bounces vs the full-GI reference (sky 0.05) | **0.0532** | 0.82× | 1.3e6 + 262k direct | 37 s + 15.6 s direct |
+
+### Where the time goes
+
+One complete sweep of the indirect solve, glFinish-bracketed, and the per-frame
+passes measured by holding the solver. **llvmpipe, 4 CPU threads — not GPU
+numbers**; the camera and texel counts are what scale.
+
+| | time | work |
+|---|---|---|
+| indirect, 1 bounce | 0.55 s | 1.6e4 cameras, 4.2e6 texels |
+| indirect, 2 bounces | 8.0 s | 2.8e5 cameras, 2.1e7 texels |
+| **indirect, 3 bounces** | **37 s** | 1.3e6 cameras, 8.8e7 texels, 4.2e7 triangle-rasters |
+| direct, per frame | 15.6 s | 262k fitted light views |
+| everything else per frame | 13 ms | G-buffer, denoise, upsample, display |
+
+The indirect is per SWEEP and the sweep is four chunks, so a frame in steady
+state is about 9 s of solve plus 15.6 s of direct. Two things follow: the
+bounce depth is the cost (×15 for the second bounce, ×4.6 for the third,
+finding 6), and **the direct term is now the most expensive single pass in the
+renderer** — 262k per-pixel light views, rebuilt every frame because the camera
+may have moved. `MBG_DIRECT_RES` and `MBG_SCALE` are the levers; the denoise and
+upsample are free at 13 ms together.
 
 The direct pass is per frame rather than per sweep, and it is a hemisphere per
 pixel — 262k workgroups at 512×512, against the 16k the GI grid runs. That is the
@@ -680,47 +704,71 @@ unoccluded. That is right for a panel and wrong for a receiver sitting inside a
 glowing box — which is what the hemisphere path, still used by every secondary
 camera, is there for.
 
-### 14. 1024 directions is not enough, and the error is banding rather than noise
+### 14. It was never a sampling-rate problem — it was a correlation problem
 
-With the direct term fixed, the indirect was still wrong in a way that only shows
-once it is looked at on its own — `MBG_INDIRECT_ONLY=1` at 4× exposure, which is
-what that switch exists for. The bounce term carried **horizontal banding** across
-the ceiling and the upper walls, and blotchy patches elsewhere.
+With the direct term fixed, the indirect was still wrong in a way that only
+shows once it is looked at on its own (`MBG_INDIRECT_ONLY=1` at 4× exposure,
+which is what that switch exists for): **horizontal banding** across the ceiling
+and the upper walls, and blotchy patches elsewhere.
 
-Three hypotheses, two of them wrong and both worth recording:
+Two hypotheses were wrong and are worth recording because both looked right:
 
 - **The second bounce's shadowing is binary.** At an 8×8 target a level-2 camera
   puts *half a texel* on Cornell's panel, so its visible fraction was the
   sub-texel yes/no of finding 12, flipping as a tile's representative moved.
-  That is real, and fixing it (the secondary cameras now use a fitted light view
-  too, so there is one visibility mechanism everywhere) changed the banding **not
-  at all**.
+  That is real, and fixing it — the secondary cameras now use a fitted light view
+  like the per-pixel pass, so there is one visibility mechanism everywhere —
+  changed the banding **not at all**.
 - **The spawn tiles are too coarse.** Tile 2 puts 256 children on every level-1
   camera and costs 100 s a sweep. Also unchanged.
-- **The quadrature itself.** A 32×32 gather gives every receiver the same 1024
-  directions, so its error is *correlated between neighbours* rather than
-  independent: as a receiver moves, a scene feature crosses a texel boundary at
-  the same place for a whole row of receivers, and the sum steps together. That
-  is why it reads as banding and not as noise, and why the pattern's spacing
-  follows the GI grid — at `MBG_SCALE=2` the bands become a fine diagonal weave
-  in the octahedral map's own fold directions.
 
-At 64×64 — 4096 directions, 16 KB of shared memory — the banding is gone, and the
-mean roughness of the full solve goes from 1.17× the reference's to **0.98×**. So
-the default level-1 target is 64 rather than the doc's 32, with the tile at 16 to
-keep the child count where finding 4 put it.
+The third hypothesis was right about the cause and wrong about the fix. A 32×32
+gather hands every receiver the **same 1024 directions**, so its quadrature error
+is *correlated between neighbours*: a scene feature crosses a texel boundary at
+the same place for a whole row of receivers and their sums step together. That is
+why it reads as banding rather than grain, and why the pattern's spacing follows
+the GI grid — at `MBG_SCALE=2` it becomes a fine diagonal weave along the
+octahedral folds.
 
-The deeper levels stay at 8×8. Their quadrature does contribute: raising level 2
-to 24×24 takes the ceiling — the surface lit entirely by bounce, and the worst
-patch in the image — from 1.30× to 1.12×, for **6× the sweep**. RMSE moves by
-0.0001. That is the resolution falloff of §6.2 being right: near cameras need the
-directions, deep ones do not.
+Raising the target to 64×64 does remove it, and that is the wrong lever: it
+treats a correlation problem as a sampling-rate problem and pays 4× for it.
+Example 40 gets clean indirect out of **8×8** buckets, and says why in one line
+of `common/micro.glsl` — its frame rotation is "deterministic across frames and
+runs but decorrelated between neighbours, so the coherent octahedral banding on a
+flat wall becomes spatial noise instead of a pattern". Two passes, not more
+texels:
 
-The cost of the shared buffer is worth stating plainly. It is sized once, at
-compile time, for the largest target any level uses, so a level-3 camera with an
-8×8 target still reserves 16 KB and spends occupancy it cannot use. A production
-version would compile a kernel variant per tier; this one keeps a single kernel
-and pays for it.
+1. **Rotate each receiver's tangent frame** by a hash of its position
+   (`common/raster.glsl`). The error stops being shared between neighbours and
+   becomes noise. Hashing the position rather than the camera index keeps a sweep
+   reproducible when the chunk scheduler moves a camera to a different slot.
+2. **Denoise the GI grid** with an a-trous, normal- and plane-aware filter
+   (`gi_filter.comp`) before upsampling. This is only safe because of finding
+   11's split: the grid carries the **indirect residual alone**, which is low
+   frequency by nature, while the direct term — every sharp edge in the image —
+   is added afterwards at full resolution and never touches it. Example 40 makes
+   exactly the same split for exactly the same reason.
+
+Neither works alone. Filtering a coherent pattern blurs the pattern; jittering
+without averaging trades bands for grain.
+
+With both, the target resolution stops mattering:
+
+| level-1 target | RMSE | ceiling roughness | mean roughness | sweep |
+|---|---|---|---|---|
+| **16×16** | **0.0532** | 0.88× | 0.82× | 37 s |
+| 32×32 | 0.0533 | 0.88× | 0.82× | 38 s |
+| 64×64 | 0.0532 | 0.88× | 0.82× | 43 s |
+
+So the default went to **16×16** — half the doc's near tier and a sixteenth of
+the directions this example briefly thought it needed. The ceiling, which is lit
+entirely by bounce and was the worst surface in the image at **1.88×** the
+reference's roughness, is now at 0.88×: slightly *under*, which is the denoise
+doing its job and the honest cost of it.
+
+The remaining lever is the one §6.2 predicts. Raising level 2 from 8×8 to 24×24
+moves the ceiling from 1.30× to 1.12× for **6× the sweep** and 0.0001 of RMSE —
+deep bounces are low frequency and do not want the resolution.
 
 ## What this does not answer
 

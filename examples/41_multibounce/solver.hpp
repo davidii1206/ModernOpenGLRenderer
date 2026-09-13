@@ -52,12 +52,13 @@ struct SolveConfig {
     // resolution, deep ones do not, because deep bounces carry little energy and
     // are extremely low frequency.
     //
-    // 64 at level 1 rather than the doc's 32, on measurement. The quadrature
-    // error of a 32x32 gather is correlated between neighbouring receivers -- the
-    // directions are the same for all of them -- so it does not read as noise,
-    // it reads as horizontal banding across the ceiling and the upper walls.
-    // 4096 directions removes it; see implementation.md, finding 14.
-    std::array<uint32_t, kMaxLevels> res{{64, 8, 8, 8}};
+    // 16 everywhere, which is HALF the doc's near tier and a sixteenth of the
+    // directions this example briefly thought it needed. Throwing resolution at
+    // the indirect term was treating a correlation problem as a sampling-rate
+    // problem: once each receiver's frame is rotated and the grid is denoised,
+    // 16x16, 32x32 and 64x64 produce the same image to within 0.0001 RMSE.
+    // See implementation.md, finding 14.
+    std::array<uint32_t, kMaxLevels> res{{16, 8, 8, 8}};
     // Tile edge for spawning the next level, in texels of THIS level's target.
     // 1 spawns per texel (the unabridged recursion); the terminal level ignores
     // it. res/block must be an integer, and configure() snaps it down until it
@@ -73,10 +74,10 @@ struct SolveConfig {
     // spawns a single child and the level below it stops being a gather at all,
     // and the extra children are cheap next to level 1's, which multiplies
     // everything under it.
-    // 16 at level 1 keeps the child count at 16 now that the target is 64 wide;
-    // the measurement behind the tile size is in finding 4 and is about how many
-    // children there are, not how many texels each covers.
-    std::array<uint32_t, kMaxLevels> block{{16, 4, 4, 4}};
+    // 4 at a 16-wide target is 16 children, which is where finding 4's
+    // measurement put it -- that finding is about how many children there are,
+    // not how many texels each covers.
+    std::array<uint32_t, kMaxLevels> block{{4, 4, 4, 4}};
 
     // The direct term. `nee` routes every emissive triangle through the analytic
     // estimator in raster.comp instead of letting the quadrature find it, which
@@ -90,10 +91,12 @@ struct SolveConfig {
     // Same rasterizer and same depth sort as everywhere else; only the receiver
     // changes. The solve is unchanged; only what the image reads changes.
     bool      direct_pixel = true;
-    // Edge of the per-pixel pass's light view. 16 puts ~256 texels on the
-    // emitter, against the 4-29 a 32x32 hemisphere manages -- see
-    // common/lightview.glsl.
-    uint32_t  direct_res = 16;
+    // Edge of the per-pixel pass's light view. 8 puts 64 texels on the emitter
+    // -- against the 4-29 a 32x32 hemisphere manages, which is the whole point
+    // of fitting the frustum (common/lightview.glsl). Measured indistinguishable
+    // from 16 and 32 in both RMSE and roughness, at a quarter of the cost, and
+    // this pass is the most expensive thing in a frame.
+    uint32_t  direct_res = 8;
     // Light-view edge for the SECONDARY CAMERAS' direct term. Smaller than the
     // per-pixel pass's because it feeds bounce transport rather than the image,
     // but it cannot be the hemisphere: at an 8x8 target a camera's hemisphere
@@ -105,6 +108,14 @@ struct SolveConfig {
     // the bounce term alone. A diagnostic, not a rendering mode -- the indirect
     // is usually 10x dimmer than the direct and invisible underneath it.
     bool      indirect_only = false;
+    // Rotate every receiver's tangent frame by a hash of its position, so the
+    // quadrature error decorrelates between neighbours instead of banding.
+    bool      jitter = true;
+    // A-trous iterations over the GI grid, and taps per side. Removes what the
+    // jitter turned into noise; safe only because the grid carries the indirect
+    // residual alone. 0 disables.
+    uint32_t  filter_iters = 3;
+    int32_t   filter_radius = 2;
     // Spread each texel's albedo mass across the four nearest spawn tiles
     // instead of assigning it to one. Removes the tile discontinuity; costs a
     // wider scan of shared memory and nothing else.
@@ -155,6 +166,8 @@ public:
     // upsample(), every frame, and is independent of the chunk schedule.
     void direct_pixel(const GBuffer& gb, const gfx::Camera& cam, const Scene& scene,
                       const SolveConfig& cfg);
+    // Denoise the GI grid in place, before upsampling. Display only.
+    void filter(const GBuffer& gb, const gfx::Camera& cam, const SolveConfig& cfg);
 
     // --- Gate entry points ---------------------------------------------------
     //
@@ -200,6 +213,7 @@ public:
     PassTimer& t_gather() { return t_gather_; }
     PassTimer& t_upsample() { return t_upsample_; }
     PassTimer& t_direct() { return t_direct_; }
+    PassTimer& t_filter() { return t_filter_; }
 
 private:
     void dispatch_1d(uint32_t count);          // 64-wide, split across x/y
@@ -211,7 +225,7 @@ private:
                     bool write_image);
     void upload_points(const std::vector<glm::vec4>& pos, const std::vector<glm::vec4>& nrm);
 
-    Pipeline place_, raster_, gather_, upsample_, direct_px_;
+    Pipeline place_, raster_, gather_, upsample_, direct_px_, filter_;
 
     // Per level: cameras, irradiance, the direct term with its visible fraction,
     // and the per-tile masses that spawned them (two vec4s per child: the
@@ -223,6 +237,7 @@ private:
     uint32_t levels_ = 0;
 
     gl::Texture gi_{gl::TextureType::tex_2d};      // GI grid, RGBA32F, (E, 1)
+    gl::Texture gi_tmp_{gl::TextureType::tex_2d};  // ping-pong for the denoise
     gl::Texture full_{gl::TextureType::tex_2d};    // framebuffer resolution
     int gi_w_ = 0, gi_h_ = 0, full_w_ = 0, full_h_ = 0;
 
@@ -238,6 +253,7 @@ private:
     PassTimer t_gather_{"Resolve"};
     PassTimer t_upsample_{"Upsample"};
     PassTimer t_direct_{"Direct/px"};
+    PassTimer t_filter_{"GI filter"};
 };
 
 } // namespace mbg

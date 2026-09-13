@@ -44,8 +44,9 @@ bool Solver::init() {
     gather_   = Pipeline::compute("shaders/gather.comp");
     upsample_ = Pipeline::compute("shaders/upsample.comp");
     direct_px_ = Pipeline::compute("shaders/direct_pixel.comp");
+    filter_ = Pipeline::compute("shaders/gi_filter.comp");
     return place_.valid() && raster_.valid() && gather_.valid() && upsample_.valid() &&
-           direct_px_.valid();
+           direct_px_.valid() && filter_.valid();
 }
 
 bool Solver::poll() {
@@ -54,6 +55,7 @@ bool Solver::poll() {
     changed |= gather_.poll();
     changed |= upsample_.poll();
     changed |= direct_px_.poll();
+    changed |= filter_.poll();
     return changed;
 }
 
@@ -62,7 +64,7 @@ void Solver::configure(const SolveConfig& cfg_in, int fb_w, int fb_h) {
     cfg.bounces = std::clamp(cfg.bounces, 1u, kMaxLevels);
     cfg.scale   = std::clamp(cfg.scale, 1u, 64u);
     for (uint32_t l = 0; l < cfg.bounces; ++l) {
-        cfg.res[l]   = std::clamp(cfg.res[l], 2u, 64u);
+        cfg.res[l]   = std::clamp(cfg.res[l], 2u, 32u);
         cfg.block[l] = snap_block(cfg.res[l], cfg.block[l]);
     }
 
@@ -137,6 +139,7 @@ void Solver::configure(const SolveConfig& cfg_in, int fb_w, int fb_h) {
     // storage, so re-specing an existing one is INVALID_OPERATION and would
     // silently keep the old size.
     make_image(gi_, gi_w_, gi_h_);
+    make_image(gi_tmp_, gi_w_, gi_h_);
     make_image(full_, fb_w, fb_h);
     full_w_ = fb_w;
     full_h_ = fb_h;
@@ -151,6 +154,7 @@ void Solver::configure(const SolveConfig& cfg_in, int fb_w, int fb_h) {
 void Solver::clear_image() {
     const float zero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     if (gi_.handle()) glClearTexImage(gi_.handle(), 0, GL_RGBA, GL_FLOAT, zero);
+    if (gi_tmp_.handle()) glClearTexImage(gi_tmp_.handle(), 0, GL_RGBA, GL_FLOAT, zero);
     if (full_.handle()) glClearTexImage(full_.handle(), 0, GL_RGBA, GL_FLOAT, zero);
 }
 
@@ -235,6 +239,7 @@ void Solver::raster_level(uint32_t l, uint32_t count, const Scene& scene,
     raster_.set("u_emitters", cfg.nee ? scene.emitter_count() : 0u);
     raster_.set("u_tent", cfg.tent ? 1u : 0u);
     raster_.set("u_lv_res", std::clamp(cfg.cam_lv_res, 2u, 32u));
+    raster_.set("u_jitter", cfg.jitter ? 1u : 0u);
     dispatch_groups(count);
     gl::memory_barrier(GL_SHADER_STORAGE_BARRIER_BIT);
 }
@@ -372,6 +377,35 @@ void Solver::direct_pixel(const GBuffer& gb, const gfx::Camera& cam, const Scene
     // exactly as the secondary cameras do.
     dispatch_groups(uint32_t(gb.width) * uint32_t(gb.height));
     gl::memory_barrier(GL_TEXTURE_FETCH_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+}
+
+void Solver::filter(const GBuffer& gb, const gfx::Camera& cam, const SolveConfig& cfg) {
+    if (!allocated_ || !filter_.valid() || cfg.filter_iters == 0) { t_filter_.skip(); return; }
+    ScopedPass p(t_filter_);
+    filter_.use();
+    gb.bind_textures();
+    filter_.set("u_gi_size", glm::ivec2(gi_w_, gi_h_));
+    filter_.set("u_size", glm::ivec2(gb.width, gb.height));
+    filter_.set("u_scale", layout_.scale);
+    filter_.set("u_inv_view_proj", glm::inverse(cam.view_projection()));
+    filter_.set("u_radius", std::max(1, cfg.filter_radius));
+    filter_.set("u_plane_tol", std::max(1e-5f, cfg.plane_tol));
+
+    // A-trous: the tap spacing doubles each iteration, so three passes of a 5x5
+    // kernel reach as far as 17x17 for a ninth of the taps.
+    for (uint32_t i = 0; i < cfg.filter_iters; ++i) {
+        const bool even = (i % 2) == 0;
+        (even ? gi_ : gi_tmp_).bind_image(0, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA32F);
+        (even ? gi_tmp_ : gi_).bind_image(1, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA32F);
+        filter_.set("u_stride", int(1u << i));
+        gl::dispatch_compute(uint32_t((gi_w_ + 7) / 8), uint32_t((gi_h_ + 7) / 8), 1);
+        gl::memory_barrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+    }
+    // An odd iteration count leaves the result in the scratch image; copy it back
+    // so the rest of the frame does not need to know which one is live.
+    if (cfg.filter_iters % 2 == 1)
+        glCopyImageSubData(gi_tmp_.handle(), GL_TEXTURE_2D, 0, 0, 0, 0,
+                           gi_.handle(), GL_TEXTURE_2D, 0, 0, 0, 0, gi_w_, gi_h_, 1);
 }
 
 void Solver::upsample(const GBuffer& gb, const gfx::Camera& cam, const SolveConfig& cfg) {

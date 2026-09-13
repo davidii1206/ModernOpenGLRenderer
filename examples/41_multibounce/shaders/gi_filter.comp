@@ -1,0 +1,95 @@
+#version 460 core
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// ---------------------------------------------------------------------------
+// Edge-aware denoise of the GI grid. DISPLAY ONLY: the solve never reads it.
+//
+// The other half of finding 14's answer. Rotating each receiver's tangent frame
+// turns the quadrature's banding into spatial noise (common/raster.glsl); this
+// pass is what then removes the noise. Neither works alone -- filtering a
+// coherent pattern just blurs the pattern, and decorrelating without averaging
+// trades bands for grain.
+//
+// It is safe to blur here and nowhere else because of the split in finding 11:
+// the grid carries the INDIRECT RESIDUAL alone, and indirect irradiance is low
+// frequency by nature. The direct term, which carries every sharp edge in the
+// image, is added afterwards at full resolution and never touches this.
+//
+// A-trous: each iteration doubles the tap spacing, so three passes of a 5x5
+// kernel reach as far as a 17x17 one for a ninth of the taps. Weights are the
+// neighbour's normal agreement and its distance from this receiver's tangent
+// plane, which is what stops it averaging across a corner or a silhouette.
+//
+// This is example 40's surfel_filter.comp with its object-space cache swapped
+// for a screen-space grid, and it inherits the drawback 40 names: a filter width
+// in pixels is a different width in world units at different depths, so a
+// distant wall is denoised harder than a near one. The fix is the object-space
+// cache of doc section 7.2, which is variant B's to build.
+// ---------------------------------------------------------------------------
+
+#include "gbuffer.glsl"
+
+layout(binding = 0, rgba32f) uniform readonly  image2D u_src;
+layout(binding = 1, rgba32f) uniform writeonly image2D u_dst;
+
+layout(binding = 0) uniform sampler2D u_albedo;
+layout(binding = 1) uniform sampler2D u_normal;
+layout(binding = 3) uniform sampler2D u_depth;
+
+uniform ivec2 u_gi_size;
+uniform ivec2 u_size;
+uniform uint  u_scale;
+uniform mat4  u_inv_view_proj;
+uniform int   u_stride;       // a-trous tap spacing for this iteration
+uniform int   u_radius;       // taps per side
+uniform float u_plane_tol;    // world units
+
+// The full-resolution G-buffer pixel a GI cell was sampled at -- the same
+// mapping place.comp uses, so the filter tests the receivers the solve actually
+// placed rather than an interpolation of them.
+ivec2 gi_to_pixel(ivec2 g) {
+    return min(g * int(u_scale) + int(u_scale) / 2, u_size - 1);
+}
+
+bool gi_receiver(ivec2 g, out vec3 pos, out vec3 nrm) {
+    ivec2 s = gi_to_pixel(g);
+    if (texelFetch(u_albedo, s, 0).a <= 0.5) return false;
+    nrm = normalize(texelFetch(u_normal, s, 0).xyz);
+    pos = world_from_depth(texelFetch(u_depth, s, 0).r,
+                           (vec2(s) + 0.5) / vec2(u_size), u_inv_view_proj);
+    return true;
+}
+
+void main() {
+    ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+    if (g.x >= u_gi_size.x || g.y >= u_gi_size.y) return;
+
+    vec3 p0, n0;
+    if (!gi_receiver(g, p0, n0)) { imageStore(u_dst, g, imageLoad(u_src, g)); return; }
+
+    vec3  acc = vec3(0.0);
+    float wsum = 0.0;
+    for (int dy = -u_radius; dy <= u_radius; ++dy) {
+        for (int dx = -u_radius; dx <= u_radius; ++dx) {
+            ivec2 q = g + ivec2(dx, dy) * u_stride;
+            if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, u_gi_size))) continue;
+
+            vec3 p1, n1;
+            if (!gi_receiver(q, p1, n1)) continue;
+
+            float wn = max(dot(n0, n1), 0.0);
+            wn *= wn; wn *= wn;                                    // ^4
+            float wp = max(1.0 - abs(dot(p1 - p0, n0)) / u_plane_tol, 0.0);
+            // A small B3-spline-ish falloff so the taps nearest the centre count
+            // most; with a-trous the far taps are already sparse.
+            float wd = 1.0 / (1.0 + float(dx * dx + dy * dy));
+            float w = wn * wp * wd;
+            if (w <= 0.0) continue;
+
+            acc += imageLoad(u_src, q).rgb * w;
+            wsum += w;
+        }
+    }
+
+    imageStore(u_dst, g, wsum > 1e-8 ? vec4(acc / wsum, 1.0) : imageLoad(u_src, g));
+}
