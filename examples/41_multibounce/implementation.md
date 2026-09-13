@@ -1390,11 +1390,63 @@ nothing over 8, and the penumbra still ramps 14-13-12-11-10-9-8-6-5-4-3-2-1-0
 instead of stepping. The residual differences are the old edge tolerance, which
 the inverted test does not need.
 
-Two things follow. The shape left behind is what culling wants — every triangle
-is now an independent side-effect-free test against a direction, so a frustum or
-cluster cull just shortens the inner loop. And `raster.comp` still rasterizes its
-light views the old way; Raster L2 and L3 are now the entire remaining frame
-cost, and the same inversion applies to them.
+The shape left behind is what culling wants: every triangle is now an
+independent, side-effect-free test against a direction, so a frustum or cluster
+cull just shortens the inner loop.
+
+#### The same inversion in raster.comp, and the leak it exposed
+
+`raster.comp`'s emitter light views and sun cone take the identical treatment —
+`lv_mass_texel` and `lv_mass_disc_texel` in place of clear + rasterize +
+`lv_mass`. And it immediately failed a gate that the Cornell image was perfectly
+happy with:
+
+    [GATE] 4 occ  E behind an opaque panel  got 0.0409  expect 0  tol 1e-06  FAIL
+
+**5.4% of an emitter coming through a blocker that covers it twice over.** The
+shape of the failure named the cause: it fell as roughly 1/res (0.0409 at an 8x8
+light view, 0.0167 at 16x16, 0.0066 at 32x32, and 0 at 4x4 where no texel centre
+happened to land on it), and a defect that scales with the perimeter rather than
+the area lives on a LINE.
+
+The line is the diagonal a quad is split along. The inverted test was written
+inclusive but without a tolerance, on the reasoning that there was none to tune —
+which is wrong for exactly the case `mbg_fill` already documents: on a shared
+edge all three products are zero plus float noise, and when both triangles round
+the wrong way the texel is left empty. A blocker's diagonal runs straight through
+the middle of a light view aimed past it, so this is the common case, not a
+corner one, and the result is a one-texel slit in an opaque panel.
+
+The fix is the tolerance `mbg_fill` has, expressed relative to the products' own
+magnitude so it stays dimensionless: `-1e-6 * (|b0| + |b1| + |b2|)`. Overlap is
+free, because both pieces compute the same depth from the same plane.
+
+Worth stating plainly: **the image never showed this.** RMSE against both
+references was unchanged to four digits with the leak present. It took an
+assertion that a specific number must be exactly zero.
+
+#### Where the frame ended up
+
+RTX 3060, Cornell, 3 bounces, default configuration:
+
+| | before | after |
+|---|---|---|
+| Raster L1 | 21.4 ms | **2.1 ms** |
+| Raster L2 | 582 ms | **47.7 ms** |
+| Raster L3 | 375 ms | **27.2 ms** |
+| Direct/px | 2317 ms | **31.8 ms** |
+| GPU total per frame | 3657 ms | **109 ms** |
+| complete sweep | ~31 s | **3.6 s** |
+
+RMSE 0.0429 against the direct reference and 0.0400 against the full-GI one,
+both unchanged; 30/35 gates, the same five that fail on this GPU for unrelated
+reasons (see below).
+
+It also retired a blocker. At the default `MBG_BUDGET=4096` a chunk used to take
+about 9 s, and a full sweep hit the NVIDIA compute watchdog at almost exactly
+20.0 s — context reset, black readback, every pass timer reading 0.000 ms. A
+chunk is now ~890 ms and the default budget runs clean. The crash was a symptom
+of the slowness, not a separate bug.
 
 **A caution about the numbers above this finding.** They were all taken on
 llvmpipe, where local memory is just stack and this whole effect is invisible. A

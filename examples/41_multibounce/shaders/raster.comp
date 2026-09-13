@@ -211,28 +211,12 @@ void main() {
         // view spends its texels on the light instead. See lightview.glsl.
         bool fitted = lit && lv_setup(g_P, g_N, tris[ti], 2.0 * u_bias);
 
-        if (fitted) {
-            for (uint i = tid; i < u_lv_res * u_lv_res; i += 64u) {
-                s_lv[i] = MBG_EMPTY;
-                s_lv_e[i] = MBG_EMPTY;
-            }
-            barrier();
-            memoryBarrierShared();
-            // ONE THREAD. lv_raster_tri walks a triangle's projected bounding
-            // box and atomicMins every texel it covers, so calling it from all
-            // 64 invocations rasterizes the SAME triangle 64 times into the same
-            // 64 shared addresses -- 64x the work and maximal atomic contention,
-            // for an answer that was already correct after the first one. The
-            // scene loop below is distributed by tid because it has many
-            // triangles to spread; the emitter pass has exactly one.
-            if (tid == 0u) lv_raster_tri(ti, u_lv_res, u_inv_far, true);
-            for (uint t = tid; t < u_tri_count; t += 64u)
-                lv_raster_tri(t, u_lv_res, u_inv_far, false);
-            barrier();
-            memoryBarrierShared();
-        }
-
-        s_red2[tid] = vec4(fitted ? lv_mass(u_lv_res, g_N, tid, u_lv_res * u_lv_res, 64u)
+        // One texel per thread, the winner kept in a register: no clear, no
+        // shared buffer, no atomics, no barrier around the visibility itself.
+        // Same depth sort with the loops nested the other way -- lv_mass_texel
+        // in common/lightview.glsl, and implementation.md finding 22.
+        s_red2[tid] = vec4(fitted ? lv_mass_texel(u_lv_res, g_N, ti, u_tri_count,
+                                                  u_inv_far, tid, 64u)
                                   : vec2(0.0), 0.0, 0.0);
         barrier();
         for (uint r = 32u; r > 0u; r >>= 1u) {
@@ -260,22 +244,14 @@ void main() {
     // both identical in every invocation, so the barriers inside cannot split.
     vec3 sun_mag = mbg_sun_unshadowed(g_N);
     if (dot(sun_mag, vec3(1.0)) > 0.0) {
-        uint lvt = u_lv_res * u_lv_res;
         lv_setup_dir(g_P, g_N, u_sun_dir, u_sun_tan_r, lv_near_for(u_inv_far),
                      2.0 * u_bias);
         // The sun's cone is the one sampling grid in this renderer that is not
         // decorrelated for free -- see lv_spin. The salt keeps it independent of
         // the hemisphere's own rotation, which is driven by the same position.
         if (u_jitter != 0u) lv_spin(mbg_jitter_angle(c.pos.xyz, 0x9E3779B9u));
-        for (uint i = tid; i < lvt; i += 64u) s_lv[i] = MBG_EMPTY;
-        barrier();
-        memoryBarrierShared();
-        for (uint t = tid; t < u_tri_count; t += 64u)
-            lv_raster_tri(t, u_lv_res, u_inv_far, false);
-        barrier();
-        memoryBarrierShared();
-
-        s_red2[tid] = vec4(lv_mass_disc(u_lv_res, g_N, u_sun_cos_r, tid, lvt, 64u),
+        s_red2[tid] = vec4(lv_mass_disc_texel(u_lv_res, g_N, u_sun_cos_r, u_tri_count,
+                                              u_inv_far, tid, 64u),
                            0.0, 0.0);
         barrier();
         for (uint r = 32u; r > 0u; r >>= 1u) {
