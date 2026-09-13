@@ -147,6 +147,9 @@ struct SolveConfig {
     // them. 0 walks the whole scene, which is the measurement this is compared
     // against. See scene.hpp's GpuCluster and lightview.glsl's lv_cull.
     bool      cull = true;
+    // One traversal per workgroup with several texels per thread, instead of
+    // one traversal per texel. See mbg_resolve_vis_coop.
+    bool      coop = true;
 
     // The direct term. `nee` routes every emissive triangle through the analytic
     // estimator in raster.comp instead of letting the quadrature find it, which

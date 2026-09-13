@@ -124,8 +124,7 @@ bool mbg_cl_live(uint c) {
 // neighbourhood, so the winners have to be visible across the workgroup. What
 // goes away is the atomics -- each texel is written once, by the thread that
 // owns it.
-bool mbg_tri_hit(uint ti, vec3 d, out float dist) {
-    MbgTri tr = tris[ti];
+bool mbg_tri_hit_tr(MbgTri tr, vec3 d, out float dist) {
     vec3 v0 = tr.p0.xyz - g_P;
     vec3 v1 = tr.p1.xyz - g_P;
     vec3 v2 = tr.p2.xyz - g_P;
@@ -159,6 +158,97 @@ bool mbg_tri_hit(uint ti, vec3 d, out float dist) {
     // the SAME d, so the scale factor |d| is common and cancels.
     dist = t;
     return true;
+}
+
+bool mbg_tri_hit(uint ti, vec3 d, out float dist) {
+    return mbg_tri_hit_tr(tris[ti], d, dist);
+}
+
+// --- Sharing one traversal across a camera's texels --------------------------
+//
+// The inverted resolve gives every texel its own traversal, and a camera has
+// 256 of them sharing ONE ORIGIN. They rediscover the same scene 256 times, and
+// they diverge the moment their distance bounds differ, so the triangle reads
+// stop being broadcasts and every lane fetches separately. Measured on Sponza:
+// 66 ms for a single camera, and neither a coarse cluster level nor a spatial
+// sort moved it, because neither addresses the count.
+//
+// So the workgroup walks the scene ONCE and each thread carries several texels
+// through it. A triangle is fetched a single time and tested against all of
+// them; the loop over geometry is workgroup uniform, so there is no divergence
+// left to lose the broadcast to. The per-texel distance bound survives as a
+// PREDICATE inside the innermost loop rather than a branch that reorders the
+// traversal -- a thread whose texels are all nearer simply does nothing for
+// that triangle.
+//
+// This is the projecting rasterizer's loop order with none of its costs: one
+// triangle against many texels, but resolved by the cone test, so there is no
+// projection, no clipping, and no local-memory polygon arrays. The inversion
+// was right for a light view, where 64 texels look at one small thing; it is
+// the wrong shape for a hemisphere, where 256 texels look at everything.
+#define MBG_TEXELS_PER_THREAD 4
+
+void mbg_resolve_vis_coop(uint tid, uint stride, uint group_count) {
+    uint n = u_res * u_res;
+    uint span = stride * MBG_TEXELS_PER_THREAD;
+
+    for (uint base = 0u; base < n; base += span) {
+        vec3  d[MBG_TEXELS_PER_THREAD];
+        float len[MBG_TEXELS_PER_THREAD];
+        uint  best[MBG_TEXELS_PER_THREAD];
+        float bd[MBG_TEXELS_PER_THREAD];
+        float worst = 0.0;                 // this thread's loosest bound
+
+        for (uint k = 0u; k < MBG_TEXELS_PER_THREAD; ++k) {
+            uint i = base + k * stride + tid;
+            d[k] = i < n ? mbg_to_world(mbg_px_to_dir(vec2(float(i % u_res),
+                                                           float(i / u_res)) + vec2(0.5), u_res))
+                         : vec3(0.0, 0.0, 1.0);
+            len[k] = length(d[k]);
+            best[k] = MBG_EMPTY;
+            bd[k] = 1e18;
+        }
+        worst = 1e18;
+
+        for (uint g = 0u; g < group_count; ++g) {
+            vec3 gq = max(max(groups[g].lo.xyz - g_P, vec3(0.0)),
+                          g_P - groups[g].hi.xyz);
+            // The loosest bound any of this thread's texels holds: if the whole
+            // group is beyond that, none of them can want it.
+            if (dot(gq, gq) > worst * worst) continue;
+
+            uint cfirst = uint(groups[g].lo.w);
+            uint clast  = cfirst + uint(groups[g].hi.w);
+            for (uint c = cfirst; c < clast; ++c) {
+                if (!mbg_cl_live(c)) continue;
+                vec3 q = max(max(clusters[c].lo.xyz - g_P, vec3(0.0)),
+                             g_P - clusters[c].hi.xyz);
+                float qd2 = dot(q, q);
+                if (qd2 > worst * worst) continue;
+
+                uint first = uint(clusters[c].lo.w);
+                uint last  = first + uint(clusters[c].hi.w);
+                for (uint t = first; t < last; ++t) {
+                    // One fetch, broadcast across the workgroup, reused by every
+                    // texel this thread owns.
+                    MbgTri tr = tris[t];
+                    for (uint k = 0u; k < MBG_TEXELS_PER_THREAD; ++k) {
+                        if (qd2 > bd[k] * bd[k]) continue;     // predicate, not a branch
+                        float tt;
+                        if (!mbg_tri_hit_tr(tr, d[k], tt)) continue;
+                        float dist = tt * len[k];
+                        if (dist < bd[k]) { bd[k] = dist; best[k] = t; }
+                    }
+                }
+                worst = max(max(bd[0], bd[1]), max(bd[2], bd[3]));
+            }
+        }
+
+        for (uint k = 0u; k < MBG_TEXELS_PER_THREAD; ++k) {
+            uint i = base + k * stride + tid;
+            if (i < n) s_vis[i] = best[k];
+        }
+    }
 }
 
 // Fill s_vis for this thread's texels. Replaces clear + rasterize + barrier.

@@ -252,6 +252,11 @@ void Solver::raster_level(uint32_t l, uint32_t count, const Scene& scene,
     raster_.set("u_tri_count", scene.count());
     raster_.set("u_cluster_count", scene.cluster_count());
     raster_.set("u_group_count", scene.group_count());
+    // Only where there is something to amortize. Carrying four texels through
+    // one traversal costs register pressure and a four-wide inner loop, and on
+    // a scene that fits in cache that is a 1.5x LOSS -- measured on Cornell.
+    raster_.set("u_coop",
+                (cfg.coop && scene.cluster_count() > 8u) ? 1u : 0u);
     raster_.set("u_cull", cfg.cull ? 1u : 0u);
     raster_.set("u_res", li.res);
     raster_.set("u_block", li.block);
