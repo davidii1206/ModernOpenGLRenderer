@@ -53,7 +53,12 @@ layout(std430, binding = 9) writeonly buffer MbgDirect  { vec4   direct_out[]; }
 
 uniform uint  u_cam_count;
 uniform uint  u_tri_count;
-uniform uint  u_block;        // spawn block edge; 0 = terminal level, no children
+uniform uint  u_block;        // tile mode: spawn block edge, in texels
+uniform uint  u_children;     // children this camera spawns; 0 = terminal level
+uniform uint  u_paths;        // 0 = branching tiles; else single-sample continuation
+uniform uint  u_level;        // this level's index, for the random streams
+uniform float u_rr;           // Russian-roulette throughput threshold; 0 = off
+uniform uint  u_importance;   // 1 = weight the continuation by the hit's radiance
 uniform float u_bias;         // camera offset along its own normal, world units
 uniform float u_emissive;     // emissive scale
 uniform uint  u_two_sided;    // force every triangle to emit from both faces
@@ -71,8 +76,12 @@ void main() {
     // barrier: every invocation of a workgroup takes the same branch.
     if (cam >= u_cam_count) return;
 
+    // In tile mode the child count is fixed by the target and the tile edge; in
+    // path mode the host sets it directly (the split factor at the primary hit,
+    // one everywhere below it). Either way u_children is the authority on how
+    // many slots this camera owns.
     uint bpr    = u_block > 0u ? u_res / u_block : 0u;
-    uint nblock = bpr * bpr;
+    uint nblock = u_children;
 
     MbgCam c = cams[cam];
     if (c.pos.w == 0.0) {
@@ -303,9 +312,222 @@ void main() {
         direct_out[cam * 2u + 1u] = vec4(direct_s, vis_s);
     }
 
-    if (u_block == 0u) return;
+    if (u_children == 0u) return;
 
-    // --- Spawn the next level ------------------------------------------------
+    // --- Spawn the next level, A: single-sample continuation -----------------
+    //
+    // THE BRANCHING RECURSION IS EXPONENTIAL AND THIS ONE IS NOT. Below, the
+    // tile estimator spawns K children per camera, so a depth-D solve costs
+    // K^D cameras: at the default schedule, 16 at level 2 and 64 at level 3,
+    // and a fourth bounce would cost 256. Every lever section 6.2 offers --
+    // resolution falloff, coarser tiles -- shrinks the BASE of that exponent
+    // and leaves the exponent alone.
+    //
+    // A path estimator has branch factor 1. Split once, here at the primary
+    // hit, into u_children paths; from then on each path picks exactly ONE
+    // continuation direction per bounce, so the cost is paths x depth and a
+    // fifth bounce costs the same as the second. That is the whole point, and
+    // everything else in this block exists to make one sample per bounce good
+    // enough to be worth keeping.
+    //
+    // Three things do that:
+    //
+    //   IMPORTANCE SAMPLING. The direction a path continues through is drawn
+    //   from the micro-buffer this camera just rasterized, with weight
+    //   cos * dOmega * albedo * (unshadowed direct irradiance at the hit). The
+    //   first three factors are the integrand's own known part; the fourth is
+    //   the best available proxy for the unknown part, and it is FREE -- the
+    //   tile estimator already evaluates it at every texel, for M_dir. So the
+    //   distribution costs one prefix sum over data we compute either way, and
+    //   it puts the one sample we keep where the light is.
+    //
+    //   STRATIFICATION. u_children samples are drawn one per equal stratum of
+    //   the CDF, offset by a hash of the receiver's position. Stratified, so
+    //   the samples cannot clump; hashed per receiver, so the residual error
+    //   decorrelates between neighbours instead of banding -- the same reason
+    //   the hemisphere's own frame is rotated (finding 14).
+    //
+    //   RUSSIAN ROULETTE on the accumulated throughput, below.
+    //
+    // AND THE CLUSTERING ERROR GOES AWAY ENTIRELY. The tile estimator carries a
+    // whole tile's mass and scales it by the visibility measured at ONE
+    // representative texel, which is why a hard-edged light needed a mass of
+    // its own (finding 18) and why even then its variance survived. Here the
+    // child sits exactly at the hit point whose mass it carries, so
+    // M_emit * vis and M_sun * vis are not approximations at all -- the tile
+    // and its representative are the same texel by construction.
+    if (u_paths != 0u) {
+        // 1. The unshadowed direct irradiance at every covered texel's hit
+        //    point, parked in s_cdf, and its mean over covered texels. This is
+        //    the same quantity the tile estimator computes for M_dir, so the
+        //    importance function is paid for out of work already being done.
+        float dsum = 0.0, dcnt = 0.0;
+        for (uint i = tid; i < texels; i += 64u) {
+            s_cdf[i] = 0.0;
+            uint key = s_vis[i];
+            if (key == MBG_EMPTY || u_importance == 0u) continue;
+            MbgTri ht = tris[mbg_key_tri(key)];
+            vec3 hdir = mbg_to_world(quad[i].xyz);
+            float hden = dot(ht.n.xyz, hdir);
+            if (abs(hden) <= 1e-12) continue;
+            vec3 hp = g_P + hdir * (dot(ht.n.xyz, ht.p0.xyz - g_P) / hden);
+            vec3 hn = hden < 0.0 ? ht.n.xyz : -ht.n.xyz;
+            vec3 d = mbg_sun_unshadowed(hn);
+            for (uint em = 0u; em < u_emitters; ++em)
+                d += mbg_emitter_unshadowed(hp, hn, tris[emitters[em]],
+                                            u_two_sided != 0u, 2.0 * u_bias, u_emissive);
+            s_cdf[i] = dot(d, vec3(1.0 / 3.0));
+            dsum += s_cdf[i];
+            dcnt += 1.0;
+        }
+        s_red2[tid] = vec4(dsum, dcnt, 0.0, 0.0);
+        barrier();
+        for (uint r = 32u; r > 0u; r >>= 1u) {
+            if (tid < r) s_red2[tid] += s_red2[tid + r];
+            barrier();
+        }
+        // The mean is a FLOOR under the importance function, not a scale on it:
+        // a texel the lights do not reach still carries multi-bounce and sky
+        // energy, and a distribution that gave it probability zero would be a
+        // biased estimator, not a clever one. Adding the mean keeps every
+        // covered texel reachable while still favouring the lit ones by
+        // roughly their own contrast. With no analytic lights at all the mean
+        // is zero and the fallback is plain cosine-albedo sampling.
+        // u_importance == 0 leaves every texel's direct term at zero, so the
+        // fallback below takes over and the distribution is cos * dOmega *
+        // albedo alone -- the BRDF-and-geometry part with the radiance guess
+        // removed. That is the ablation implementation.md finding 20 measures
+        // against, and it is the distribution a path tracer without a light
+        // estimate would use.
+        float dbar = s_red2[0].y > 0.0 ? s_red2[0].x / s_red2[0].y : 0.0;
+        if (!(dbar > 0.0)) dbar = 1.0;
+        barrier();
+
+        for (uint i = tid; i < texels; i += 64u) {
+            uint key = s_vis[i];
+            float f = 0.0;
+            if (key != MBG_EMPTY) {
+                vec3 alb = tris[mbg_key_tri(key)].albedo.xyz;
+                f = quad[i].w * dot(alb, vec3(1.0 / 3.0)) * (s_cdf[i] + dbar);
+            }
+            s_cdf[i] = f;
+        }
+        barrier();
+
+        // 2. The CDF, and one stratified sample per path.
+        float total = mbg_scan_cdf(tid, texels);
+        float xi = mbg_rand(c.pos.xyz, 0x517CC1B7u + u_level);
+
+        for (uint b = tid; b < u_children; b += 64u) {
+            uint slot = cam * u_children + b;
+            vec3 m_ind = vec3(0.0), m_emit = vec3(0.0), m_sun = vec3(0.0);
+            vec3 hit = vec3(0.0), hn = vec3(0.0);
+            float alive = 0.0, thr = 0.0;
+
+            // total <= 0 means nothing reflective is visible -- an aperture
+            // filling the hemisphere. There is no continuation to make.
+            if (total > 0.0) {
+                float u = (float(b) + xi) / float(u_children) * total;
+                uint i = mbg_sample_cdf(u, texels);
+                float f = s_cdf[i] - (i > 0u ? s_cdf[i - 1u] : 0.0);
+                uint key = s_vis[i];
+                if (f > 0.0 && key != MBG_EMPTY) {
+                    MbgTri ht = tris[mbg_key_tri(key)];
+                    vec3 hdir = mbg_to_world(quad[i].xyz);
+                    float hden = dot(ht.n.xyz, hdir);
+                    if (abs(hden) > 1e-12) {
+                        hit = g_P + hdir * (dot(ht.n.xyz, ht.p0.xyz - g_P) / hden);
+                        // Face the child's hemisphere back toward this camera,
+                        // exactly as the tile estimator does.
+                        hn = hden < 0.0 ? ht.n.xyz : -ht.n.xyz;
+                        alive = 1.0;
+
+                        // The Monte Carlo weight. quad[i].w is cos * dOmega for
+                        // this texel and f/total is the probability it was drawn
+                        // with, so albedo * w / (N * p) is an unbiased estimate
+                        // of the whole reflected integral from one direction.
+                        // At u_children == 1 and a perfectly cosine-proportional
+                        // f this reduces to the albedo alone, which is the
+                        // throughput a path tracer carries.
+                        float mc = quad[i].w * total / (float(u_children) * f);
+                        m_ind = ht.albedo.xyz * mc;
+
+                        vec3 d_sun = mbg_sun_unshadowed(hn);
+                        vec3 d_emit = vec3(0.0);
+                        for (uint em = 0u; em < u_emitters; ++em)
+                            d_emit += mbg_emitter_unshadowed(hit, hn, tris[emitters[em]],
+                                                             u_two_sided != 0u,
+                                                             2.0 * u_bias, u_emissive);
+                        m_emit = m_ind * d_emit;
+                        m_sun  = m_ind * d_sun;
+
+                        // RUSSIAN ROULETTE.
+                        //
+                        // c.nrm.w is this camera's own throughput, 1 at the
+                        // primary hit; the child's is the parent's times the
+                        // factor the gather will apply to its irradiance, which
+                        // is m_ind / PI.
+                        //
+                        // TIMES u_children, AND THAT FACTOR IS NOT A FUDGE. The
+                        // mass already carries the 1/N of the split, because N
+                        // paths share one integral -- but the split is
+                        // STRATIFICATION, not attenuation. A path that is one of
+                        // 64 does not carry a 64th of the light; it carries an
+                        // unbiased estimate of all of it, and the 64th is the
+                        // averaging that happens when its siblings are summed.
+                        // Leaving the 1/N in made every path's throughput read
+                        // albedo/64, which is below any sane threshold, so the
+                        // roulette fired on every path at the first bounce and
+                        // the estimate survived only because the 1/q division is
+                        // correct. The `paths` gate's "roulette dormant above
+                        // threshold" assertion is there to catch exactly this:
+                        // at a depth where roulette must do nothing, it has to
+                        // reproduce the unrouletted answer BIT FOR BIT.
+                        //
+                        // With that factor the product down a path is the
+                        // running product of what each bounce reflects, so the
+                        // test below is "has this path's remaining contribution
+                        // fallen below the point where it is worth another
+                        // bounce" -- the intuition that a deep bounce does not
+                        // matter, made into something that terminates paths
+                        // WITHOUT biasing the answer.
+                        //
+                        // Survivors are divided by their survival probability,
+                        // so the estimator's expectation is unchanged; what
+                        // changes is the expected path length, which becomes
+                        // finite and scene-dependent instead of fixed at the
+                        // bounce count. Below the threshold q falls with the
+                        // throughput, so a dark path dies quickly and a bright
+                        // one runs long, which is the whole trade.
+                        thr = c.nrm.w * dot(m_ind, vec3(1.0 / 3.0)) *
+                              float(u_children) * 0.31830988618379;
+                        if (u_rr > 0.0 && thr < u_rr) {
+                            float q = clamp(thr / u_rr, 0.05, 1.0);
+                            if (mbg_rand(hit, 0xB5297A4Du + u_level * 977u + b) >= q) {
+                                alive = 0.0;
+                                m_ind = vec3(0.0); m_emit = vec3(0.0); m_sun = vec3(0.0);
+                            } else {
+                                float inv = 1.0 / q;
+                                m_ind *= inv; m_emit *= inv; m_sun *= inv;
+                                thr *= inv;
+                            }
+                        }
+                    }
+                }
+            }
+
+            child_w[slot * 3u + 0u] = vec4(m_ind, alive);
+            child_w[slot * 3u + 1u] = vec4(m_emit, 0.0);
+            child_w[slot * 3u + 2u] = vec4(m_sun, 0.0);
+            child_cam[slot].pos = vec4(hit, alive);
+            // The throughput rides in nrm.w so the next level can roll its own
+            // roulette without a buffer of its own.
+            child_cam[slot].nrm = vec4(hn, alive != 0.0 ? thr : 0.0);
+        }
+        return;
+    }
+
+    // --- Spawn the next level, B: branching tiles ----------------------------
     //
     // One child camera per u_block x u_block tile of this camera's target, placed
     // at the tile's most central covered texel and carrying that whole tile's
@@ -458,6 +680,6 @@ void main() {
         child_w[slot * 3u + 1u] = vec4(alive != 0.0 ? wdir : vec3(0.0), 0.0);
         child_w[slot * 3u + 2u] = vec4(alive != 0.0 ? wsun : vec3(0.0), 0.0);
         child_cam[slot].pos = vec4(hit, alive);
-        child_cam[slot].nrm = vec4(hn, 0.0);
+        child_cam[slot].nrm = vec4(hn, alive);
     }
 }

@@ -64,10 +64,26 @@ bool Solver::poll() {
     return changed;
 }
 
+// Children this level's cameras spawn.
+//
+// The whole difference between the two estimators lives in this function. Tile
+// mode branches: every camera spawns one child per tile of its own target, so
+// the count multiplies at each level and the tree is K^D. Path mode splits ONCE
+// -- level 0 is the primary hit -- and every level below it continues each path
+// with exactly one child, so the tree is a bundle of `paths` straight lines and
+// its size is paths x D.
+static uint32_t level_children(const SolveConfig& cfg, uint32_t l) {
+    if (l + 1 >= cfg.bounces) return 0;                       // terminal
+    if (cfg.paths) return l == 0 ? std::max(1u, cfg.paths) : 1u;
+    const uint32_t bpr = cfg.res[l] / cfg.block[l];
+    return bpr * bpr;
+}
+
 void Solver::configure(const SolveConfig& cfg_in, int fb_w, int fb_h) {
     SolveConfig cfg = cfg_in;
     cfg.bounces = std::clamp(cfg.bounces, 1u, kMaxLevels);
     cfg.scale   = std::clamp(cfg.scale, 1u, 64u);
+    cfg.paths   = cfg.paths ? std::clamp(cfg.paths, 1u, 256u) : 0u;
     for (uint32_t l = 0; l < cfg.bounces; ++l) {
         cfg.res[l]   = std::clamp(cfg.res[l], 2u, 32u);
         cfg.block[l] = snap_block(cfg.res[l], cfg.block[l]);
@@ -91,8 +107,7 @@ void Solver::configure(const SolveConfig& cfg_in, int fb_w, int fb_h) {
         std::size_t total = 0;
         uint32_t k = n;
         for (uint32_t l = 0; l < levels_; ++l) {
-            const uint32_t block = (l + 1 == levels_) ? 0u : cfg.block[l];
-            const uint32_t children = block ? (cfg.res[l] / block) * (cfg.res[l] / block) : 0u;
+            const uint32_t children = level_children(cfg, l);
             total += std::size_t(k) * (kCamBytes + kIrradBytes + kDirectBytes +
                                        (l ? kWeightBytes : 0));
             if (!children) break;
@@ -113,7 +128,7 @@ void Solver::configure(const SolveConfig& cfg_in, int fb_w, int fb_h) {
         LevelInfo& li = info_[l];
         li.res = cfg.res[l];
         li.block = (l + 1 == levels_) ? 0u : cfg.block[l];
-        li.children = li.block ? (li.res / li.block) * (li.res / li.block) : 0u;
+        li.children = level_children(cfg, l);
         li.cameras = count;
         li.bytes = std::size_t(count) * (kCamBytes + kIrradBytes + kDirectBytes +
                                         (l ? kWeightBytes : 0));
@@ -237,6 +252,13 @@ void Solver::raster_level(uint32_t l, uint32_t count, const Scene& scene,
     raster_.set("u_tri_count", scene.count());
     raster_.set("u_res", li.res);
     raster_.set("u_block", li.block);
+    raster_.set("u_children", li.children);
+    raster_.set("u_paths", cfg.paths ? 1u : 0u);
+    raster_.set("u_level", l);
+    // Roulette is a property of the path estimator; the tile estimator has no
+    // single path to terminate, only a tile's worth of them at once.
+    raster_.set("u_rr", cfg.paths ? std::max(0.0f, cfg.rr) : 0.0f);
+    raster_.set("u_importance", cfg.importance ? 1u : 0u);
     raster_.set("u_bias", cfg.bias);
     raster_.set("u_inv_far", 1.0f / far);
     cfg.sky.bind(raster_);
@@ -305,7 +327,7 @@ void Solver::upload_points(const std::vector<glm::vec4>& pos,
     std::vector<glm::vec4> packed(pos.size() * 2);
     for (std::size_t i = 0; i < pos.size(); ++i) {
         packed[i * 2 + 0] = glm::vec4(glm::vec3(pos[i]), 1.0f);
-        packed[i * 2 + 1] = glm::vec4(glm::vec3(nrm[i]), 0.0f);
+        packed[i * 2 + 1] = glm::vec4(glm::vec3(nrm[i]), 1.0f);   // throughput
     }
     cams_[0].data(packed.data(), packed.size() * sizeof(glm::vec4));
 }

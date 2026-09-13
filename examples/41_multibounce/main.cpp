@@ -20,8 +20,14 @@
 //     camera, visibility resolved by atomicMin in shared memory (5.3)
 //   - the full-resolution mesh: every camera loops every triangle, no culling,
 //     no LOD, no cluster DAG, no work list (5.2, 5.4 are what this measures)
-//   - recursion to MBG_BOUNCES levels with the resolution ladder and tile
-//     clustering of 6.2, terminating in direct lighting only (6.1)
+//   - recursion to MBG_BOUNCES levels, terminating in direct lighting only (6.1),
+//     with TWO estimators for it: the doc's branching tree (a child per tile of
+//     every camera, the resolution ladder and tile clustering of 6.2, K^D
+//     cameras) and a single-sample path continuation (split once at the primary
+//     hit, branch factor 1 below it, importance-sampled and Russian-rouletted,
+//     paths x D cameras). The second is the default and the first is one env var
+//     away, because the first is what section 6.2 describes and the second is
+//     what makes depth affordable -- see implementation.md, finding 20
 //   - the direct term as a separate pass (3): exact polygon irradiance, with
 //     visibility taken off the rasterized depth sort -- per camera for the
 //     bounce transport, and a hemisphere per PIXEL for the image, which is the
@@ -53,9 +59,16 @@
 //   MBG_SUN=f|r,g,b         irradiance on a surface facing the sun
 //   MBG_SUN_DIR=x,y,z       toward the sun
 //   MBG_SUN_ANGLE=deg       the sun's angular RADIUS; larger is a softer shadow
-//   MBG_GATE=all            run the analytic gates and exit
+//   MBG_GATE=all            run the analytic gates and exit (quad closed rect occ
+//                           oracle texeldir series paths)
 //   MBG_MODEL=path.glb      CornellBoxOriginal.glb; the references only match it
-//   MBG_BOUNCES=3           camera levels; 1 == direct only
+//   MBG_BOUNCES=3           camera levels; 1 == direct only (up to 8)
+//   MBG_PATHS=64            single-sample continuation: split this many ways at
+//                           the primary hit, branch factor 1 below it, so cost
+//                           is paths x bounces. 0 = the branching tile estimator
+//   MBG_RR=0.15             Russian-roulette threshold on path throughput; 0 off
+//   MBG_IMPORTANCE=1        weight the continuation by the hit's radiance, not
+//                           by cos * solid angle * albedo alone
 //   MBG_NEE=1               analytic direct term (doc section 3's separate pass)
 //   MBG_TENT=1              spread each texel's mass over the 4 nearest tiles
 //   MBG_DIRECT_PIXEL=1      rasterize a hemisphere per pixel for the image's
@@ -166,6 +179,9 @@ EnvOpts read_env() {
     if (const char* v = getenv("MBG_GATE"))     o.gate = v;
     if (const char* v = getenv("MBG_MODEL"))    o.model = v;
     if (const char* v = getenv("MBG_BOUNCES"))  u32(v, o.cfg.bounces);
+    if (const char* v = getenv("MBG_PATHS"))    u32(v, o.cfg.paths);
+    if (const char* v = getenv("MBG_RR"))       o.cfg.rr = float(atof(v));
+    if (const char* v = getenv("MBG_IMPORTANCE")) o.cfg.importance = atoi(v) != 0;
     if (const char* v = getenv("MBG_SCALE"))    u32(v, o.cfg.scale);
     if (const char* v = getenv("MBG_BUDGET"))   u32(v, o.cfg.budget);
     if (const char* v = getenv("MBG_RES"))      u32(v, o.cfg.res[0]);
@@ -607,6 +623,24 @@ int main() {
 
             if (ImGui::CollapsingHeader("Solve", ImGuiTreeNodeFlags_DefaultOpen)) {
                 int b = int(cfg.bounces);
+                {
+                    // The estimator choice, above everything it governs: it
+                    // decides what the sliders below even mean.
+                    int pa = int(cfg.paths);
+                    bool path_mode = pa != 0;
+                    if (ImGui::Checkbox("Single-sample continuation", &path_mode))
+                        cfg.paths = path_mode ? 64u : 0u;
+                    if (cfg.paths) {
+                        pa = int(cfg.paths);
+                        if (ImGui::SliderInt("Paths (split at primary hit)", &pa, 1, 256))
+                            cfg.paths = uint32_t(pa);
+                        ImGui::SliderFloat("Roulette threshold", &cfg.rr, 0.0f, 1.0f);
+                        ImGui::Checkbox("Radiance-weighted continuation", &cfg.importance);
+                        ImGui::TextUnformatted("branch factor 1: cost is paths x bounces");
+                    } else {
+                        ImGui::TextUnformatted("branching tiles: cost is K^bounces");
+                    }
+                }
                 if (ImGui::SliderInt("Bounces (camera levels)", &b, 1, int(kMaxLevels)))
                     cfg.bounces = uint32_t(b);
                 int sc = int(cfg.scale);
@@ -620,7 +654,7 @@ int main() {
                     snprintf(lbl, sizeof lbl, "L%u target", l + 1);
                     int r = int(cfg.res[l]);
                     if (ImGui::SliderInt(lbl, &r, 2, 32)) cfg.res[l] = uint32_t(r);
-                    if (l + 1 < cfg.bounces) {
+                    if (l + 1 < cfg.bounces && cfg.paths == 0u) {
                         snprintf(lbl, sizeof lbl, "L%u spawn tile", l + 1);
                         int k = int(cfg.block[l]);
                         if (ImGui::SliderInt(lbl, &k, 1, 16)) cfg.block[l] = uint32_t(k);

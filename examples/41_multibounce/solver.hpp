@@ -39,10 +39,13 @@
 
 namespace mbg {
 
-// 4 is arbitrary but not accidental: the doc's variant A terminates at bounce 3,
-// and one more level exists so that "does the 4th bounce change anything" is a
-// question this example can answer rather than assume.
-constexpr uint32_t kMaxLevels = 4;
+// 8, since the path estimator made depth affordable. The branching recursion
+// could not use more than about four -- 4^4 children per primary hit is 256
+// cameras at the deepest level for each one at the top -- so the cap used to be
+// "one past what the doc terminates at, to check that the 4th bounce changes
+// nothing". With branch factor 1 the cost is paths x depth, so the question
+// "what does bounce 7 contribute" is one this example can now answer by asking.
+constexpr uint32_t kMaxLevels = 8;
 
 struct SolveConfig {
     uint32_t bounces = 3;          // camera levels; 1 == direct only
@@ -59,7 +62,7 @@ struct SolveConfig {
     // problem: once each receiver's frame is rotated and the grid is denoised,
     // 16x16, 32x32 and 64x64 produce the same image to within 0.0001 RMSE.
     // See implementation.md, finding 14.
-    std::array<uint32_t, kMaxLevels> res{{16, 8, 8, 8}};
+    std::array<uint32_t, kMaxLevels> res{{16, 8, 8, 8, 8, 8, 8, 8}};
     // Tile edge for spawning the next level, in texels of THIS level's target.
     // 1 spawns per texel (the unabridged recursion); the terminal level ignores
     // it. res/block must be an integer, and configure() snaps it down until it
@@ -78,7 +81,43 @@ struct SolveConfig {
     // 4 at a 16-wide target is 16 children, which is where finding 4's
     // measurement put it -- that finding is about how many children there are,
     // not how many texels each covers.
-    std::array<uint32_t, kMaxLevels> block{{4, 4, 4, 4}};
+    std::array<uint32_t, kMaxLevels> block{{4, 4, 4, 4, 4, 4, 4, 4}};
+
+    // --- The estimator -------------------------------------------------------
+    //
+    // SINGLE-SAMPLE CONTINUATION. Split once at the primary hit into `paths`
+    // directions, then let each path pick exactly ONE continuation per bounce.
+    // Branch factor 1, so a depth-D solve costs paths x D cameras instead of
+    // the branching recursion's K^D -- and every knob below that shrinks K only
+    // shrinks the base of that exponent, which is why this is the setting that
+    // actually makes depth affordable.
+    //
+    // 0 selects the branching tile estimator instead: K = (res/block)^2 children
+    // per camera, each carrying a whole tile of directions scaled by one
+    // representative's visibility. That one is deterministic, which is why every
+    // gate runs on it, and it is the doc's variant A as written.
+    //
+    // 64 at the default. The split is where the variance of the whole solve is
+    // decided -- below it each path is a single sample and nothing averages it
+    // but its 63 siblings.
+    uint32_t  paths = 64;
+    // Russian roulette threshold on the path throughput (the running product of
+    // what each bounce reflects, near enough). Below it a path survives with
+    // probability throughput/threshold and is divided by that probability, so
+    // the estimate stays unbiased and the expected path length becomes finite
+    // and scene-dependent rather than pinned to `bounces`. 0 disables it.
+    //
+    // 0.15 never fires within three bounces off Cornell's walls (0.73^3 = 0.39),
+    // which is deliberate: the default configuration is still exactly the solve
+    // it was, and roulette only starts deciding things at the depths that were
+    // previously unreachable.
+    float     rr = 0.15f;
+    // Draw the continuation direction from the micro-buffer's own radiance --
+    // cos * dOmega * albedo * (unshadowed direct irradiance at the hit) --
+    // rather than from cos * dOmega * albedo alone. The extra factor is the only
+    // guess in it, and it costs nothing: the direct irradiance at every texel's
+    // hit point is already evaluated for the mass. 0 ablates it.
+    bool      importance = true;
 
     // The direct term. `nee` routes every emissive triangle through the analytic
     // estimator in raster.comp instead of letting the quadrature find it, which
@@ -143,7 +182,8 @@ struct SolveConfig {
 
     // Only the fields that change buffer sizes.
     bool layout_equals(const SolveConfig& o) const {
-        if (bounces != o.bounces || scale != o.scale || budget != o.budget) return false;
+        if (bounces != o.bounces || scale != o.scale || budget != o.budget ||
+            paths != o.paths) return false;
         for (uint32_t i = 0; i < bounces; ++i)
             if (res[i] != o.res[i] || block[i] != o.block[i]) return false;
         return true;
@@ -270,7 +310,9 @@ private:
     PassTimer t_place_{"Place"};
     std::array<PassTimer, kMaxLevels> t_raster_{
         PassTimer{"Raster L1"}, PassTimer{"Raster L2"},
-        PassTimer{"Raster L3"}, PassTimer{"Raster L4"}};
+        PassTimer{"Raster L3"}, PassTimer{"Raster L4"},
+        PassTimer{"Raster L5"}, PassTimer{"Raster L6"},
+        PassTimer{"Raster L7"}, PassTimer{"Raster L8"}};
     PassTimer t_gather_{"Resolve"};
     PassTimer t_upsample_{"Upsample"};
     PassTimer t_direct_{"Direct/px"};

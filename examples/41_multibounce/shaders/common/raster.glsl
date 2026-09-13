@@ -32,6 +32,15 @@ shared uint s_vis[MBG_MAX_TEXELS];
 shared vec4 s_red[64];
 shared vec4 s_red2[64];
 
+// The continuation distribution, for the single-sample path estimator: one
+// weight per texel, turned into an inclusive CDF in place. Only raster.comp's
+// spawn uses it, and only after the light views are finished, so it could alias
+// s_lv -- but 4 KB of shared memory is cheaper than the class of bug that comes
+// from two buffers sharing storage across a barrier, and the budget here is
+// about 18 KB against a 32 KB floor.
+shared float s_cdf[MBG_MAX_TEXELS];
+shared float s_blk[64];
+
 vec3 g_P, g_T, g_B, g_N;      // the camera, set once per workgroup
 
 vec3 mbg_to_local(vec3 w) { return vec3(dot(w, g_T), dot(w, g_B), dot(w, g_N)); }
@@ -211,14 +220,70 @@ uint mbg_hash(uint x) {
 // The hash is over the receiver's POSITION rather than its index, so the
 // rotation does not change when the chunk scheduler assigns a camera to a
 // different slot; a sweep is reproducible bit for bit either way.
-// The rotation angle for a receiver at `pos`. `salt` separates independent
-// sampling grids belonging to the same receiver -- the hemisphere and the sun's
-// cone -- so that decorrelating one does not lock it to the other.
-float mbg_jitter_angle(vec3 pos, uint salt) {
-    uint seed = mbg_hash(salt ^ floatBitsToUint(pos.x) ^
+// A uniform in [0,1) for a receiver at `pos`, on an independent stream.
+//
+// EVERY random number in this renderer comes from here, and every one of them is
+// a hash of a POSITION rather than of a camera index or a frame counter. That is
+// what keeps a sweep reproducible bit for bit: the chunk scheduler is free to
+// assign a camera to a different slot, and a receiver at the same point still
+// draws the same numbers. `stream` separates the decisions made at one point --
+// the hemisphere's rotation, the sun cone's, which direction a path continues
+// through, whether it survives roulette -- so that decorrelating one does not
+// lock it to another.
+float mbg_rand(vec3 pos, uint stream) {
+    uint seed = mbg_hash(stream ^ floatBitsToUint(pos.x) ^
                 mbg_hash(floatBitsToUint(pos.y) ^
                 mbg_hash(floatBitsToUint(pos.z))));
-    return float(seed) * (1.0 / 4294967296.0) * 6.28318530717959;
+    return float(seed) * (1.0 / 4294967296.0);
+}
+
+float mbg_jitter_angle(vec3 pos, uint salt) {
+    return mbg_rand(pos, salt) * 6.28318530717959;
+}
+
+// --- The continuation distribution ------------------------------------------
+//
+// s_cdf holds a non-negative weight per texel on entry and its INCLUSIVE prefix
+// sum on exit; the return value is the total, identical in every invocation.
+//
+// Blocked scan rather than a serial one on thread 0: 64 contiguous runs scanned
+// in parallel, a Hillis-Steele scan of the 64 run totals, then one add per
+// entry. At 256 texels that is 4 serial adds plus 6 barriers instead of 256
+// dependent adds with 63 lanes idle.
+float mbg_scan_cdf(uint tid, uint n) {
+    uint per = (n + 63u) / 64u;
+    uint lo = min(tid * per, n);
+    uint hi = min(lo + per, n);
+
+    float run = 0.0;
+    for (uint i = lo; i < hi; ++i) { run += s_cdf[i]; s_cdf[i] = run; }
+    s_blk[tid] = run;
+    barrier();
+
+    for (uint d = 1u; d < 64u; d <<= 1u) {
+        float v = tid >= d ? s_blk[tid - d] : 0.0;
+        barrier();
+        s_blk[tid] += v;
+        barrier();
+    }
+    // s_blk[tid] is the inclusive scan of the run totals, so subtracting this
+    // run's own total leaves the offset the run starts at.
+    float off = s_blk[tid] - run;
+    for (uint i = lo; i < hi; ++i) s_cdf[i] += off;
+    float total = s_blk[63];
+    barrier();
+    return total;
+}
+
+// The first index whose inclusive CDF reaches `u`. No barriers: the search is
+// per invocation and reads only.
+uint mbg_sample_cdf(float u, uint n) {
+    uint lo = 0u, hi = n - 1u;
+    while (lo < hi) {
+        uint mid = (lo + hi) >> 1u;
+        if (s_cdf[mid] < u) lo = mid + 1u; else hi = mid;
+    }
+    return lo;
 }
 
 void mbg_set_receiver(vec3 pos, vec3 nrm, float bias, bool jitter) {
@@ -227,7 +292,7 @@ void mbg_set_receiver(vec3 pos, vec3 nrm, float bias, bool jitter) {
     g_P = pos + g_N * bias;
 
     if (jitter) {
-        float a = mbg_jitter_angle(pos, 0u);
+        float a = mbg_jitter_angle(pos, 0x27D4EB2Du);
         float c = cos(a), sn = sin(a);
         vec3 t2 = g_T * c + g_B * sn;
         g_B = g_B * c - g_T * sn;

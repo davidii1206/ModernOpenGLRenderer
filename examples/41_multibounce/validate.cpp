@@ -197,6 +197,12 @@ bool run_gates(const std::string& names, Solver& solver, const SolveConfig& base
     // rather than in each gate -- MBG_SKY=0.05 MBG_GATE=all used to be a way to
     // fail a correct renderer.
     base.sky = SkyLight{};
+    // And on the DETERMINISTIC estimator. Every assertion below predicts an
+    // exact number from the geometry, which a stochastic estimator only matches
+    // in expectation -- so the branching tile recursion is what the 31 gates
+    // measure, and the path estimator is measured against it (the `paths` gate
+    // at the end, which is the one that may legitimately be noisy).
+    base.paths = 0;
 
     // --- 1. The quadrature table --------------------------------------------
     //
@@ -604,6 +610,91 @@ bool run_gates(const std::string& names, Solver& solver, const SolveConfig& base
         // And the limit the series is converging to, for scale.
         printf("[GATE] 6 series  infinite-bounce value would be %.6f\n",
                kPi * L / (1.0 - p));
+    }
+
+    // --- 8. The path estimator is unbiased, and so is the roulette -----------
+    //
+    // The same closed enclosure, and the same exact answer per bounce count --
+    // but measured with the SINGLE-SAMPLE CONTINUATION estimator, which the 31
+    // gates above deliberately do not exercise because they all assert exact
+    // numbers and this one is stochastic.
+    //
+    // Stochastic is not the same as approximate, and that is the whole point of
+    // the gate. An importance-sampled continuation divided by its own pdf, and a
+    // roulette that divides survivors by their survival probability, are both
+    // exactly unbiased: the expectation is the analytic series, and the only
+    // thing the sample count buys is how tightly one run lands on it. So the
+    // tolerance here is a STANDARD ERROR argument rather than a bound on
+    // systematic error -- 1.5% over 512 receivers x 64 paths -- and a bug in
+    // either weight shows up as a bias that no amount of averaging removes.
+    //
+    // Roulette is then asserted twice over: once at a depth where it cannot
+    // fire, where it must change nothing at all, and once past it, where it must
+    // still land on the same number while visibly terminating paths.
+    if (wants(names, "paths")) {
+        const double L = 0.25, p = 0.5;
+        Scene s;
+        s.build(make_box(1.0f, glm::vec3(float(p)), glm::vec3(float(L))));
+        SolveConfig cfg = base;
+        cfg.bias = 1e-4f;
+        cfg.sky = SkyLight{};
+        cfg.paths = 64;
+        for (uint32_t i = 0; i < kMaxLevels; ++i) { cfg.res[i] = 16; cfg.block[i] = 4; }
+
+        // Receivers spread over the floor and one wall, because the random
+        // streams are hashed from POSITION: 512 distinct points are 512
+        // independent draws, where 512 copies of one point would be one draw
+        // repeated and would measure nothing.
+        std::vector<glm::vec4> pos, nrm;
+        for (int i = 0; i < 16; ++i)
+            for (int j = 0; j < 16; ++j) {
+                const float u = (float(i) + 0.5f) / 16.0f * 1.6f - 0.8f;
+                const float v = (float(j) + 0.5f) / 16.0f * 1.6f - 0.8f;
+                pos.push_back(glm::vec4(u, -1.0f, v, 1.0f));
+                nrm.push_back(glm::vec4(0.0f, 1.0f, 0.0f, 0.0f));
+                pos.push_back(glm::vec4(-1.0f, u, v, 1.0f));
+                nrm.push_back(glm::vec4(1.0f, 0.0f, 0.0f, 0.0f));
+            }
+
+        auto series = [&](uint32_t n) {
+            double e = 0.0, pk = 1.0;
+            for (uint32_t k = 0; k < n; ++k) { e += pk; pk *= p; }
+            return e * kPi * L;
+        };
+
+        for (uint32_t n = 2; n <= 4; ++n) {
+            cfg.bounces = n;
+            cfg.rr = 0.0f;
+            const std::vector<glm::vec4> e = solver.solve_points(s, cfg, pos, nrm);
+            char lbl[64];
+            snprintf(lbl, sizeof lbl, "E after %u levels, %u paths", n, cfg.paths);
+            r.check(8, "paths", lbl, mean_channel(e, 0), series(n), 1.5e-2);
+        }
+
+        // Roulette, where it cannot fire. Throughput after k bounces is about
+        // p^k = 0.5^k, so at 3 levels the deepest path still carries 0.25 and a
+        // threshold of 0.15 never triggers: the two runs must agree EXACTLY,
+        // which also proves the roulette code path is not perturbing the stream
+        // of random numbers the continuation draws from.
+        cfg.bounces = 3;
+        cfg.rr = 0.0f;
+        const double no_rr = mean_channel(solver.solve_points(s, cfg, pos, nrm), 0);
+        cfg.rr = 0.15f;
+        const double dormant = mean_channel(solver.solve_points(s, cfg, pos, nrm), 0);
+        r.check(8, "paths", "roulette dormant above threshold", dormant, no_rr, 1e-9);
+
+        // And where it does fire: a threshold above the throughput at every
+        // depth kills most paths after the first bounce, and the answer must not
+        // move. This is the assertion that the 1/q division is there and right;
+        // without it the result comes back short by whatever fraction died.
+        cfg.bounces = 4;
+        cfg.rr = 0.0f;
+        const double full = mean_channel(solver.solve_points(s, cfg, pos, nrm), 0);
+        cfg.rr = 0.9f;
+        const double rolled = mean_channel(solver.solve_points(s, cfg, pos, nrm), 0);
+        r.check(8, "paths", "roulette unbiased below threshold", rolled, full, 2.5e-2);
+        printf("[GATE] 8 paths   roulette at 0.9: %.6f vs %.6f unrouletted "
+               "(analytic %.6f)\n", rolled, full, series(4));
     }
 
     printf("[GATE] %d passed, %d failed\n", r.passed, r.failed);

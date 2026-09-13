@@ -53,7 +53,10 @@ void main() {
             float d = texelFetch(u_depth, s, 0).r;
             vec2 uv = (vec2(s) + 0.5) / vec2(u_size);
             pos = vec4(world_from_depth(d, uv, u_inv_view_proj), 1.0);
-            nrm = vec4(normalize(n.xyz), 0.0);
+            // w is the path throughput, and a primary hit starts at 1: every
+            // path below it is a running product of what it reflects off.
+            // raster.comp's roulette reads it (see u_rr).
+            nrm = vec4(normalize(n.xyz), 1.0);
         }
     }
 
