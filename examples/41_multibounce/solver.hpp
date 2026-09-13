@@ -150,6 +150,10 @@ struct SolveConfig {
     // One traversal per workgroup with several texels per thread, instead of
     // one traversal per texel. See mbg_resolve_vis_coop.
     bool      coop = true;
+    // Visit the coarse groups nearest-first, so the per-texel distance bound
+    // tightens early instead of at whatever point the Morton order happens to
+    // cross the receiver's end of the scene. See mbg_order_groups.
+    bool      order = true;
 
     // The direct term. `nee` routes every emissive triangle through the analytic
     // estimator in raster.comp instead of letting the quadrature find it, which

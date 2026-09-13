@@ -1531,6 +1531,91 @@ The sweep row is like for like.)
 RMSE 0.0430 against the direct reference and 0.0400 against the full-GI one,
 both unchanged throughout. With the sun, a sweep is 1.10 s.
 
+### 24. Nearest-first is worth 1.33x, and the thread's texel assignment is worth nothing
+
+The cluster levels prune with a DISTANCE BOUND: a box whose closest point is
+farther than the nearest hit a texel has found is skipped in six operations
+instead of 64 triangles. That bound only tightens when the traversal finds
+something near, and the order underneath it was the Morton order of the scene --
+a property of the building, not of the receiver standing in it. A Z-curve crosses
+Sponza end to end several times, so the bound stayed loose through most of the
+walk and the early-out fired late.
+
+Sorting the coarse groups by distance and walking them nearest-first costs one
+rank sort per camera over a list that is 65 long. It is **not a hierarchy**: no
+level is added, nothing new is stored, no test changes. Only the order changes.
+
+| 256 cameras, 32x32 target, best of 3 interleaved | index order | nearest first | |
+|---|---|---|---|
+| Sponza, 262k triangles, 4098 clusters in 65 groups | 5109.3 ms | **3842.6 ms** | **1.33x** |
+| Cornell+bunny, 69k triangles, 1086 clusters in 17 groups | 646.3 ms | 650.8 ms | 0.99x |
+
+Seventeen groups is not enough to be worth sorting, which is the same shape as
+every other lever here: it pays where there is something to skip.
+
+#### The hypothesis that measured as nothing
+
+A thread carries four texels and `worst`, the loosest of their four bounds, gates
+both box tests -- so a thread prunes only as well as its worst texel. The four
+are handed out with a stride of 64, which means four directions from four rows of
+the hemisphere aimed at four unrelated parts of the scene, and any one of them
+looking at open sky never finds a hit and holds the bound at infinity. Giving the
+thread a 2x2 tile of adjacent texels instead should correlate the four bounds.
+
+It measured **0.95x on Sponza** -- a small loss -- and made the ordering slightly
+worse when both were on (1.27x against 1.31x). The reason is in the SIMT layer
+rather than the arithmetic: the box test's `continue` is per lane, so the inner
+loop still runs if any lane in the warp wants the box, and what governs the cost
+is the union over 32 lanes. Tightening one lane's bound does not shrink that
+union. The code is gone; the argument is kept here because it is a good argument
+that happens to be wrong, and the reason it is wrong is a property of the machine
+rather than of the algorithm.
+
+#### The measurement was harder than the optimisation
+
+Four separate wrong answers came out of this before the harness was fixed, and
+all of them were measurements of something other than the change:
+
+- **The first call in a process is ~40% slow.** Shader compile, buffer
+  allocation, clocks coming up. Every ratio taken against a cold first
+  measurement credits the warm-up to whichever variant ran second.
+- **Absolute throughput varies up to 74% between runs of the same binary.** The
+  same Sponza baseline measured 5109 ms and 8728 ms. In the throttled run the
+  real 1.33x showed up as 1.08x.
+- **A first-versus-last drift check does not catch it**, reporting +0.2% on that
+  throttled run.
+- **And samples are easy to over-read.** A run of five that went
+  slow/fast/slow/fast/slow was taken for position-dependent noise and used to
+  argue the effect away. The two fast ones were the two configurations with the
+  ordering on.
+
+What works is interleaving the configurations, keeping each one's minimum, and
+printing every sample. That is what gate 9 now does, and reps 1 and 2 of the
+Sponza run above agreed to 0.0 ms.
+
+#### A gate for the part the suite could not reach
+
+`oracle` is the assertion that matters for the rasterizer, but it ray casts on
+the CPU per texel per triangle, so it only runs on Cornell -- and Cornell is 32
+triangles in one cluster, below every threshold that turns the cluster levels and
+the cooperative traversal on. The last four commits all worked in code `oracle`
+cannot see.
+
+Gate 9 closes that: reordering the traversal is a pure reordering against a
+conservative bound, so the visibility buffer must come back bit-identical, which
+is a far stronger statement than an energy tolerance -- a bound that pruned one
+triangle too many is a single changed texel, and it would hide inside any
+average. It is GPU-only, so it runs on a scene of any size.
+
+It has to allow for one thing. `dist < bd` is strict, so among triangles at
+exactly the same distance the one found FIRST wins, and changing the visit order
+is precisely what this gate varies. Sponza carries coincident and duplicated
+polygons: **161 texels of 262144 change, and all 161 are ties** -- both winners
+at identical depth, worst relative difference exactly 0. So the gate intersects
+both candidates and counts a difference only when the depths actually differ.
+Without that it fails on Sponza and sends you hunting a bound bug that is not
+there.
+
 ## What this does not answer
 
 - **§8.1, the reuse radius experiment.** The gate the doc puts before everything

@@ -60,7 +60,7 @@
 //   MBG_SUN_DIR=x,y,z       toward the sun
 //   MBG_SUN_ANGLE=deg       the sun's angular RADIUS; larger is a softer shadow
 //   MBG_GATE=all            run the analytic gates and exit (quad closed rect occ
-//                           oracle texeldir series paths)
+//                           oracle texeldir series paths order)
 //   MBG_MODEL=path.glb      CornellBoxOriginal.glb; the references only match it
 //   MBG_BOUNCES=3           camera levels; 1 == direct only (capped at
 //                           kMaxLevels, currently 3)
@@ -70,6 +70,7 @@
 //   MBG_RR=0.15             Russian-roulette threshold on path throughput; 0 off
 //   MBG_IMPORTANCE=1        weight the continuation by the hit's radiance, not
 //                           by cos * solid angle * albedo alone
+//   MBG_ORDER=1             visit the coarse groups nearest-first
 //   MBG_NEE=1               analytic direct term (doc section 3's separate pass)
 //   MBG_TENT=1              spread each texel's mass over the 4 nearest tiles
 //   MBG_DIRECT_PIXEL=1      rasterize a hemisphere per pixel for the image's
@@ -191,6 +192,7 @@ EnvOpts read_env() {
     if (const char* v = getenv("MBG_RR"))       o.cfg.rr = float(atof(v));
     if (const char* v = getenv("MBG_IMPORTANCE")) o.cfg.importance = atoi(v) != 0;
     if (const char* v = getenv("MBG_CULL"))     o.cfg.cull = atoi(v) != 0;
+    if (const char* v = getenv("MBG_ORDER"))    o.cfg.order = atoi(v) != 0;
     if (const char* v = getenv("MBG_COOP"))     o.cfg.coop = atoi(v) != 0;
     if (const char* v = getenv("MBG_SCALE"))    u32(v, o.cfg.scale);
     if (const char* v = getenv("MBG_BUDGET"))   u32(v, o.cfg.budget);
@@ -521,9 +523,14 @@ int main() {
     PassTimer t_display("Display");
     PassTimer t_imgui("ImGui");
     PassTimer* const timers[] = {&t_frame, &t_gbuf, &t_display, &t_imgui};
+    // One per LEVEL, so this list is kMaxLevels long and not one longer: the cap
+    // came down from 4 to 3 when the recursion was limited to three bounces, and
+    // the stale fourth entry was an out-of-bounds std::array read that a release
+    // build happily returned garbage for.
+    static_assert(kMaxLevels == 3, "solver_timers lists one PassTimer per level");
     PassTimer* const solver_timers[] = {&solver.t_place(), &solver.t_raster(0),
                                         &solver.t_raster(1), &solver.t_raster(2),
-                                        &solver.t_raster(3), &solver.t_gather(),
+                                        &solver.t_gather(),
                                         &solver.t_upsample(), &solver.t_direct(),
                                         &solver.t_filter()};
 

@@ -22,6 +22,10 @@
 
 uniform uint  u_res;          // hemisphere target edge, texels
 
+// An ablation knob for the traversal ORDER, which is about how fast the
+// distance bound tightens rather than about what gets tested.
+uniform uint  u_order;        // 1 = visit groups nearest-first
+
 // The largest target any level may use. The default schedule needs 256, but the
 // buffer is sized for the cap so MBG_RES can be raised without a recompile --
 // and a level-3 camera with an 8x8 target reserves the same 4 KB either way,
@@ -101,6 +105,62 @@ void mbg_cull(uint tid, uint stride, uint cluster_count) {
 bool mbg_cl_live(uint c) {
     return s_cli_all != 0u || (s_climask[c >> 5u] & (1u << (c & 31u))) != 0u;
 }
+
+// --- Front to back ------------------------------------------------------------
+//
+// The distance bound is the only reason the two box levels are worth anything:
+// a box farther than the nearest hit so far costs six operations instead of 64
+// triangles. But the bound only tightens when the traversal FINDS something
+// near, and the order it walks in is the Morton order of the scene -- a property
+// of the building, not of the receiver standing in it. A Z-curve crosses from
+// one end of Sponza to the other and back several times, so the bound is still
+// loose most of the way through and the early-out fires late.
+//
+// Visiting the groups nearest-first costs one sort per camera over a list that
+// is 65 long on Sponza, and the bound is near its final value after the first
+// few. This is NOT a hierarchy: it adds no level, stores nothing new, and
+// changes no test. It changes the order in which the existing level is visited.
+#define MBG_MAX_GROUPS (MBG_CLUSTER_WORDS * 32 / 64)
+shared float s_gdist[MBG_MAX_GROUPS];
+shared uint  s_gord[MBG_MAX_GROUPS];
+shared uint  s_gsorted;                  // 0 = walk them in index order
+
+void mbg_order_groups(uint tid, uint stride, uint group_count) {
+    // Nothing to order; or more groups than the array holds, which is only
+    // reachable with culling off, where there is no bound to tighten anyway.
+    if (u_order == 0u || group_count <= 2u || group_count > MBG_MAX_GROUPS) {
+        if (tid == 0u) s_gsorted = 0u;
+        barrier();
+        return;
+    }
+    if (tid == 0u) s_gsorted = 1u;
+    for (uint g = tid; g < group_count; g += stride) {
+        // Closest point of the box to the receiver, componentwise; zero on any
+        // axis the receiver is already between lo and hi. Squared, because the
+        // comparisons below only need the order and the traversal squares its
+        // bound too.
+        vec3 q = max(max(groups[g].lo.xyz - g_P, vec3(0.0)),
+                     g_P - groups[g].hi.xyz);
+        s_gdist[g] = dot(q, q);
+    }
+    barrier();
+    // A rank sort: every group counts how many come before it and writes itself
+    // there. O(n^2) against a list of 65 is about a thousand comparisons spread
+    // over 64 threads -- cheaper than the 28 barrier-separated passes a bitonic
+    // sort of 128 would need, and it is stable, so the Morton order survives as
+    // the tie-break among the boxes the receiver is already inside, all of which
+    // score exactly zero.
+    for (uint g = tid; g < group_count; g += stride) {
+        float dg = s_gdist[g];
+        uint rank = 0u;
+        for (uint h = 0u; h < group_count; ++h)
+            if (s_gdist[h] < dg || (s_gdist[h] == dg && h < g)) ++rank;
+        s_gord[rank] = g;
+    }
+    barrier();
+}
+
+uint mbg_group_at(uint gi) { return s_gsorted != 0u ? s_gord[gi] : gi; }
 
 // --- The hemisphere, inverted ------------------------------------------------
 //
@@ -192,6 +252,19 @@ void mbg_resolve_vis_coop(uint tid, uint stride, uint group_count) {
     uint n = u_res * u_res;
     uint span = stride * MBG_TEXELS_PER_THREAD;
 
+    mbg_order_groups(tid, stride, group_count);
+
+    // A THREAD'S FOUR TEXELS ARE STRIDED, AND GIVING IT A 2x2 TILE INSTEAD DOES
+    // NOT HELP -- which is worth recording, because the argument for it is good.
+    // `worst` is the loosest of the four bounds and gates both box tests, so a
+    // thread prunes only as well as its worst texel; four strided texels look at
+    // four unrelated parts of the scene, and any one of them seeing open sky
+    // never finds a hit and holds the bound at infinity. Adjacent texels would
+    // agree far better. Measured on Sponza it is 0.95x -- a small LOSS. The
+    // reason is in the SIMT layer rather than the arithmetic: the box test's
+    // `continue` is per lane, the inner loop still runs if any lane in the warp
+    // wants it, so what governs is the union over 32 lanes and tightening one
+    // lane's bound does not shrink that union. See implementation.md finding 24.
     for (uint base = 0u; base < n; base += span) {
         vec3  d[MBG_TEXELS_PER_THREAD];
         float len[MBG_TEXELS_PER_THREAD];
@@ -210,7 +283,8 @@ void mbg_resolve_vis_coop(uint tid, uint stride, uint group_count) {
         }
         worst = 1e18;
 
-        for (uint g = 0u; g < group_count; ++g) {
+        for (uint gi = 0u; gi < group_count; ++gi) {
+            uint g = mbg_group_at(gi);
             vec3 gq = max(max(groups[g].lo.xyz - g_P, vec3(0.0)),
                           g_P - groups[g].hi.xyz);
             // The loosest bound any of this thread's texels holds: if the whole
@@ -274,6 +348,8 @@ void mbg_resolve_vis(uint tid, uint stride, uint group_count, uint tri_count) {
         return;
     }
 
+    mbg_order_groups(tid, stride, group_count);
+
     for (uint i = tid; i < n; i += stride) {
         vec3  d = mbg_to_world(mbg_px_to_dir(vec2(float(i % u_res), float(i / u_res))
                                              + vec2(0.5), u_res));
@@ -288,7 +364,8 @@ void mbg_resolve_vis(uint tid, uint stride, uint group_count, uint tri_count) {
         // and so rediscovers the same scene; testing 65 group boxes before 4098
         // cluster boxes turns that from O(n) into O(sqrt n), and the distance
         // bound prunes at both levels.
-        for (uint g = 0u; g < group_count; ++g) {
+        for (uint gi = 0u; gi < group_count; ++gi) {
+            uint g = mbg_group_at(gi);
             vec3 gq = max(max(groups[g].lo.xyz - g_P, vec3(0.0)),
                           g_P - groups[g].hi.xyz);
             if (dot(gq, gq) > bestdist * bestdist) continue;

@@ -2,6 +2,7 @@
 
 #include <gllib/log.hpp>
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -695,6 +696,162 @@ bool run_gates(const std::string& names, Solver& solver, const SolveConfig& base
         r.check(8, "paths", "roulette unbiased below threshold", rolled, full, 2.5e-2);
         printf("[GATE] 8 paths   roulette at 0.9: %.6f vs %.6f unrouletted "
                "(analytic %.6f)\n", rolled, full, series(kMaxLevels));
+    }
+
+    // --- 9. Reordering the traversal cannot change what it finds -------------
+    //
+    // The oracle above is the assertion that matters for the rasterizer, but it
+    // cannot reach the code this one is about: it runs a CPU ray cast per texel
+    // per triangle, so it is only affordable on Cornell -- and Cornell is 32
+    // triangles, one cluster, which is below the threshold where the cooperative
+    // traversal and the cluster levels switch on at all. Everything
+    // mbg_order_groups and the 2x2 texel mapping do is invisible to it.
+    //
+    // Both of those are PURE REORDERINGS. Visiting the coarse groups
+    // nearest-first changes which box is tested when; handing a thread a tile
+    // instead of a stride changes which thread owns which texel. Neither changes
+    // what any texel is compared against, and the distance bound they exist to
+    // tighten is conservative, so it can only skip boxes that could not have
+    // won. The visibility buffer must therefore come back BIT-IDENTICAL, and
+    // that is a far stronger statement than an energy tolerance: a bound that
+    // pruned one triangle too many shows up as a single changed texel here and
+    // would hide inside any average.
+    //
+    // GPU-only, so it costs one extra solve per variant and runs on a scene of
+    // any size -- which is the point, since it is only meaningful on one big
+    // enough to turn the coop path on.
+    if (wants(names, "order")) {
+        SolveConfig cfg = base;
+        cfg.bounces = 1;
+        cfg.res[0] = 32;
+
+        std::mt19937 rng(1234u);
+        std::uniform_real_distribution<float> u01(0.0f, 1.0f);
+        std::vector<glm::vec4> pos, nrm;
+        const uint32_t kCams = 256;
+        for (uint32_t i = 0; i < kCams; ++i) {
+            const Tri& t = tris[rng() % tris.size()];
+            float a = u01(rng), b = u01(rng);
+            if (a + b > 1.0f) { a = 1.0f - a; b = 1.0f - b; }
+            pos.push_back(glm::vec4(t.p[0] + a * (t.p[1] - t.p[0]) + b * (t.p[2] - t.p[0]), 1.0f));
+            nrm.push_back(glm::vec4(t.n, 0.0f));
+        }
+
+        // raster_visibility reads the buffer back, so it synchronises and the
+        // wall clock around it is the hemisphere's cost and nothing else. This
+        // is the same measurement the culling and cooperative-traversal commits
+        // reported, which is why the timing lives in the gate rather than in a
+        // bench frame: MBG_BENCH averages a pass over a frame that is dominated
+        // by the per-pixel direct term.
+        auto timed = [&](SolveConfig c, double& ms) {
+            const auto t0 = std::chrono::steady_clock::now();
+            std::vector<uint32_t> v = solver.raster_visibility(scene, c, pos, nrm);
+            ms = std::chrono::duration<double, std::milli>(
+                     std::chrono::steady_clock::now() - t0).count();
+            return v;
+        };
+
+        Quadrature qo;
+        qo.build(cfg.res[0]);
+        const uint32_t texels_o = cfg.res[0] * cfg.res[0];
+
+        SolveConfig ref = cfg;
+        ref.order = false;
+
+        // A THROWAWAY CALL FIRST, because the first one in the process is not
+        // measuring the traversal. It pays for the shader compile, the buffer
+        // allocations and the clocks coming up, and on Sponza that is 41% --
+        // four times any effect being looked for here. Ratios taken against a
+        // cold first measurement credited the warm-up to whichever variant
+        // happened to run second.
+        // INTERLEAVED REPEATS, AND THE MINIMUM OF EACH -- not a single A/B.
+        //
+        // Two things make a single pair of calls unable to measure a 1.3x
+        // effect here. The first call in a process is ~40% slow: shader
+        // compile, allocations, and the clocks coming up. And absolute
+        // throughput varies by up to 74% BETWEEN runs of the same binary --
+        // one run measured this scene's baseline at 5109 ms and another, while
+        // the machine was throttled, at 8728, which compressed a real 1.33x
+        // down to an apparent 1.08x.
+        //
+        // Neither is fixed by a first-versus-last drift check, which reported
+        // +0.2% on the throttled run. Interleaving the configurations and
+        // keeping each one's MINIMUM is what works: the minimum is the rep
+        // where least else interfered, and interleaving means any drift over
+        // the run is charged to both configurations rather than to whichever
+        // one happened to go second. Every sample is printed so a suspicious
+        // pattern stays visible instead of being averaged into the answer.
+        //
+        // A warning against over-reading those samples, from this gate's own
+        // history: a run of five that went slow/fast/slow/fast/slow looked
+        // exactly like position-dependent noise, and was mistaken for it. The
+        // fast ones were the two configurations with the ordering ON. Lining
+        // samples up by configuration before by position is the discipline.
+        const int kReps = 3;
+        double warm_ms = 0.0;
+        (void)timed(ref, warm_ms);
+
+        SolveConfig on = cfg;
+        on.order = true;
+
+        double best_off = 1e30, best_on = 1e30;
+        std::vector<uint32_t> want, got;
+        printf("[GATE] 9 order   %u cameras x %u texels on %zu triangles, "
+               "%u clusters in %u groups (warm-up %.0f ms discarded)\n",
+               kCams, texels_o, tris.size(), scene.cluster_count(),
+               scene.group_count(), warm_ms);
+        for (int rep = 0; rep < kReps; ++rep) {
+            double a = 0.0, b = 0.0;
+            std::vector<uint32_t> va = timed(ref, a);
+            std::vector<uint32_t> vb = timed(on, b);
+            best_off = std::min(best_off, a);
+            best_on = std::min(best_on, b);
+            printf("[GATE] 9 order   rep %d       index order %8.1f ms   "
+                   "nearest first %8.1f ms\n", rep, a, b);
+            if (rep == 0) { want = std::move(va); got = std::move(vb); }
+        }
+
+        {
+            // A DIFFERENT TRIANGLE IS NOT YET A DIFFERENT ANSWER.
+            //
+            // `dist < bd` is strict, so among triangles at exactly the same
+            // distance the one found FIRST wins -- and changing the visit order
+            // is precisely what this gate varies. Sponza carries coincident and
+            // duplicated polygons in quantity, so a tie flipping is the
+            // expected, harmless outcome and says nothing about the bound.
+            //
+            // What would be a bug is a bound that pruned a box which could have
+            // won: that shows up as the two winners lying at MEASURABLY
+            // different distances. So intersect both and compare the depths --
+            // only a real difference counts against the gate.
+            std::size_t diff = 0, ties = 0;
+            double worst_rel = 0.0;
+            const std::size_t n = std::min(want.size(), got.size());
+            for (std::size_t i = 0; i < n; ++i) {
+                if (want[i] == got[i]) continue;
+                const uint32_t c = uint32_t(i / texels_o), tx = uint32_t(i % texels_o);
+                glm::vec3 N = glm::normalize(glm::vec3(nrm[c])), T, B;
+                onb(N, T, B);
+                const glm::vec3 P = glm::vec3(pos[c]) + N * cfg.bias;
+                const glm::vec3 dl = glm::vec3(qo.texels[tx]);
+                const glm::vec3 d = T * dl.x + B * dl.y + N * dl.z;
+                float ta = 0.0f, tb = 0.0f;
+                const bool ha = want[i] != 0xFFFFFFFFu && ray_tri(P, d, tris[want[i]], ta);
+                const bool hb = got[i]  != 0xFFFFFFFFu && ray_tri(P, d, tris[got[i]],  tb);
+                if (!ha || !hb) { ++diff; continue; }
+                const double rel = std::abs(double(ta) - double(tb)) /
+                                   std::max(1e-9, double(std::max(ta, tb)));
+                if (rel <= 1e-5) { ++ties; continue; }
+                worst_rel = std::max(worst_rel, rel);
+                ++diff;
+            }
+            if (want.size() != got.size()) diff = std::max(want.size(), got.size());
+            r.check(9, "order", "nearest first", double(diff), 0.0, 0.0, true);
+            printf("[GATE] 9 order   %zu tie(s) at equal depth, %zu at different "
+                   "depth (worst rel %.3g)\n", ties, diff, worst_rel);
+            printf("[GATE] 9 order   best of %d: %8.1f -> %8.1f ms   %.2fx\n",
+                   kReps, best_off, best_on, best_off / std::max(1e-9, best_on));
+        }
     }
 
     printf("[GATE] %d passed, %d failed\n", r.passed, r.failed);

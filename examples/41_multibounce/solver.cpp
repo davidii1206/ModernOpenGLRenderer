@@ -258,6 +258,8 @@ void Solver::raster_level(uint32_t l, uint32_t count, const Scene& scene,
     raster_.set("u_coop",
                 (cfg.coop && scene.cluster_count() > 8u) ? 1u : 0u);
     raster_.set("u_cull", cfg.cull ? 1u : 0u);
+    // The order only matters if there are cluster levels to reorder.
+    raster_.set("u_order", (cfg.order && cfg.cull) ? 1u : 0u);
     raster_.set("u_res", li.res);
     raster_.set("u_block", li.block);
     raster_.set("u_children", li.children);
