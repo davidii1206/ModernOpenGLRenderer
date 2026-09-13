@@ -94,6 +94,7 @@ void main() {
               N * u_bias;
 
     vec3 E = vec3(0.0);
+    lv_jit = vec2(0.0);          // emitter views: their frames already differ per receiver
 
     // Uniform loop bound, so the barriers inside it are safe.
     for (uint e = 0u; e < u_emitters; ++e) {
@@ -154,7 +155,34 @@ void main() {
     // direction, hard-edged -- which is why it is the half that moved here.
     vec3 sun_mag = mbg_sun_unshadowed(N);
     if (dot(sun_mag, vec3(1.0)) > 0.0) {
-        // Deliberately NOT spun per receiver, unlike the secondary cameras'.
+        // AN ORDERED DITHER, NOT A ROTATION AND NOT A HASH.
+        //
+        // lv_setup_dir builds its frame from the sun direction, which is the
+        // same everywhere, so every receiver in the scene gets the IDENTICAL
+        // texel grid -- and a straight architectural edge lies parallel to one
+        // of its axes, so a whole row of texels flips at once. An 8x8 cone then
+        // resolves a penumbra in EIGHT steps rather than sixty-four, which on
+        // Sponza's floor is plateaus six pixels wide. Cornell never showed it
+        // because its penumbrae are a pixel or two across.
+        //
+        // Spinning per receiver, as the secondary cameras do, would fix the
+        // alignment and replace it with grain -- and nothing averages this pass,
+        // whose output is the image's sharpest term and goes straight to the
+        // screen. A Bayer offset is deterministic and spatially structured
+        // instead: neighbouring pixels sample the cone at different sub-texel
+        // positions, so the row that flips differs between them and a plateau
+        // becomes a fine gradient rather than noise.
+        //
+        // 4x4 in each axis, so the eight steps become thirty-two and the dither
+        // period is four pixels -- below what reads as a pattern at the width
+        // these penumbrae actually have.
+        const uint bayer[16] = uint[16](0u, 8u, 2u, 10u, 12u, 4u, 14u, 6u,
+                                        3u, 11u, 1u, 9u, 15u, 7u, 13u, 5u);
+        uint bx = uint(p.x) & 3u, by = uint(p.y) & 3u;
+        lv_jit = vec2(float(bayer[by * 4u + bx]) + 0.5,
+                      float(bayer[bx * 4u + by]) + 0.5) / 16.0 - 0.5;
+
+        // Not spun per receiver, unlike the secondary cameras'.
         // Nothing averages this pass: its output is the image's sharpest term
         // and goes straight to the screen. An unrotated grid gives a penumbra
         // that ramps smoothly as the receiver moves across it, which is what a

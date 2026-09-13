@@ -47,6 +47,9 @@ float lv_wmax;                      // the emitter's far extent along lv_F
 // How close a triangle's PLANE has to pass to the receiver before "which side of
 // it am I on" stops being a meaningful question. See lv_fill.
 float lv_peps;
+// Sub-texel offset of the sampling grid, in texels. Lets a caller break the
+// alignment between a straight occluder edge and the grid's own rows.
+vec2 lv_jit = vec2(0.0);
 
 vec3 lv_project(vec3 d) { return vec3(dot(d, lv_R), dot(d, lv_U), dot(d, lv_F)); }
 
@@ -330,7 +333,7 @@ vec2 lv_mass_texel(uint res, vec3 N, uint emit_ti, uint cluster_count,
     vec2 m = vec2(0.0);
     uint n = res * res;
     for (uint i = lo; i < n; i += stride) {
-        vec3 d = lv_px_to_dir(vec2(float(i % res), float(i / res)) + vec2(0.5), res);
+        vec3 d = lv_px_to_dir(vec2(float(i % res), float(i / res)) + vec2(0.5) + lv_jit, res);
         float cosr = dot(N, d);
         if (cosr <= 0.0) continue;
 
@@ -373,7 +376,7 @@ vec2 lv_mass_disc_texel(uint res, vec3 N, float cos_r, uint cluster_count,
     vec2 m = vec2(0.0);
     uint n = res * res;
     for (uint i = lo; i < n; i += stride) {
-        vec3 d = lv_px_to_dir(vec2(float(i % res), float(i / res)) + vec2(0.5), res);
+        vec3 d = lv_px_to_dir(vec2(float(i % res), float(i / res)) + vec2(0.5) + lv_jit, res);
         float l = length(d);
         if (dot(d, lv_F) < cos_r * l) continue;
         float cosr = dot(N, d);
