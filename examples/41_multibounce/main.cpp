@@ -64,9 +64,10 @@
 //   MBG_MODEL=path.glb      CornellBoxOriginal.glb; the references only match it
 //   MBG_BOUNCES=3           camera levels; 1 == direct only (capped at
 //                           kMaxLevels, currently 3)
-//   MBG_PATHS=40            single-sample continuation: split this many ways at
+//   MBG_PATHS=20            single-sample continuation: split this many ways at
 //                           the primary hit, branch factor 1 below it, so cost
-//                           is paths x bounces. 0 = the branching tile estimator
+//                           is paths x bounces. 40 is the split that costs what
+//                           the tree costs. 0 = the branching tile estimator
 //   MBG_RR=0.15             Russian-roulette threshold on path throughput; 0 off
 //   MBG_IMPORTANCE=1        weight the continuation by the hit's radiance, not
 //                           by cos * solid angle * albedo alone

@@ -109,21 +109,26 @@ struct SolveConfig {
     // representative's visibility. That one is deterministic, which is why every
     // gate runs on it, and it is the doc's variant A as written.
     //
-    // 40, which is not a round number and is not meant to be: at the three-bounce
-    // cap it is the split that costs EXACTLY what the branching tree costs. The
-    // tree spawns 16 then 4, so a primary hit carries 1 + 16 + 64 = 81 cameras;
-    // a path split of S carries 1 + 2S, and 1 + 2*40 = 81. Same cameras, same
-    // texels, same triangle-rasters, to the unit -- which is the comparison
-    // finding 20 defaults on, and at equal cost the path estimator wins on every
-    // axis that is not a tie.
+    // 20, BECAUSE THE ESTIMATOR SATURATES FAR BELOW THE EQUAL-COST POINT.
     //
-    // PATHS SATURATE WELL BELOW THIS. 40, 64 and 256 score the same RMSE to four
-    // digits, and 20 scores 0.0403 against 40's 0.0402 for HALF the cameras with
-    // the same whole-image noise (3.86 against 3.88). MBG_PATHS=20 is therefore
-    // a free 2x on the solve if the equal-cost comparison is not what is wanted;
-    // it is not the default only because the default is the configuration the
-    // branching estimator is measured against.
-    uint32_t  paths = 40;
+    // The equal-cost point is 40: at the three-bounce cap the branching tree
+    // spawns 16 then 4, so a primary hit carries 1 + 16 + 64 = 81 cameras, and a
+    // path split of S carries 1 + 2S with 1 + 2*40 = 81. Same cameras, same
+    // texels, same triangle-rasters, to the unit. That is the comparison finding
+    // 20 is written against and MBG_PATHS=40 still reproduces it exactly.
+    //
+    // But the split saturates long before it: 20, 40, 64 and 256 all score the
+    // same RMSE to three digits (0.0403 / 0.0402 / 0.0402 / 0.0402), the same
+    // whole-image high-pass noise (3.87 against 3.88) and the same ceiling noise
+    // (1.39 against 1.40). Between 20 and 40 the largest single-pixel difference
+    // in the reference frame is 17/255 and only 99 pixels of 262144 differ by
+    // more than 8 -- and, checked the way finding 24 says to check a default,
+    // the ceiling/wall diagonal and the vertical corner are step-for-step
+    // identical. Halving the split is 1.63x measured end to end (22990 ms to
+    // 14094 ms, 1.33e6 cameras to 6.7e5) for an image nobody can pick out of a
+    // line-up. Cost is 1 + paths*(bounces-1) cameras per primary hit, so this is
+    // also what makes a fourth bounce cost what three used to.
+    uint32_t  paths = 20;
     // Russian roulette threshold on the path throughput (the running product of
     // what each bounce reflects, near enough). Below it a path survives with
     // probability throughput/threshold and is divided by that probability, so

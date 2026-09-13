@@ -36,7 +36,7 @@ reload sees it.
 | `MBG_GATE=all` or a comma list | run the analytic gates and exit. Names: `quad`, `closed`, `rect`, `occ`, `oracle`, `texeldir`, `series`, `paths`. `MBG_GATE_VERBOSE=1` prints each rasterizer/oracle disagreement |
 | `MBG_MODEL=path.glb` | model to load (default `CornellBoxOriginal.glb`). The two reference PNGs only match that one |
 | `MBG_BOUNCES=n` | camera levels, 1–`kMaxLevels`. **3 is the cap** (solver.hpp); 1 = direct only |
-| `MBG_PATHS=n` | **single-sample continuation**: split this many ways at the primary hit, branch factor 1 below it, so the cost is `paths × bounces` instead of `K^bounces` (default 40, the split that costs exactly what the branching tree costs at 3 bounces; 20 measures the same for half the cameras, see finding 21). `0` selects the branching tile estimator; see finding 20 |
+| `MBG_PATHS=n` | **single-sample continuation**: split this many ways at the primary hit, branch factor 1 below it, so the cost is `paths × bounces` instead of `K^bounces` (default 20, where the estimator has saturated; 40 is the split that costs exactly what the branching tree costs at 3 bounces and is what the equal-cost comparison uses, see findings 21 and 26). `0` selects the branching tile estimator; see finding 20 |
 | `MBG_RR=f` | Russian-roulette threshold on path throughput (default 0.15). Below it a path survives with probability `throughput/f` and is divided by it. 0 disables |
 | `MBG_IMPORTANCE=0\|1` | draw the continuation from the micro-buffer's radiance rather than from `cos × dΩ × albedo` alone (default 1) |
 | `MBG_SCALE=n` | GI grid = framebuffer / n (default 4). **1 = one camera per pixel**, the doc's correctness reference. Finer resolves creases and costs silhouettes — see finding 21 |
@@ -231,13 +231,13 @@ thing to scale.
 
 ### The default configuration
 
-`MBG_BOUNCES=3`, `MBG_SCALE=4` (GI 128×128), 40 paths, targets 16/8/8, analytic
+`MBG_BOUNCES=3`, `MBG_SCALE=4` (GI 128×128), 20 paths, targets 16/8/8, analytic
 direct with an 8×8 light view per pixel, jitter + denoise on, no environment.
 
 | | RMSE | roughness vs reference | cameras/sweep |
 |---|---|---|---|
-| 1 bounce vs the direct reference | **0.0430** | 0.91× | 1.6e4 + 262k direct |
-| 3 bounces vs the full-GI reference (sky 0.05) | **0.0402** | 0.67× | 1.3e6 + 262k direct |
+| 1 bounce vs the direct reference | **0.0431** | 0.91× | 1.6e4 + 262k direct |
+| 3 bounces vs the full-GI reference (sky 0.05) | **0.0403** | 0.66× | 6.7e5 + 262k direct |
 
 At one bounce there is no recursion and the two estimators are the same code.
 
@@ -245,12 +245,14 @@ At one bounce there is no recursion and the two estimators are the same code.
 
 | 3 bounces, sky 0.05 | RMSE | ceiling roughness | cameras/sweep | sweep |
 |---|---|---|---|---|
-| **path**, 40 paths (default) | **0.0402** | 0.95 | 1.33e6 | 51.4 s |
+| **path**, 40 paths (`MBG_PATHS=40`) | **0.0402** | 0.95 | 1.33e6 | 51.4 s |
 | branching tiles (`MBG_PATHS=0`) | 0.0407 | 0.91 | 1.33e6 | 52.5 s |
 
 40 is the split that costs exactly what the tree costs at three bounces, so this
 is the same budget spent two ways. They are a wash on every measured axis, and
-the tiebreak is that one of them is unbiased (finding 20).
+the tiebreak is that one of them is unbiased (finding 20). It is no longer the
+default -- finding 26 halves it, because the estimator has saturated long before
+the equal-cost point -- but `MBG_PATHS=40` still reproduces this table exactly.
 
 Both moved with finding 16 (the light view now clips to its own frustum): the
 full-GI number was **0.0532** before it and the per-frame direct pass was
@@ -277,13 +279,15 @@ spread is under 1% and the comparisons are sound; *across* batches the clock
 means nothing. The camera and texel counts are exact and hardware independent,
 and they are the thing to scale with.
 
-**At the shipped configuration** — 3 bounces, 40 paths, GI grid 128×128 — one
-complete sweep, three runs in one batch, spread under 1%:
+**At the configuration shipped when this table was taken** — 3 bounces, 40 paths,
+GI grid 128×128 — one complete sweep, three runs in one batch, spread under 1%.
+Everything in this table PREDATES findings 22–26; the work column is still exact,
+but the current default is 20 paths and the same sweep now measures 14.0 s:
 
 | | time | work |
 |---|---|---|
 | **indirect, 3 bounces, path 40** | **51.4 s** | 1.33e6 cameras, 8.8e7 texels, 4.2e7 triangle-rasters |
-| indirect, 3 bounces, path 20 (same quality) | ~26 s | 0.67e6 cameras |
+| indirect, 3 bounces, path 20 (same quality, now the default) | ~26 s | 0.67e6 cameras |
 | indirect, 3 bounces, branching | 52.5 s | 1.33e6 cameras, 8.8e7 texels |
 | indirect, 3 bounces, path 64 | 81.7 s | 2.11e6 cameras, 1.38e8 texels |
 | indirect, 3 bounces, **with the sun** | ~57 s | + one cone raster per camera |
@@ -1144,7 +1148,7 @@ own budget spent the other way.
 
 | 3 bounces, sky 0.05, 1.33e6 cameras/sweep either way | RMSE | ceiling roughness | sweep |
 |---|---|---|---|
-| **path, 40 (default)** | **0.0402** | 0.95 | **51.4 s** |
+| **path, 40 (`MBG_PATHS=40`)** | **0.0402** | 0.95 | **51.4 s** |
 | branching tiles (`MBG_PATHS=0`) | 0.0407 | 0.91 | 52.5 s |
 | path, 64 | 0.0402 | 0.97 | 81.7 s |
 
@@ -1316,9 +1320,10 @@ Two things survive the revert:
 
 - **Paths saturate at about half the default.** 20 paths at scale 4 scores
   0.0403 against 40's 0.0402, with whole-image noise 3.86 against 3.88, for
-  **half the cameras**. `MBG_PATHS=20` is a free 2× on the solve. It is not the
-  default only because 40 is the split that costs exactly what the branching
-  estimator costs, which is the comparison finding 20 rests on.
+  **half the cameras**. `MBG_PATHS=20` is a free 2× on the solve. It was not the
+  default at the time only because 40 is the split that costs exactly what the
+  branching estimator costs, which is the comparison finding 20 rests on. Finding
+  26 takes it, after checking the silhouette the way this finding says to.
 - **The real fix is not more grid.** The crease needs the upsample to behave at a
   silhouette and the denoise to average *along* an edge it cannot average across
   — an anisotropic kernel steered by local structure. That is a real piece of
@@ -1704,6 +1709,105 @@ nothing to notice in an image and the timings look like ordinary noise. What
 gave it away was that mask-on and mask-off were BIT-IDENTICAL -- which is only
 evidence because an approximation is supposed to differ. When a cheap path
 reproduces the reference exactly, suspect that it never ran.
+
+### 26. Three things the traversal was doing that it did not need to do
+
+Finding 22 established that the inner loop is bandwidth bound, not compute bound:
+about 155 operations against 96 bytes, 1.6 flops per byte where an RTX 3060 wants
+nearer 36. Three changes follow from reading that sentence literally, and a
+fourth from reading the estimator's own saturation curve. None of them adds a
+data structure, and the first three are **bit-identical** — verified pixel for
+pixel, not by RMSE.
+
+#### The terminal hemisphere is an occlusion query
+
+A secondary camera at the deepest level spawns no children. Its hemisphere is
+read for exactly one thing: whether each direction hit anything, so the sky and
+the analytic emitters can be masked. *Which* triangle won, and how far away it
+was, is computed and then thrown away.
+
+So the terminal level takes an any-hit path: the first triangle a direction hits
+ends that texel, and the traversal stops testing it. `u_anyhit` gates it, and
+the host sets it only where the answer genuinely cannot matter — a level with no
+children, no visibility dump, and either NEE on or no emitters at all:
+
+```cpp
+const bool anyhit = cfg.anyhit && li.children == 0 && !dump &&
+                    (cfg.nee || scene.emitter_count() == 0);
+```
+
+Three of those four conditions are about a consumer that would notice. The dump
+is the gates' own read-back; an emitter without NEE is picked up *by* the
+hemisphere, and its radiance depends on which triangle won.
+
+#### The cone setup was recomputed per texel
+
+`mbg_cone_contains` needs three edge planes and the triangle's plane, all of them
+functions of the triangle and the camera origin alone. The cooperative traversal
+carries `MBG_TEXELS_PER_THREAD` texels per thread against the same triangle, so
+that setup was being built four times for four uses of it. Hoisting it out of the
+texel loop into `mbg_tri_setup` leaves each texel with three dot products, a
+tolerance test and one divide.
+
+#### Two thirds of the triangle record is shading data
+
+`MbgTri` was six vec4s: three positions, a plane normal, an albedo and an
+emission. The traversal reads the first four and never touches the last two —
+they are wanted once, at the end, for whichever triangle won.
+
+Interleaved they still cost bandwidth. A cache line is 128 bytes and the stride
+was 96, so a line carried 1.3 triangles and a third of what it carried was
+discarded. Split into `MbgTriGeom` (64 bytes) and `MbgTriShade` (32), a line
+carries two triangles with nothing wasted. Total memory is unchanged — the same
+six vec4s in two arrays instead of one — and `mbg_tri(i)` reassembles both halves
+for the handful of call sites that want the whole thing.
+
+The plane normal stays with the positions rather than with the shading data,
+because `lv_tri_hit`'s half-space rule (finding 19) needs its SIGN — the outward
+direction, oriented against the shading normal where the winding disagreed — so
+it cannot be recovered from the positions alone.
+
+#### And the split was twice what the estimator needed
+
+Finding 21 measured this and left it on the table: 20 paths scores the same as
+40 on RMSE, on whole-image noise and on ceiling noise, for half the cameras. It
+stayed at 40 because 40 is the equal-cost point against the branching estimator,
+which is the comparison finding 20 rests on — a reason to keep 40 *reproducible*,
+not a reason to make every render pay for it. `MBG_PATHS=40` still reproduces
+that table exactly.
+
+What finding 21 also established is that aggregates are not enough to change a
+default with. So before taking it, the same two crops that caught the scale-3
+regression — the ceiling/left-wall diagonal and the vertical corner — were
+rendered side by side at 3×. They are step-for-step identical. Between the two
+renders the largest single-pixel difference in the reference frame is 17/255 and
+99 pixels of 262144 differ by more than 8.
+
+| 3 bounces, sky 0.05, reference camera | cameras/sweep | sweep | RMSE | ceiling hp |
+|---|---|---|---|---|
+| 40 paths | 1.33e6 | 23.1 s | 0.0402 | 1.399 |
+| **20 paths (the new default)** | **6.7e5** | **14.1 s** | 0.0403 | 1.388 |
+
+**1.64× on the whole solve**, on the same machine in the same batch. Cost is
+`1 + paths × (bounces − 1)` cameras per primary hit, so this is also what makes a
+fourth bounce cost roughly what three used to.
+
+#### What the numbers are worth
+
+The three bit-identical changes cannot be ranked here. Finding 22 established
+that llvmpipe ranked a version the 3060 measured 124× apart as being within 3×,
+so a software rasterizer's clock says nothing about a change whose entire premise
+is the memory hierarchy. What *can* be asserted from this machine is what the
+changes were verified on: 36/36 gates, and output identical pixel for pixel with
+the optimization on and off. The any-hit path also removes work in a way that is
+visible in the counts rather than the clock — the deepest level stops testing a
+texel the moment it is answered — and the record split is a cache-line argument
+that either holds on real hardware or does not, and will not be settled by
+llvmpipe either way.
+
+The path count is the exception: it halves the camera count, which is exact and
+hardware independent, and the 1.64× measured here is only the confirmation that
+nothing else grew to fill the gap.
 
 ## What this does not answer
 
