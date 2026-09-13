@@ -162,7 +162,7 @@ bool mbg_tri_hit(uint ti, vec3 d, out float dist) {
 }
 
 // Fill s_vis for this thread's texels. Replaces clear + rasterize + barrier.
-void mbg_resolve_vis(uint tid, uint stride, uint cluster_count, uint tri_count) {
+void mbg_resolve_vis(uint tid, uint stride, uint group_count, uint tri_count) {
     uint n = u_res * u_res;
 
     // A scene small enough not to be culled does not want the cluster
@@ -194,21 +194,33 @@ void mbg_resolve_vis(uint tid, uint stride, uint cluster_count, uint tri_count) 
         // 1e30 squared is not a float.
         float bestdist = 1e18;
 
-        for (uint c = 0u; c < cluster_count; ++c) {
-            if (!mbg_cl_live(c)) continue;
-            // Closest point of the box to the receiver, componentwise: zero on
-            // any axis the receiver is already between lo and hi.
-            vec3 q = max(max(clusters[c].lo.xyz - g_P, vec3(0.0)),
-                         g_P - clusters[c].hi.xyz);
-            if (dot(q, q) > bestdist * bestdist) continue;   // cannot beat what we have
+        // Two levels, coarse first. Every texel of this camera shares an origin
+        // and so rediscovers the same scene; testing 65 group boxes before 4098
+        // cluster boxes turns that from O(n) into O(sqrt n), and the distance
+        // bound prunes at both levels.
+        for (uint g = 0u; g < group_count; ++g) {
+            vec3 gq = max(max(groups[g].lo.xyz - g_P, vec3(0.0)),
+                          g_P - groups[g].hi.xyz);
+            if (dot(gq, gq) > bestdist * bestdist) continue;
 
-            uint first = uint(clusters[c].lo.w);
-            uint last  = first + uint(clusters[c].hi.w);
-            for (uint t = first; t < last; ++t) {
-                float tt;
-                if (!mbg_tri_hit(t, d, tt)) continue;
-                float dist = tt * len_d;
-                if (dist < bestdist) { bestdist = dist; best = t; }
+            uint cfirst = uint(groups[g].lo.w);
+            uint clast  = cfirst + uint(groups[g].hi.w);
+            for (uint c = cfirst; c < clast; ++c) {
+                if (!mbg_cl_live(c)) continue;
+                // Closest point of the box to the receiver, componentwise: zero
+                // on any axis the receiver is already between lo and hi.
+                vec3 q = max(max(clusters[c].lo.xyz - g_P, vec3(0.0)),
+                             g_P - clusters[c].hi.xyz);
+                if (dot(q, q) > bestdist * bestdist) continue;
+
+                uint first = uint(clusters[c].lo.w);
+                uint last  = first + uint(clusters[c].hi.w);
+                for (uint t = first; t < last; ++t) {
+                    float tt;
+                    if (!mbg_tri_hit(t, d, tt)) continue;
+                    float dist = tt * len_d;
+                    if (dist < bestdist) { bestdist = dist; best = t; }
+                }
             }
         }
         s_vis[i] = best;

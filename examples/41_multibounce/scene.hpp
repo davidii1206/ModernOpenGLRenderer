@@ -75,6 +75,7 @@ enum Binding : uint32_t {
     kBindDirect   = 9,     // this level's (direct irradiance, visible fraction)
     kBindChildD   = 10,    // the next level's, read by the gather
     kBindClusters = 11,    // triangle-cluster bounds, for culling
+    kBindGroups   = 12,    // bounds over RUNS of clusters: the coarse level
 };
 
 // The GPU triangle, mirroring MbgTri in shaders/common/scene.glsl.
@@ -105,6 +106,7 @@ public:
         buf_.bind_base(kBindTris);
         emit_.bind_base(kBindEmitters);
         clusters_.bind_base(kBindClusters);
+        groups_.bind_base(kBindGroups);
     }
 
     uint32_t count() const { return count_; }
@@ -115,6 +117,10 @@ public:
     // being picked up by the hemisphere raster. See raster.comp.
     uint32_t emitter_count() const { return emitter_count_; }
     uint32_t cluster_count() const { return cluster_count_; }
+    uint32_t group_count() const { return group_count_; }
+    // Clusters per group. Two levels of 64 cover 4096 clusters -- 262k
+    // triangles -- in sqrt(n) tests instead of n, which is the whole point.
+    static constexpr uint32_t kGroupSize = 64;
     // Triangles per cluster. 64 matches the workgroup, so one cull step feeds
     // one thread-per-triangle pass, and it is small enough that a cluster's box
     // is tight even where the mesh is not.
@@ -126,7 +132,9 @@ private:
     gl::Buffer buf_{gl::BufferType::shader, gl::BufferUsage::static_draw};
     gl::Buffer emit_{gl::BufferType::shader, gl::BufferUsage::static_draw};
     gl::Buffer clusters_{gl::BufferType::shader, gl::BufferUsage::static_draw};
-    uint32_t count_ = 0, emissive_ = 0, emitter_count_ = 0, cluster_count_ = 0;
+    gl::Buffer groups_{gl::BufferType::shader, gl::BufferUsage::static_draw};
+    uint32_t count_ = 0, emissive_ = 0, emitter_count_ = 0, cluster_count_ = 0,
+             group_count_ = 0;
     double area_ = 0.0;
     Bounds bounds_;
 };

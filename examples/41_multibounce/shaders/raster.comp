@@ -60,6 +60,7 @@ uniform uint  u_level;        // this level's index, for the random streams
 uniform float u_rr;           // Russian-roulette throughput threshold; 0 = off
 uniform uint  u_importance;   // 1 = weight the continuation by the hit's radiance
 uniform uint  u_cluster_count;
+uniform uint  u_group_count;
 uniform float u_bias;         // camera offset along its own normal, world units
 uniform float u_emissive;     // emissive scale
 uniform uint  u_two_sided;    // force every triangle to emit from both faces
@@ -113,7 +114,7 @@ void main() {
     uint texels = u_res * u_res;
 
     mbg_cull(tid, 64u, u_cluster_count);
-    mbg_resolve_vis(tid, 64u, u_cluster_count, u_tri_count);
+    mbg_resolve_vis(tid, 64u, u_group_count, u_tri_count);
     barrier();
     memoryBarrierShared();
 

@@ -68,6 +68,7 @@ uniform uint u_cull;
 
 layout(std430, binding = 0) readonly buffer MbgTris { MbgTri tris[]; };
 layout(std430, binding = 11) readonly buffer MbgClusters { MbgCluster clusters[]; };
+layout(std430, binding = 12) readonly buffer MbgGroups   { MbgCluster groups[]; };
 layout(std430, binding = 2) readonly buffer MbgQuad { vec4   quad[]; };
 
 // Orthonormal basis around n. Duff et al. 2017, branchless and stable at both

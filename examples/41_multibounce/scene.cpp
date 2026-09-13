@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 
 namespace mbg {
 
@@ -73,6 +74,67 @@ std::vector<Tri> extract_triangles(const gfx::Model& model) {
                 emit(vs[is[k]], vs[is[k + 1]], vs[is[k + 2]]);
         }
     }
+
+    // --- Spatial order, and it is what makes the cluster levels work ---------
+    //
+    // Clusters are runs of consecutive triangles, so their boxes are only as
+    // tight as the order they arrive in. Mesh order gives decent 64-triangle
+    // clusters -- a mesh's triangles are locally coherent -- and USELESS groups
+    // above them: 64 consecutive clusters of Sponza is 4096 triangles spanning
+    // the whole building, so the coarse box contains everything and culls
+    // nothing. Measured: adding the coarse level on mesh order was worth 1%.
+    //
+    // Sorting by Morton code makes both levels compact, because a run of
+    // consecutive codes is a run of nearby triangles at every scale.
+    //
+    // AND IT IS NOT UNIFORMLY BETTER, which is worth knowing before trusting
+    // it. Measured at a 32x32 grid, one bounce:
+    //
+    //   Cornell+bunny  direct      5806 ms -> 3134 ms   1.85x
+    //   Cornell+bunny  hemisphere  2860 ms -> 2413 ms   1.19x
+    //   Sponza         hemisphere 14948 ms -> 17192 ms  0.87x   (three runs, +-1%)
+    //
+    // The bunny is one dense organic mesh, where the model's own order carries
+    // no useful structure and Morton supplies it. Sponza is architecture, where
+    // the artist already put each column's triangles together -- tighter than a
+    // Morton run that straddles a seam, which is the known weakness of the
+    // curve. So this helps a mesh and hurts a building.
+    //
+    // Done HERE rather than in Scene::build so the host's triangle vector and
+    // the GPU's agree on indices -- the oracle gate compares them directly.
+    // MBG_MORTON=0 keeps the model's own order, which is not always worse --
+    // see the measurement in the header comment above.
+    const char* morton_env = getenv("MBG_MORTON");
+    const bool morton = !(morton_env && atoi(morton_env) == 0);
+    if (morton && out.size() > 1) {
+        glm::vec3 lo(1e30f), hi(-1e30f);
+        for (const Tri& t : out)
+            for (int k = 0; k < 3; ++k) { lo = glm::min(lo, t.p[k]); hi = glm::max(hi, t.p[k]); }
+        const glm::vec3 inv = 1.0f / glm::max(hi - lo, glm::vec3(1e-6f));
+
+        // 10 bits per axis interleaved: one 32-bit key, no big-integer work.
+        auto spread = [](uint32_t v) {
+            v &= 0x3FFu;
+            v = (v | (v << 16)) & 0x030000FFu;
+            v = (v | (v <<  8)) & 0x0300F00Fu;
+            v = (v | (v <<  4)) & 0x030C30C3u;
+            v = (v | (v <<  2)) & 0x09249249u;
+            return v;
+        };
+        std::vector<std::pair<uint32_t, uint32_t>> order(out.size());
+        for (std::size_t i = 0; i < out.size(); ++i) {
+            const glm::vec3 c = (out[i].p[0] + out[i].p[1] + out[i].p[2]) / 3.0f;
+            const glm::vec3 u = glm::clamp((c - lo) * inv, glm::vec3(0.0f), glm::vec3(1.0f));
+            order[i] = {spread(uint32_t(u.x * 1023.0f)) |
+                        (spread(uint32_t(u.y * 1023.0f)) << 1) |
+                        (spread(uint32_t(u.z * 1023.0f)) << 2),
+                        uint32_t(i)};
+        }
+        std::sort(order.begin(), order.end());
+        std::vector<Tri> sorted(out.size());
+        for (std::size_t i = 0; i < out.size(); ++i) sorted[i] = out[order[i].second];
+        out.swap(sorted);
+    }
     return out;
 }
 
@@ -108,6 +170,22 @@ bool Scene::build(const std::vector<Tri>& tris) {
     }
     cluster_count_ = uint32_t(clusters.size());
     clusters_.data(clusters.data(), clusters.size() * sizeof(GpuCluster));
+
+    // The coarse level: a box over each run of kGroupSize clusters. Without it
+    // every texel tests every cluster, and 256 texels sharing one origin each
+    // rediscover the same scene independently.
+    std::vector<GpuCluster> groups;
+    for (std::size_t base = 0; base < clusters.size(); base += kGroupSize) {
+        const std::size_t n = std::min<std::size_t>(kGroupSize, clusters.size() - base);
+        glm::vec3 lo(1e30f), hi(-1e30f);
+        for (std::size_t i = 0; i < n; ++i) {
+            lo = glm::min(lo, glm::vec3(clusters[base + i].lo));
+            hi = glm::max(hi, glm::vec3(clusters[base + i].hi));
+        }
+        groups.push_back({glm::vec4(lo, float(base)), glm::vec4(hi, float(n))});
+    }
+    group_count_ = uint32_t(groups.size());
+    groups_.data(groups.data(), groups.size() * sizeof(GpuCluster));
 
     std::vector<GpuTri> gpu(tris.size());
     std::vector<uint32_t> emitters;
