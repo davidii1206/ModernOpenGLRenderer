@@ -187,26 +187,28 @@ bool Scene::build(const std::vector<Tri>& tris) {
     group_count_ = uint32_t(groups.size());
     groups_.data(groups.data(), groups.size() * sizeof(GpuCluster));
 
-    std::vector<GpuTri> gpu(tris.size());
+    std::vector<GpuTriGeom> gpu(tris.size());
+    std::vector<GpuTriShade> shade(tris.size());
     std::vector<uint32_t> emitters;
     bounds_ = Bounds{};
     area_ = 0.0;
     emissive_ = 0;
     for (std::size_t i = 0; i < tris.size(); ++i) {
         const Tri& t = tris[i];
-        GpuTri& g = gpu[i];
+        GpuTriGeom& g = gpu[i];
+        GpuTriShade& sh = shade[i];
         g.p0 = glm::vec4(t.p[0], 0.0f);
         g.p1 = glm::vec4(t.p[1], 0.0f);
         g.p2 = glm::vec4(t.p[2], 0.0f);
         g.n  = glm::vec4(t.n, t.double_sided ? 1.0f : 0.0f);
-        g.albedo = glm::vec4(t.albedo, 0.0f);
+        sh.albedo = glm::vec4(t.albedo, 0.0f);
         // emission.w flags a triangle as an ANALYTIC emitter: the hemisphere
         // resolve then skips its L_e, because raster.comp adds the same energy
         // exactly instead of quadrature-sampled. Flagging it in the triangle
         // rather than only in the emitter list is what makes the two paths
         // impossible to double-count -- one flag gates both.
         const bool emits = glm::dot(t.emission, glm::vec3(1.0f)) > 0.0f;
-        g.emission = glm::vec4(t.emission, emits ? 1.0f : 0.0f);
+        sh.emission = glm::vec4(t.emission, emits ? 1.0f : 0.0f);
         if (emits) emitters.push_back(uint32_t(i));
         for (int k = 0; k < 3; ++k) bounds_.add(t.p[k]);
         area_ += double(t.area);
@@ -214,7 +216,8 @@ bool Scene::build(const std::vector<Tri>& tris) {
     }
 
     count_ = uint32_t(gpu.size());
-    buf_.data(gpu.data(), gpu.size() * sizeof(GpuTri));
+    buf_.data(gpu.data(), gpu.size() * sizeof(GpuTriGeom));
+    shade_.data(shade.data(), shade.size() * sizeof(GpuTriShade));
     emitter_count_ = uint32_t(emitters.size());
     // Never leave the binding empty: a shader that reads an unbound SSBO is
     // undefined, and u_emitters == 0 is a value the kernel has to be given

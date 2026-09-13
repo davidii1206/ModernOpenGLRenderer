@@ -133,7 +133,7 @@ void main() {
             uint key = s_vis[i];
             float v = 0.0;
             if (key != MBG_EMPTY && u_emitters != 0u) {
-                MbgTri ht = tris[key];
+                MbgTri ht = mbg_tri(key);
                 vec3 hdir = mbg_to_world(quad[i].xyz);
                 float hden = dot(ht.n.xyz, hdir);
                 if (abs(hden) > 1e-12) {
@@ -141,7 +141,7 @@ void main() {
                     vec3 hn = hden < 0.0 ? ht.n.xyz : -ht.n.xyz;
                     vec3 e = mbg_sun_unshadowed(hn);
                     for (uint em = 0u; em < u_emitters; ++em)
-                        e += mbg_emitter_unshadowed(hp, hn, tris[emitters[em]],
+                        e += mbg_emitter_unshadowed(hp, hn, mbg_tri(emitters[em]),
                                                     u_two_sided != 0u, 2.0 * u_bias,
                                                     u_emissive);
                     v = dot(e, vec3(1.0 / 3.0));
@@ -166,7 +166,7 @@ void main() {
         // answered the only question a sky needs answered; all that is left is
         // to ask the dome what colour it is (common/sky.glsl).
         if (key == MBG_EMPTY) { acc += mbg_sky_dome(mbg_to_world(q.xyz)) * q.w; continue; }
-        MbgTri tr = tris[key];
+        MbgTri tr = mbg_tri(key);
         // emission.w marks a triangle whose direct term is added analytically
         // below; taking it from the quadrature as well would double it.
         if (u_emitters != 0u && tr.emission.w != 0.0) continue;
@@ -201,7 +201,7 @@ void main() {
     float unsh_e = 0.0, unsh_s = 0.0;
     for (uint e = 0u; e < u_emitters; ++e) {
         uint ti = emitters[e];
-        vec3 mag = mbg_emitter_unshadowed(g_P, g_N, tris[ti], u_two_sided != 0u,
+        vec3 mag = mbg_emitter_unshadowed(g_P, g_N, mbg_tri(ti), u_two_sided != 0u,
                                           2.0 * u_bias, u_emissive);
         bool lit = dot(mag, vec3(1.0)) > 0.0;
         // A frustum fitted to the emitter, not the hemisphere. At an 8x8 target
@@ -210,7 +210,7 @@ void main() {
         // second bounce, flipping as a tile's representative moves, is the
         // horizontal banding that the indirect term used to show. The fitted
         // view spends its texels on the light instead. See lightview.glsl.
-        bool fitted = lit && lv_setup(g_P, g_N, tris[ti], 2.0 * u_bias);
+        bool fitted = lit && lv_setup(g_P, g_N, mbg_tri(ti), 2.0 * u_bias);
 
         // One texel per thread, the winner kept in a register: no clear, no
         // shared buffer, no atomics, no barrier around the visibility itself.
@@ -354,7 +354,7 @@ void main() {
             s_cdf[i] = 0.0;
             uint key = s_vis[i];
             if (key == MBG_EMPTY || u_importance == 0u) continue;
-            MbgTri ht = tris[key];
+            MbgTri ht = mbg_tri(key);
             vec3 hdir = mbg_to_world(quad[i].xyz);
             float hden = dot(ht.n.xyz, hdir);
             if (abs(hden) <= 1e-12) continue;
@@ -362,7 +362,7 @@ void main() {
             vec3 hn = hden < 0.0 ? ht.n.xyz : -ht.n.xyz;
             vec3 d = mbg_sun_unshadowed(hn);
             for (uint em = 0u; em < u_emitters; ++em)
-                d += mbg_emitter_unshadowed(hp, hn, tris[emitters[em]],
+                d += mbg_emitter_unshadowed(hp, hn, mbg_tri(emitters[em]),
                                             u_two_sided != 0u, 2.0 * u_bias, u_emissive);
             s_cdf[i] = dot(d, vec3(1.0 / 3.0));
             dsum += s_cdf[i];
@@ -395,7 +395,7 @@ void main() {
             uint key = s_vis[i];
             float f = 0.0;
             if (key != MBG_EMPTY) {
-                vec3 alb = tris[key].albedo.xyz;
+                vec3 alb = mbg_tri(key).albedo.xyz;
                 f = quad[i].w * dot(alb, vec3(1.0 / 3.0)) * (s_cdf[i] + dbar);
             }
             s_cdf[i] = f;
@@ -420,7 +420,7 @@ void main() {
                 float f = s_cdf[i] - (i > 0u ? s_cdf[i - 1u] : 0.0);
                 uint key = s_vis[i];
                 if (f > 0.0 && key != MBG_EMPTY) {
-                    MbgTri ht = tris[key];
+                    MbgTri ht = mbg_tri(key);
                     vec3 hdir = mbg_to_world(quad[i].xyz);
                     float hden = dot(ht.n.xyz, hdir);
                     if (abs(hden) > 1e-12) {
@@ -443,7 +443,7 @@ void main() {
                         vec3 d_sun = mbg_sun_unshadowed(hn);
                         vec3 d_emit = vec3(0.0);
                         for (uint em = 0u; em < u_emitters; ++em)
-                            d_emit += mbg_emitter_unshadowed(hit, hn, tris[emitters[em]],
+                            d_emit += mbg_emitter_unshadowed(hit, hn, mbg_tri(emitters[em]),
                                                              u_two_sided != 0u,
                                                              2.0 * u_bias, u_emissive);
                         m_emit = m_ind * d_emit;
@@ -610,7 +610,7 @@ void main() {
                 uint idx = uint(yy) * u_res + uint(xx);
                 uint key = s_vis[idx];
                 if (key == MBG_EMPTY) continue;
-                MbgTri ht = tris[key];
+                MbgTri ht = mbg_tri(key);
                 vec3 mass = (wx * wy) * quad[idx].w * ht.albedo.xyz;
                 wsum += mass;
 
@@ -631,7 +631,7 @@ void main() {
                     wsun += mass * mbg_sun_unshadowed(hn);
                     vec3 e_dir = vec3(0.0);
                     for (uint em = 0u; em < u_emitters; ++em)
-                        e_dir += mbg_emitter_unshadowed(hp, hn, tris[emitters[em]],
+                        e_dir += mbg_emitter_unshadowed(hp, hn, mbg_tri(emitters[em]),
                                                         u_two_sided != 0u, 2.0 * u_bias,
                                                         u_emissive);
                     wdir += mass * e_dir;
@@ -652,7 +652,7 @@ void main() {
         vec3 hit = vec3(0.0), hn = vec3(0.0);
         float alive = 0.0;
         if (besti != MBG_EMPTY) {
-            MbgTri tr = tris[s_vis[besti]];
+            MbgTri tr = mbg_tri(s_vis[besti]);
             vec3 dir = mbg_to_world(quad[besti].xyz);
             float denom = dot(tr.n.xyz, dir);
             if (abs(denom) > 1e-12) {

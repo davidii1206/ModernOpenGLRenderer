@@ -14,6 +14,9 @@
 
 // AoS, 96 bytes. Positions are world space, pre-transformed on the host.
 //   n.w    != 0  double-sided (emits and reflects from both faces)
+// The assembled triangle, a VALUE type: what a cold consumer wants when it
+// already knows which triangle won. Storage is split in two (see below and
+// scene.hpp), and mbg_tri() puts the halves back together.
 struct MbgTri {
     vec4 p0;
     vec4 p1;
@@ -21,6 +24,23 @@ struct MbgTri {
     vec4 n;
     vec4 albedo;
     vec4 emission;   // emitted RADIANCE, KHR_materials_emissive_strength folded in
+};
+
+// What the TRAVERSAL reads: positions and the plane normal, 64 bytes, so a
+// 128-byte cache line carries two triangles with nothing wasted. The albedo and
+// the emission are not here because no traversal has ever read them -- they are
+// shading data, wanted once a winner is known. See GpuTriGeom in scene.hpp for
+// why the normal stays on this side of the split.
+struct MbgTriGeom {
+    vec4 p0;
+    vec4 p1;
+    vec4 p2;
+    vec4 n;          // w != 0: double-sided
+};
+
+struct MbgTriShade {
+    vec4 albedo;
+    vec4 emission;
 };
 
 // A secondary camera: a point on a surface plus the normal its hemisphere is
@@ -66,7 +86,19 @@ struct MbgCluster {
 // rasterizers cull and they are included in either order.
 uniform uint u_cull;
 
-layout(std430, binding = 0) readonly buffer MbgTris { MbgTri tris[]; };
+layout(std430, binding = 0)  readonly buffer MbgGeomB  { MbgTriGeom  geom[]; };
+layout(std430, binding = 13) readonly buffer MbgShadeB { MbgTriShade shade[]; };
+
+// One triangle, both halves. Only cold paths call this -- a winner's shading, an
+// emitter's polygon -- so the second fetch costs nothing that matters.
+MbgTri mbg_tri(uint i) {
+    MbgTriGeom  g = geom[i];
+    MbgTriShade s = shade[i];
+    MbgTri t;
+    t.p0 = g.p0; t.p1 = g.p1; t.p2 = g.p2; t.n = g.n;
+    t.albedo = s.albedo; t.emission = s.emission;
+    return t;
+}
 layout(std430, binding = 11) readonly buffer MbgClusters { MbgCluster clusters[]; };
 layout(std430, binding = 12) readonly buffer MbgGroups   { MbgCluster groups[]; };
 layout(std430, binding = 2) readonly buffer MbgQuad { vec4   quad[]; };

@@ -281,7 +281,9 @@ uint lv_cl_count(uint cluster_count) {
 uint lv_cl_at(uint k) { return s_cl_overflow != 0u ? k : s_cl[k]; }
 
 bool lv_tri_hit(uint ti, vec3 d, out float dist) {
-    MbgTri tr = tris[ti];
+    // geom[], not mbg_tri(): this is the light view's inner loop and the shading
+    // half of the record is never read here.
+    MbgTriGeom tr = geom[ti];
     vec3 v0 = tr.p0.xyz - lv_P;
     vec3 v1 = tr.p1.xyz - lv_P;
     vec3 v2 = tr.p2.xyz - lv_P;

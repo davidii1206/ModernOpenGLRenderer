@@ -223,14 +223,14 @@ void main() {
     // its own cosine falloff and solid angle and only borrows the fraction.
     if (!refine_e) {
         for (uint e = 0u; e < u_emitters; ++e)
-            E += mbg_emitter_unshadowed(P, N, tris[emitters[e]], u_two_sided != 0u,
+            E += mbg_emitter_unshadowed(P, N, mbg_tri(emitters[e]), u_two_sided != 0u,
                                         2.0 * u_bias, u_emissive) * gfrac.x;
     }
 
     // Uniform loop bound, so the barriers inside it are safe.
     for (uint e = 0u; refine_e && e < u_emitters; ++e) {
         uint ti = emitters[e];
-        MbgTri tr = tris[ti];
+        MbgTri tr = mbg_tri(ti);
 
         // The magnitude is exact and needs no buffer at all; only the fraction
         // below is estimated. Skip the whole light view when there is nothing to

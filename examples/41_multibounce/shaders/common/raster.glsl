@@ -11,7 +11,7 @@
 // renderer and this is it: rasterize, let the depth sort decide, read the
 // winner. No rays, no shadow maps, no second structure.
 //
-// The includer declares `tris[]` and `quad[]`; the two uniforms the rasterizer
+// The includer declares `geom[]` and `quad[]`; the two uniforms the rasterizer
 // itself needs are declared here, because a GLSL header cannot use a uniform the
 // includer declares after it. Set the receiver frame with mbg_set_receiver()
 // before rasterizing.
@@ -213,7 +213,7 @@ struct MbgTriSetup {
     float sgn;             // orientation; 0 = edge on, subtends nothing
 };
 
-MbgTriSetup mbg_tri_setup(MbgTri tr) {
+MbgTriSetup mbg_tri_setup(MbgTriGeom tr) {
     vec3 v0 = tr.p0.xyz - g_P;
     vec3 v1 = tr.p1.xyz - g_P;
     vec3 v2 = tr.p2.xyz - g_P;
@@ -245,7 +245,7 @@ bool mbg_hit_dir(MbgTriSetup h, vec3 d, out float dist) {
     return true;
 }
 
-bool mbg_tri_hit_tr(MbgTri tr, vec3 d, out float dist) {
+bool mbg_tri_hit_tr(MbgTriGeom tr, vec3 d, out float dist) {
     vec3 v0 = tr.p0.xyz - g_P;
     vec3 v1 = tr.p1.xyz - g_P;
     vec3 v2 = tr.p2.xyz - g_P;
@@ -282,7 +282,7 @@ bool mbg_tri_hit_tr(MbgTri tr, vec3 d, out float dist) {
 }
 
 bool mbg_tri_hit(uint ti, vec3 d, out float dist) {
-    return mbg_tri_hit_tr(tris[ti], d, dist);
+    return mbg_tri_hit_tr(geom[ti], d, dist);
 }
 
 // --- Sharing one traversal across a camera's texels --------------------------
@@ -389,7 +389,7 @@ void mbg_resolve_vis_coop(uint tid, uint stride, uint group_count) {
                     // texel this thread owns.
                     // One fetch and ONE setup, reused by every texel this
                     // thread owns -- see mbg_tri_setup.
-                    MbgTriSetup h = mbg_tri_setup(tris[t]);
+                    MbgTriSetup h = mbg_tri_setup(geom[t]);
                     for (uint k = 0u; k < MBG_TEXELS_PER_THREAD; ++k) {
                         // A texel that already has its answer under any-hit is
                         // done; its bound is zero, so the box tests above have

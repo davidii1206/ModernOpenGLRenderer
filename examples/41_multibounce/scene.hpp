@@ -76,6 +76,7 @@ enum Binding : uint32_t {
     kBindChildD   = 10,    // the next level's, read by the gather
     kBindClusters = 11,    // triangle-cluster bounds, for culling
     kBindGroups   = 12,    // bounds over RUNS of clusters: the coarse level
+    kBindTriShade = 13,    // albedo and emission, read only for a winner
 };
 
 // The GPU triangle, mirroring MbgTri in shaders/common/scene.glsl.
@@ -89,9 +90,32 @@ struct GpuCluster {
     glm::vec4 hi;          // w: how many
 };
 
-struct GpuTri {
+// SPLIT, BECAUSE THE TRAVERSAL IS BANDWIDTH BOUND AND READS HALF OF IT.
+//
+// The inner loop fetches a triangle and asks whether a direction is inside it:
+// about 155 operations against 96 bytes, or 1.6 flops per byte, where an RTX
+// 3060 wants something nearer 36. It is nowhere close to compute bound -- and
+// two of those six vec4s, the albedo and the emission, are never read by the
+// traversal at all. They are shading data, wanted only once a winner is known.
+//
+// Interleaved they still cost bandwidth, because a cache line is 128 bytes and
+// this stride is 96: a line carries 1.3 triangles and a third of what it carries
+// is thrown away. Split, the geometry array strides 64 and a line carries two
+// triangles with nothing wasted. Total memory is unchanged -- the same six vec4s
+// live in two arrays instead of one.
+//
+// The plane normal stays with the positions rather than with the shading data,
+// because lv_tri_hit's half-space rule (finding 19) needs its SIGN -- the
+// outward direction, oriented against the shading normal when the winding
+// disagreed -- so it cannot be recovered from the positions alone. The
+// hemisphere could derive it from cross(p1-p0, p2-p0); the light view could not,
+// so it is stored once and both read it.
+struct GpuTriGeom {
     glm::vec4 p0, p1, p2;
     glm::vec4 n;           // w != 0: double-sided
+};
+
+struct GpuTriShade {
     glm::vec4 albedo;
     glm::vec4 emission;
 };
@@ -104,6 +128,7 @@ public:
     bool build(const std::vector<Tri>& tris);
     void bind() const {
         buf_.bind_base(kBindTris);
+        shade_.bind_base(kBindTriShade);
         emit_.bind_base(kBindEmitters);
         clusters_.bind_base(kBindClusters);
         groups_.bind_base(kBindGroups);
@@ -130,6 +155,7 @@ public:
 
 private:
     gl::Buffer buf_{gl::BufferType::shader, gl::BufferUsage::static_draw};
+    gl::Buffer shade_{gl::BufferType::shader, gl::BufferUsage::static_draw};
     gl::Buffer emit_{gl::BufferType::shader, gl::BufferUsage::static_draw};
     gl::Buffer clusters_{gl::BufferType::shader, gl::BufferUsage::static_draw};
     gl::Buffer groups_{gl::BufferType::shader, gl::BufferUsage::static_draw};
