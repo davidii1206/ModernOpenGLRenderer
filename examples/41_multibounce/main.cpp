@@ -195,6 +195,7 @@ EnvOpts read_env() {
     if (const char* v = getenv("MBG_BOUNCES"))  u32(v, o.cfg.bounces);
     if (const char* v = getenv("MBG_PATHS"))    u32(v, o.cfg.paths);
     if (const char* v = getenv("MBG_RR"))       o.cfg.rr = float(atof(v));
+    if (const char* v = getenv("MBG_ANYHIT"))   o.cfg.anyhit = atoi(v) != 0;
     if (const char* v = getenv("MBG_IMPORTANCE")) o.cfg.importance = atoi(v) != 0;
     if (const char* v = getenv("MBG_CULL"))     o.cfg.cull = atoi(v) != 0;
     if (const char* v = getenv("MBG_DIRECT_MASK")) o.cfg.direct_mask = atoi(v) != 0;

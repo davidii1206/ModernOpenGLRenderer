@@ -25,6 +25,10 @@ uniform uint  u_res;          // hemisphere target edge, texels
 // An ablation knob for the traversal ORDER, which is about how fast the
 // distance bound tightens rather than about what gets tested.
 uniform uint  u_order;        // 1 = visit groups nearest-first
+// 1 = the caller only needs to know WHETHER a direction is blocked, not by what.
+// See mbg_resolve_vis_coop: it turns the closest-hit search into an any-hit one,
+// which the existing distance bound then terminates almost immediately.
+uniform uint  u_anyhit;
 
 // The largest target any level may use. The default schedule needs 256, but the
 // buffer is sized for the cap so MBG_RES can be raised without a recompile --
@@ -184,6 +188,63 @@ uint mbg_group_at(uint gi) { return s_gsorted != 0u ? s_gord[gi] : gi; }
 // neighbourhood, so the winners have to be visible across the workgroup. What
 // goes away is the atomics -- each texel is written once, by the thread that
 // owns it.
+// --- Setup once per triangle, test once per direction -------------------------
+//
+// EVERYTHING THE CONE TEST DOES EXCEPT THREE DOT PRODUCTS IS INDEPENDENT OF THE
+// DIRECTION. The three edge planes cross(v_k, v_k+1), the triple product that
+// orients them, and the triangle's own plane depend only on the triangle and the
+// receiver -- and the cooperative traversal below asks the same triangle about
+// MBG_TEXELS_PER_THREAD directions in a row. Computing them inside that loop
+// does the work four times.
+//
+// Split apart, a triangle costs three crosses and a triple product ONCE, and
+// each direction costs four dot products and a divide. By operation count that
+// is about 155 against 268 per triangle at four texels.
+//
+// The arithmetic is unchanged and in the same order, so this is bit-identical to
+// the fused version by construction -- which is the point: it is a pure code
+// motion, and any measured difference would be a bug. (NVIDIA's compiler may
+// already hoist some of it out of a constant-trip unrolled loop; the split makes
+// it certain and costs nothing if it was already happening.)
+struct MbgTriSetup {
+    vec3  e0, e1, e2;      // the three edge planes through the receiver
+    vec3  pn;              // the triangle's plane normal
+    float pc;              // and its offset: t = pc / dot(pn, d)
+    float sgn;             // orientation; 0 = edge on, subtends nothing
+};
+
+MbgTriSetup mbg_tri_setup(MbgTri tr) {
+    vec3 v0 = tr.p0.xyz - g_P;
+    vec3 v1 = tr.p1.xyz - g_P;
+    vec3 v2 = tr.p2.xyz - g_P;
+
+    MbgTriSetup h;
+    h.e0 = cross(v0, v1);
+    h.e1 = cross(v1, v2);
+    h.e2 = cross(v2, v0);
+    float o = dot(h.e0, v2);
+    h.sgn = abs(o) < 1e-20 ? 0.0 : (o < 0.0 ? -1.0 : 1.0);
+    h.pn = tr.n.xyz;
+    h.pc = dot(h.pn, v0);
+    return h;
+}
+
+bool mbg_hit_dir(MbgTriSetup h, vec3 d, out float dist) {
+    if (h.sgn == 0.0) return false;
+    float b0 = dot(d, h.e0) * h.sgn;
+    float b1 = dot(d, h.e1) * h.sgn;
+    float b2 = dot(d, h.e2) * h.sgn;
+    float tol = -1e-6 * (abs(b0) + abs(b1) + abs(b2) + 1e-30);
+    if (b0 < tol || b1 < tol || b2 < tol) return false;
+
+    float den = dot(h.pn, d);
+    if (abs(den) < 1e-20) return false;
+    float t = h.pc / den;
+    if (t <= 0.0) return false;                  // behind the camera
+    dist = t;
+    return true;
+}
+
 bool mbg_tri_hit_tr(MbgTri tr, vec3 d, out float dist) {
     vec3 v0 = tr.p0.xyz - g_P;
     vec3 v1 = tr.p1.xyz - g_P;
@@ -248,6 +309,27 @@ bool mbg_tri_hit(uint ti, vec3 d, out float dist) {
 // the wrong shape for a hemisphere, where 256 texels look at everything.
 #define MBG_TEXELS_PER_THREAD 4
 
+// ANY-HIT AT THE TERMINAL LEVEL, AND WHY IT IS EXACT THERE.
+//
+// A camera that spawns no children uses this buffer for one thing: the
+// quadrature, which asks `key == MBG_EMPTY` and adds the sky, and otherwise adds
+// `tr.emission * q.w`. With MBG_NEE on, every emissive triangle carries
+// emission.w and the quadrature CONTINUES past it -- it is already counted
+// analytically -- and every other triangle has emission zero. So whichever
+// triangle is found, the contribution is exactly zero, and the only bit that
+// survives is whether one was found at all.
+//
+// Which makes the terminal hemisphere an occlusion query wearing a visibility
+// buffer's clothes. Finding the NEAREST blocker there is work whose result is
+// discarded. Stopping at the first turns the search from "scan until the bound
+// proves nothing nearer exists" into "stop", and the bound machinery already in
+// this loop does the rest for free: a finished texel sets its bound to zero, so
+// `worst` collapses and every remaining box fails its test in six operations.
+//
+// It is NOT exact at a level that spawns -- there the nearest hit is the hit
+// point a child camera is placed on -- and it is not exact with MBG_NEE off,
+// where the quadrature is how emitters are found in the first place. The host
+// sets u_anyhit only when both conditions hold.
 void mbg_resolve_vis_coop(uint tid, uint stride, uint group_count) {
     uint n = u_res * u_res;
     uint span = stride * MBG_TEXELS_PER_THREAD;
@@ -305,12 +387,20 @@ void mbg_resolve_vis_coop(uint tid, uint stride, uint group_count) {
                 for (uint t = first; t < last; ++t) {
                     // One fetch, broadcast across the workgroup, reused by every
                     // texel this thread owns.
-                    MbgTri tr = tris[t];
+                    // One fetch and ONE setup, reused by every texel this
+                    // thread owns -- see mbg_tri_setup.
+                    MbgTriSetup h = mbg_tri_setup(tris[t]);
                     for (uint k = 0u; k < MBG_TEXELS_PER_THREAD; ++k) {
+                        // A texel that already has its answer under any-hit is
+                        // done; its bound is zero, so the box tests above have
+                        // stopped bringing it work, and this catches the boxes
+                        // that contain the receiver and so score zero anyway.
+                        if (u_anyhit != 0u && best[k] != MBG_EMPTY) continue;
                         if (qd2 > bd[k] * bd[k]) continue;     // predicate, not a branch
                         float tt;
-                        if (!mbg_tri_hit_tr(tr, d[k], tt)) continue;
+                        if (!mbg_hit_dir(h, d[k], tt)) continue;
                         float dist = tt * len[k];
+                        if (u_anyhit != 0u) { bd[k] = 0.0; best[k] = t; continue; }
                         if (dist < bd[k]) { bd[k] = dist; best[k] = t; }
                     }
                 }
@@ -341,7 +431,9 @@ void mbg_resolve_vis(uint tid, uint stride, uint group_count, uint tri_count) {
             float bestt = 1e30;
             for (uint t = 0u; t < tri_count; ++t) {
                 float tt;
-                if (mbg_tri_hit(t, d, tt) && tt < bestt) { bestt = tt; best = t; }
+                if (!mbg_tri_hit(t, d, tt)) continue;
+                if (u_anyhit != 0u) { best = t; break; }
+                if (tt < bestt) { bestt = tt; best = t; }
             }
             s_vis[i] = best;
         }
@@ -385,10 +477,15 @@ void mbg_resolve_vis(uint tid, uint stride, uint group_count, uint tri_count) {
                 for (uint t = first; t < last; ++t) {
                     float tt;
                     if (!mbg_tri_hit(t, d, tt)) continue;
+                    // Any-hit: the bound goes to zero, so every remaining box
+                    // fails its test and the two loops above unwind themselves.
+                    if (u_anyhit != 0u) { best = t; bestdist = 0.0; break; }
                     float dist = tt * len_d;
                     if (dist < bestdist) { bestdist = dist; best = t; }
                 }
+                if (u_anyhit != 0u && best != MBG_EMPTY) break;
             }
+            if (u_anyhit != 0u && best != MBG_EMPTY) break;
         }
         s_vis[i] = best;
     }

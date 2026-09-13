@@ -273,6 +273,23 @@ void Solver::raster_level(uint32_t l, uint32_t count, const Scene& scene,
     // Roulette is a property of the path estimator; the tile estimator has no
     // single path to terminate, only a tile's worth of them at once.
     raster_.set("u_rr", cfg.paths ? std::max(0.0f, cfg.rr) : 0.0f);
+    // THE TERMINAL LEVEL ONLY NEEDS TO KNOW WHETHER A DIRECTION IS BLOCKED.
+    //
+    // Its visibility buffer feeds the quadrature and nothing else -- no spawn,
+    // no hit point -- and the quadrature adds the sky where a direction escapes
+    // and `emission * dOmega` where it does not. With `nee` on, every emissive
+    // triangle is analytic and the quadrature skips it, and every other triangle
+    // has emission zero, so the value found is worth exactly nothing and only
+    // its existence is read. A scene with no emissive triangles at all is the
+    // same case for the same reason.
+    //
+    // Neither holds at a level that spawns (the nearest hit is where the child
+    // camera goes) or with `nee` off (the quadrature is how emitters are found),
+    // and a dump is the oracle gate comparing this buffer against a CPU ray cast
+    // texel for texel, which wants the nearest. See raster.glsl.
+    const bool anyhit = cfg.anyhit && li.children == 0 && !dump &&
+                        (cfg.nee || scene.emitter_count() == 0);
+    raster_.set("u_anyhit", anyhit ? 1u : 0u);
     raster_.set("u_importance", cfg.importance ? 1u : 0u);
     raster_.set("u_bias", cfg.bias);
     raster_.set("u_inv_far", 1.0f / far);

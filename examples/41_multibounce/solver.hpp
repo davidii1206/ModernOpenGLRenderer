@@ -137,6 +137,10 @@ struct SolveConfig {
     // kMaxLevels safe -- without it, depth is unbounded work for energy that is
     // already below the tone curve's resolution.
     float     rr = 0.15f;
+    // Let the terminal level answer "is this direction blocked" instead of
+    // "by what" -- exact there, and the distance bound then terminates the
+    // search almost immediately. 0 ablates it. See raster.glsl.
+    bool      anyhit = true;
     // Draw the continuation direction from the micro-buffer's own radiance --
     // cos * dOmega * albedo * (unshadowed direct irradiance at the hit) --
     // rather than from cos * dOmega * albedo alone. The extra factor is the only
