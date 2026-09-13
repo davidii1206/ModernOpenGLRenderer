@@ -13,6 +13,7 @@
 #include "gbuffer.glsl"
 #include "brdf.glsl"
 #include "tonemap.glsl"
+#include "sky.glsl"
 
 in vec2 v_uv;
 out vec4 frag_color;
@@ -35,6 +36,7 @@ uniform int   u_tonemap;
 uniform mat4  u_inv_view_proj;
 uniform vec3  u_scene_min;
 uniform vec3  u_scene_extent;
+uniform vec3  u_eye;
 
 // Linear light -> what the monitor shows. The references are already tonemapped
 // by the path tracer, so this is the space the comparison has to happen in.
@@ -64,6 +66,16 @@ void main() {
     // L_out = L_e + albedo * E / PI, through the same helper the compute
     // kernels use -- see common/brdf.glsl.
     vec3 lit = sgi_outgoing(emi.rgb, alb.rgb, E);
+
+    // A pixel the G-buffer never covered is a camera ray that left the scene,
+    // which is the same event the secondary cameras call an empty texel -- so it
+    // reads the same dome, plus the sun's disc if it is looking at it. Without
+    // this the Cornell box's open side would still be black while every surface
+    // inside it was lit by a sky, which is the one way a correct sky can look
+    // broken. Costs one unprojection on background pixels and nothing anywhere
+    // else, and is exactly zero when no sky is configured.
+    if (alb.a <= 0.5)
+        lit = mbg_sky_lookup(world_from_depth(1.0, uv, u_inv_view_proj) - u_eye);
 
     // stb_image loads top-down and gfx::Texture does not flip, so the reference
     // arrives with its first row at v = 0. Flip to match our own framebuffer.

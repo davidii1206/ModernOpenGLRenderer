@@ -33,6 +33,7 @@
 #include "gpu_util.hpp"
 #include "scene.hpp"
 #include "screen.hpp"
+#include "sky.hpp"
 
 #include <array>
 
@@ -122,7 +123,11 @@ struct SolveConfig {
     bool      tent = true;
 
     float     bias = 1e-3f;        // camera offset along its own normal, world units
-    glm::vec3 sky{0.0f};           // radiance of an uncovered texel
+    // The environment: what an uncovered texel sees, and the one light in the
+    // scene that has no geometry. All zero by default, so every measurement in
+    // implementation.md and every gate reads exactly what it did before this
+    // existed. See sky.hpp and shaders/common/sky.glsl.
+    SkyLight  sky{};
     float     emissive = 1.0f;
     bool      two_sided = false;
     float     plane_tol = 0.05f;   // upsample plane cutoff, world units

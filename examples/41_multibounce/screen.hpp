@@ -16,6 +16,7 @@
 // ---------------------------------------------------------------------------
 
 #include "gpu_util.hpp"
+#include "sky.hpp"
 
 namespace mbg {
 
@@ -72,6 +73,8 @@ public:
         int   tonemap = 0;
         glm::mat4 inv_view_proj{1.0f};
         glm::vec3 scene_min{0.0f}, scene_extent{1.0f};
+        glm::vec3 eye{0.0f};
+        SkyLight  sky{};               // what a background pixel shows
     };
 
     bool init();

@@ -43,6 +43,16 @@
 // Every knob is an env var as well as an ImGui control, so a measurement can be
 // scripted. The ones that matter, with defaults:
 //
+//   MBG_DAYLIGHT=1          a sun and a sky dome through the box's open side;
+//                           off by default, so nothing above it changes
+//   MBG_SKY=f               constant radiance added in every direction
+//   MBG_SKY_ZENITH=f|r,g,b  the dome: straight up, at the horizon, and below it
+//   MBG_SKY_HORIZON=..      (MBG_DAYLIGHT sets all three; these override it)
+//   MBG_SKY_GROUND=..
+//   MBG_SKY_UP=x,y,z        world up for the dome's gradient; glTF is Y-up
+//   MBG_SUN=f|r,g,b         irradiance on a surface facing the sun
+//   MBG_SUN_DIR=x,y,z       toward the sun
+//   MBG_SUN_ANGLE=deg       the sun's angular RADIUS; larger is a softer shadow
 //   MBG_GATE=all            run the analytic gates and exit
 //   MBG_MODEL=path.glb      CornellBoxOriginal.glb; the references only match it
 //   MBG_BOUNCES=3           camera levels; 1 == direct only
@@ -139,6 +149,17 @@ struct EnvOpts {
     bool  paused = false;
 };
 
+// "0.4" -> (0.4, 0.4, 0.4); "0.4,0.5,0.6" -> the triple. One spelling for a grey
+// and one for a colour, because most of these knobs are set to a grey while
+// being measured and to a colour while being looked at.
+glm::vec3 parse_vec3(const char* v, const glm::vec3& fallback) {
+    float a = 0.0f, b = 0.0f, c = 0.0f;
+    int n = sscanf(v, "%f,%f,%f", &a, &b, &c);
+    if (n == 3) return glm::vec3(a, b, c);
+    if (n == 1) return glm::vec3(a);
+    return fallback;
+}
+
 EnvOpts read_env() {
     EnvOpts o;
     auto u32 = [](const char* v, uint32_t& dst) { dst = uint32_t(std::max(0, atoi(v))); };
@@ -155,7 +176,16 @@ EnvOpts read_env() {
     if (const char* v = getenv("MBG_BLOCK2"))   u32(v, o.cfg.block[1]);
     if (const char* v = getenv("MBG_BLOCK3"))   u32(v, o.cfg.block[2]);
     if (const char* v = getenv("MBG_BIAS"))     o.cfg.bias = float(atof(v));
-    if (const char* v = getenv("MBG_SKY"))      o.cfg.sky = glm::vec3(float(atof(v)));
+    // The preset first, so the individual knobs below can override any part of it.
+    if (const char* v = getenv("MBG_DAYLIGHT")) { if (atoi(v) != 0) o.cfg.sky = SkyLight::daylight(); }
+    if (const char* v = getenv("MBG_SKY"))      o.cfg.sky.ambient = parse_vec3(v, o.cfg.sky.ambient);
+    if (const char* v = getenv("MBG_SKY_ZENITH"))  o.cfg.sky.zenith  = parse_vec3(v, o.cfg.sky.zenith);
+    if (const char* v = getenv("MBG_SKY_HORIZON")) o.cfg.sky.horizon = parse_vec3(v, o.cfg.sky.horizon);
+    if (const char* v = getenv("MBG_SKY_GROUND"))  o.cfg.sky.ground  = parse_vec3(v, o.cfg.sky.ground);
+    if (const char* v = getenv("MBG_SKY_UP"))      o.cfg.sky.up      = parse_vec3(v, o.cfg.sky.up);
+    if (const char* v = getenv("MBG_SUN"))         o.cfg.sky.irradiance = parse_vec3(v, o.cfg.sky.irradiance);
+    if (const char* v = getenv("MBG_SUN_DIR"))     o.cfg.sky.dir     = parse_vec3(v, o.cfg.sky.dir);
+    if (const char* v = getenv("MBG_SUN_ANGLE"))   o.cfg.sky.angle   = float(atof(v));
     if (const char* v = getenv("MBG_EMISSIVE")) o.cfg.emissive = float(atof(v));
     if (const char* v = getenv("MBG_TWOSIDED")) o.cfg.two_sided = atoi(v) != 0;
     if (const char* v = getenv("MBG_NEE"))      o.cfg.nee = atoi(v) != 0;
@@ -558,6 +588,8 @@ int main() {
             dp.inv_view_proj = glm::inverse(view_proj);
             dp.scene_min = sb.mn;
             dp.scene_extent = glm::max(sb.extent(), glm::vec3(1e-4f));
+            dp.eye = cam.position();
+            dp.sky = cfg.sky;
             display.render(gbuf, solver.target(), refs, dp);
         }
 
@@ -606,10 +638,54 @@ int main() {
                 ImGui::Text("camera state %.1f MB", double(solver.bytes()) / (1024.0 * 1024.0));
             }
 
+            if (ImGui::CollapsingHeader("Sky & sun")) {
+                // Everything here restarts the sweep: the GI image persists
+                // across frames, so a changed environment leaves half of it
+                // solved under the old one until the cursor comes round.
+                bool touched = false;
+                if (ImGui::Button("Daylight")) { cfg.sky = SkyLight::daylight(); touched = true; }
+                ImGui::SameLine();
+                if (ImGui::Button("Off")) { cfg.sky = SkyLight{}; touched = true; }
+
+                touched |= ImGui::ColorEdit3("Zenith", &cfg.sky.zenith.x,
+                                             ImGuiColorEditFlags_Float | ImGuiColorEditFlags_HDR);
+                touched |= ImGui::ColorEdit3("Horizon", &cfg.sky.horizon.x,
+                                             ImGuiColorEditFlags_Float | ImGuiColorEditFlags_HDR);
+                touched |= ImGui::ColorEdit3("Ground", &cfg.sky.ground.x,
+                                             ImGuiColorEditFlags_Float | ImGuiColorEditFlags_HDR);
+                touched |= ImGui::SliderFloat("Ambient floor", &cfg.sky.ambient.x, 0.0f, 1.0f);
+                cfg.sky.ambient.y = cfg.sky.ambient.z = cfg.sky.ambient.x;
+
+                touched |= ImGui::ColorEdit3("Sun irradiance", &cfg.sky.irradiance.x,
+                                             ImGuiColorEditFlags_Float | ImGuiColorEditFlags_HDR);
+                touched |= ImGui::SliderFloat("Sun radius (deg)", &cfg.sky.angle, 0.1f, 10.0f);
+                // Azimuth and elevation rather than a raw vector: a direction is
+                // the one parameter here that is adjusted by looking at where
+                // the shadows land, and dragging three components to keep a unit
+                // vector on a sphere is not that.
+                {
+                    glm::vec3 d = glm::normalize(glm::length(cfg.sky.dir) > 1e-6f
+                                                 ? cfg.sky.dir : glm::vec3(0, 1, 0));
+                    float elev = glm::degrees(std::asin(std::clamp(d.y, -1.0f, 1.0f)));
+                    float azim = glm::degrees(std::atan2(d.x, d.z));
+                    bool moved = ImGui::SliderFloat("Sun elevation", &elev, -5.0f, 90.0f);
+                    moved |= ImGui::SliderFloat("Sun azimuth", &azim, -180.0f, 180.0f);
+                    if (moved) {
+                        const float e = glm::radians(elev), a = glm::radians(azim);
+                        cfg.sky.dir = glm::vec3(std::cos(e) * std::sin(a), std::sin(e),
+                                                std::cos(e) * std::cos(a));
+                        touched = true;
+                    }
+                }
+                ImGui::TextUnformatted(
+                    cfg.sky.has_sun()
+                        ? "sun: analytic magnitude, visibility off a rasterized cone"
+                        : "sun off -- its rasterization is skipped entirely");
+                if (touched) { solver.clear_image(); solver.restart(); }
+            }
+
             if (ImGui::CollapsingHeader("Transport", ImGuiTreeNodeFlags_DefaultOpen)) {
                 ImGui::SliderFloat("Emissive scale", &cfg.emissive, 0.0f, 8.0f);
-                ImGui::SliderFloat("Sky", &cfg.sky.x, 0.0f, 4.0f);
-                cfg.sky.y = cfg.sky.z = cfg.sky.x;
                 ImGui::SliderFloat("Camera bias", &cfg.bias, 0.0f,
                                    sb.diagonal() * 0.01f, "%.5f");
                 ImGui::SliderFloat("Upsample plane tol", &cfg.plane_tol, 0.0f,

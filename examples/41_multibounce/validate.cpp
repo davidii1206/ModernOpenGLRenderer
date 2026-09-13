@@ -191,6 +191,12 @@ bool run_gates(const std::string& names, Solver& solver, const SolveConfig& base
     // is what these assertions are about.
     SolveConfig base = base_in;
     base.jitter = false;
+    // Every assertion below is about the emitters and the geometry, and every
+    // one of them predicts an answer on the CPU from those alone. An environment
+    // adds energy none of those predictions account for, so it is cleared here
+    // rather than in each gate -- MBG_SKY=0.05 MBG_GATE=all used to be a way to
+    // fail a correct renderer.
+    base.sky = SkyLight{};
 
     // --- 1. The quadrature table --------------------------------------------
     //
@@ -222,7 +228,7 @@ bool run_gates(const std::string& names, Solver& solver, const SolveConfig& base
         SolveConfig cfg = base;
         cfg.bounces = 1;
         cfg.bias = 1e-4f;
-        cfg.sky = glm::vec3(0.0f);
+        cfg.sky = SkyLight{};
 
         std::vector<glm::vec4> pos, nrm;
         const glm::vec3 dirs[5] = {
@@ -284,7 +290,7 @@ bool run_gates(const std::string& names, Solver& solver, const SolveConfig& base
         SolveConfig cfg = base;
         cfg.bounces = 1;
         cfg.bias = 1e-4f;
-        cfg.sky = glm::vec3(0.0f);
+        cfg.sky = SkyLight{};
 
         const std::vector<glm::vec4> pos{{0.0f, 0.0f, 0.0f, 1.0f}};
         const std::vector<glm::vec4> nrm{{0.0f, 0.0f, 1.0f, 0.0f}};
@@ -350,7 +356,7 @@ bool run_gates(const std::string& names, Solver& solver, const SolveConfig& base
         SolveConfig cfg = base;
         cfg.bounces = 1;
         cfg.bias = 1e-4f;
-        cfg.sky = glm::vec3(0.0f);
+        cfg.sky = SkyLight{};
         const std::vector<glm::vec4> pos{{0.0f, 0.0f, 0.0f, 1.0f}};
         const std::vector<glm::vec4> nrm{{0.0f, 0.0f, 1.0f, 0.0f}};
         cfg.res[0] = 32;
@@ -489,7 +495,7 @@ bool run_gates(const std::string& names, Solver& solver, const SolveConfig& base
         SolveConfig cfg = base;
         cfg.bounces = 1;
         cfg.bias = 1e-4f;
-        cfg.sky = glm::vec3(0.0f);
+        cfg.sky = SkyLight{};
         const std::vector<glm::vec4> pos{{0.0f, 0.0f, 0.0f, 1.0f}};
         const std::vector<glm::vec4> nrm{{0.0f, 1.0f, 0.0f, 0.0f}};
 
@@ -572,7 +578,7 @@ bool run_gates(const std::string& names, Solver& solver, const SolveConfig& base
         s.build(make_box(1.0f, glm::vec3(float(p)), glm::vec3(float(L))));
         SolveConfig cfg = base;
         cfg.bias = 1e-4f;
-        cfg.sky = glm::vec3(0.0f);
+        cfg.sky = SkyLight{};
         // Overridable so the gate can be bisected against resolution and tile
         // size when it fails -- which is how the coplanar-emitter bug and the
         // grazing-hit bug below were both localized.

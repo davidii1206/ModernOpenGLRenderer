@@ -47,8 +47,14 @@ reload sees it.
 | `MBG_NEE=0\|1` | evaluate the direct term analytically instead of taking it from the raster (default 1). **The single most important setting for image quality**; see finding 2 |
 | `MBG_TENT=0\|1` | spread each texel's mass over the four nearest spawn tiles (default 1) |
 | `MBG_DIRECT_PIXEL=0\|1` | rasterize a hemisphere **per pixel** for the image's direct term instead of taking it from the GI grid (default 1); see finding 11 |
-| `MBG_DIRECT_RES=n` | edge of that pass's per-emitter light view (default 16); see finding 13 |
-| `MBG_SKY=f` | radiance of an uncovered texel. **0.05 is needed to reproduce the full-GI reference**; see finding 5 |
+| `MBG_DIRECT_RES=n` | edge of that pass's per-emitter light view (default 8); see finding 13 |
+| `MBG_SKY=f` | constant radiance added to every uncovered texel in every direction. **0.05 is needed to reproduce the full-GI reference**; see finding 5 |
+| `MBG_DAYLIGHT=1` | a sun and a sky dome through the box's open side. Off by default, so nothing above it changes; see finding 15 |
+| `MBG_SKY_ZENITH=` / `_HORIZON=` / `_GROUND=` | the dome, as `f` for a grey or `r,g,b` for a colour. Override whatever `MBG_DAYLIGHT` set |
+| `MBG_SKY_UP=x,y,z` | world up for the dome's gradient (default `0,1,0` — glTF is Y-up) |
+| `MBG_SUN=f\|r,g,b` | irradiance on a surface facing the sun. 0 skips the sun's rasterization entirely |
+| `MBG_SUN_DIR=x,y,z` | toward the sun |
+| `MBG_SUN_ANGLE=deg` | the sun's angular **radius**; larger is a softer shadow at no extra cost |
 | `MBG_EMISSIVE=f` | emissive scale |
 | `MBG_BIAS=f` | camera offset along its own normal, world units (default = 2.5e-4 × scene diagonal) |
 | `MBG_PLANE=f` | upsample plane cutoff, world units (default = 0.01 × scene diagonal) |
@@ -84,6 +90,7 @@ reload sees it.
 | 7 | Variant B: object-space cache, temporal feedback | ⬜ a separate example; this is what validates it |
 | 8.2 §1, §3 | Analytic integration gates, rasterizer vs oracle | ✅ 21 assertions, all passing |
 | 8.2 §6 | Variant A end to end, producing reference images | ✅ |
+| — | Sky dome and sun (not in the doc; the doc's scene is closed) | ✅ dome from the empty texels, sun analytic with a rasterized cone — finding 15 |
 
 ## Layout
 
@@ -93,6 +100,7 @@ reload sees it.
 | `scene.hpp/.cpp` | triangle extraction, the GPU triangle soup, the quadrature table |
 | `solver.hpp/.cpp` | the recursive camera schedule: allocation, chunking, dispatch, the gate entry points |
 | `screen.hpp/.cpp` | G-buffer, geometry pass, references, display — adapted from example 40 |
+| `sky.hpp` | the sun and the dome: one struct, one `bind()`, the `MBG_DAYLIGHT` preset |
 | `validate.hpp/.cpp` | the analytic gates |
 | `gpu_util.hpp/.cpp` | `PassTimer`, `Pipeline`, camera control — copied from example 40 unchanged |
 
@@ -103,8 +111,9 @@ term, per pixel), plus the G-buffer and display raster pairs. `shaders/common/`
 carries `hemi.glsl` (the map, the clipper, the packed key), `raster.glsl` (the
 hemisphere rasterizer and its visibility ratio, shared by every pass that needs
 to know what a point can see), `lightview.glsl` (the per-emitter frustum and its
-rasterizer), `emitter.glsl` (the analytic magnitude, shared by both direct paths
-so they cannot drift), `scene.glsl` (structs, bindings, ONB), and `oct.glsl`,
+rasterizer, and the sun's cone), `emitter.glsl` (the analytic magnitude, shared
+by both direct paths so they cannot drift), `sky.glsl` (the dome's gradient and
+the sun's analytic irradiance), `scene.glsl` (structs, bindings, ONB), and `oct.glsl`,
 `gbuffer.glsl`, `brdf.glsl`, `tonemap.glsl` from example 40 — `tonemap.glsl` with
 an AgX curve added (finding 10).
 
@@ -212,13 +221,18 @@ thing to scale.
 
 ### The default configuration
 
-`MBG_BOUNCES=3`, `MBG_SCALE=4` (GI 128×128), targets 32/8/8, tiles 8/4, analytic
-direct with 16 visibility samples, tent weights on.
+`MBG_BOUNCES=3`, `MBG_SCALE=4` (GI 128×128), targets 16/8/8, tiles 4/4, analytic
+direct with an 8×8 light view per pixel, jitter + denoise on, tent weights on,
+no environment.
 
 | | RMSE | roughness vs reference | cameras/sweep | sweep |
 |---|---|---|---|---|
-| 1 bounce vs the direct reference | **0.0430** | 0.91× | 1.6e4 + 262k direct | 0.5 s + 15.6 s direct |
-| 3 bounces vs the full-GI reference (sky 0.05) | **0.0532** | 0.82× | 1.3e6 + 262k direct | 37 s + 15.6 s direct |
+| 1 bounce vs the direct reference | **0.0431** | 0.91× | 1.6e4 + 262k direct | 0.7 s + 6.8 s direct |
+| 3 bounces vs the full-GI reference (sky 0.05) | **0.0404** | 0.81× | 1.3e6 + 262k direct | 48 s + 7.0 s direct |
+
+Both moved with finding 16 (the light view now clips to its own frustum): the
+full-GI number was **0.0532** before it and the per-frame direct pass was
+**15.6 s**. Every table below this one that predates it is marked.
 
 ### Where the time goes
 
@@ -231,8 +245,16 @@ numbers**; the camera and texel counts are what scale.
 | indirect, 1 bounce | 0.55 s | 1.6e4 cameras, 4.2e6 texels |
 | indirect, 2 bounces | 8.0 s | 2.8e5 cameras, 2.1e7 texels |
 | **indirect, 3 bounces** | **37 s** | 1.3e6 cameras, 8.8e7 texels, 4.2e7 triangle-rasters |
-| direct, per frame | 15.6 s | 262k fitted light views |
+| direct, per frame | 7.0 s | 262k fitted light views |
+| direct, per frame, **with the sun** | 8.0 s | + 262k cone views, one rasterization each |
 | everything else per frame | 13 ms | G-buffer, denoise, upsample, display |
+
+The sun costs **15%** of the per-pixel direct pass, for one more light view per
+pixel against the emitter's two rasterizations — and buys a light whose shadow is
+resolved per pixel. `MBG_DAYLIGHT=1` raises a three-bounce sweep from 48 s to
+49 s: the secondary cameras' cone view is 8×8 and is skipped outright on every
+receiver facing away from the sun, which in a box lit through one aperture is
+most of them.
 
 The indirect is per SWEEP and the sweep is four chunks, so a frame in steady
 state is about 9 s of solve plus 15.6 s of direct. Two things follow: the
@@ -760,6 +782,10 @@ With both, the target resolution stops mattering:
 | 32×32 | 0.0533 | 0.88× | 0.82× | 38 s |
 | 64×64 | 0.0532 | 0.88× | 0.82× | 43 s |
 
+*(measured before finding 16; the same configuration now reads 0.0404 / 0.88× /
+0.81× / 48 s. The comparison between rows is unaffected — the change is in the
+direct pass, which is identical in all three.)*
+
 So the default went to **16×16** — half the doc's near tier and a sixteenth of
 the directions this example briefly thought it needed. The ceiling, which is lit
 entirely by bounce and was the worst surface in the image at **1.88×** the
@@ -769,6 +795,106 @@ doing its job and the honest cost of it.
 The remaining lever is the one §6.2 predicts. Raising level 2 from 8×8 to 24×24
 moves the ceiling from 1.30× to 1.12× for **6× the sweep** and 0.0001 of RMSE —
 deep bounces are low frequency and do not want the resolution.
+
+### 15. A sky is what the visibility buffer already says; a sun is not
+
+The Cornell box has an open +z side, so adding an environment needs no new scene
+and it turns out to need almost no new machinery either — but the two halves of
+"sky and sunlight" land on opposite sides of this renderer's one design rule.
+
+**The dome is free, and that is the interesting part.** A secondary camera's
+hemisphere is a visibility buffer; a texel no triangle reached is a texel that
+sees the sky. `raster.comp`'s quadrature loop already visits every one of them,
+already knows the direction, and already has the cosine-weighted solid angle in
+`quad[]`. The whole feature is replacing a constant with `mbg_sky_dome(dir)`.
+Sky occlusion therefore comes out exactly as correct as the rasterizer is, which
+is the same guarantee every bounce already has — no cone tracing, no AO term, no
+second structure, and no ray. The Cornell box's open side is a hole in the
+geometry and the renderer treats it as one.
+
+**The sun cannot work that way, for the reason the panel could not.** A disc of
+1.2° covers 5×10⁻⁴ of a hemisphere; a 16×16 target has 256 texels, so the sun is
+a fifth of a texel and a quadrature would find it in one camera out of five and
+miss it in the rest. That is finding 2 again, one order of magnitude worse. So
+the sun takes the same split as the emitters:
+
+| | magnitude | visibility |
+|---|---|---|
+| emitter | Lambert's formula, exact | ratio of two rasterizations of a fitted frustum |
+| **sun** | `L·Ω·cos θ`, exact | fraction of a rasterized **cone** that nothing reached |
+
+and it is *cheaper* than the emitter's, because a light at infinity has nothing
+behind it. There is no emitter pass to divide by: a texel of the disc is lit
+exactly when nothing was written into it. It also needs no bias and cannot
+self-shadow numerically, because there is no depth comparison at all — the
+receiver's own triangle is removed by the receiver-plane cull before a key is
+ever packed, and after that, presence is the entire test.
+
+The split between the passes follows finding 11 without modification. The sun is
+a direct term, so it goes per **pixel** (`direct_pixel.comp`) where its shadow
+boundary is the sharpest thing in the image, and it is subtracted out of the GI
+grid by `u_split` exactly as the panel is. The dome is a hemisphere integral, so
+it stays on the GI grid: a per-pixel version would be a second copy of the same
+integral at forty times the cost, for a term smooth enough that a 4×4 block
+resolves it. That division — one direction goes per pixel, the whole hemisphere
+goes on the grid — is the same one the emitters already forced, and getting a sky
+and a sun for free out of it is the strongest evidence so far that the split is
+the right one rather than a Cornell-shaped convenience.
+
+Cost: **+15%** on the per-pixel direct pass, **+1 s on a 48 s** three-bounce
+sweep. `MBG_DAYLIGHT=1`, and `renders/06_daylight_3bounce.png`.
+
+Two things are deliberately approximate and both are recorded in
+`shaders/common/sky.glsl`. The cosine is clamped rather than integrated over the
+part of the disc above the horizon, which is wrong by O(α²) ≈ 3×10⁻⁴ of the sun's
+own irradiance and only within a degree of the terminator. And the dome is a
+three-colour gradient rather than Preetham or Hosek — this example measures
+transport, and all the transport needs from a dome is that its radiance vary with
+direction.
+
+### 16. The light view has to clip to its own frustum, and it was costing 2× and 0.013 RMSE
+
+Found while building the sun, because the sun is the case that breaks loudly.
+
+`lv_raster_tri` projected every triangle into the light view and then clamped the
+resulting bounding box to the target. For a triangle *outside* the frustum that
+still works — the clamp collapses it to one texel column and the edge functions
+reject it — but the pixel coordinates it produces are as large as the ratio
+between the triangle's angular extent and the frustum's. For an emitter that
+ratio is single digits. For the **sun's cone** it is several thousand: a Cornell
+wall lands at pixel coordinates of order 10⁴ on an 8×8 buffer.
+
+Two things break there at once, and the second one was already happening on the
+emitters:
+
+- float32 edge functions built from products of 10⁴-scale coordinates carry
+  absolute noise comparable to `lv_fill`'s tolerance;
+- that tolerance is `1e-5 × |area2|`, i.e. a fixed fraction of the triangle's own
+  area, so a triangle projected 10³× too large is dilated by a fraction of a
+  texel. The occluder comes out slightly bigger than it is.
+
+Clipping the polygon against the frustum's four side planes first bounds every
+coordinate by construction. The side planes of a perspective frustum all pass
+through the receiver, so they are great circles in direction space and
+`mbg_clip_plane` takes them unchanged — 4 more Sutherland-Hodgman passes, and
+`MBG_CLIP_MAX` from 8 to 10 to hold the result.
+
+It is not only a correctness fix. The bounding box no longer has to be clamped
+down from thousands of texels, so the rasterizer stops iterating texels it will
+reject:
+
+| | per-frame direct pass | full-GI RMSE | 1-bounce RMSE |
+|---|---|---|---|
+| bounding box clamped | 15.6 s | 0.0532 | 0.0430 |
+| **clipped to the frustum** | **7.0 s** | **0.0404** | 0.0431 |
+
+Half the time and a fifth off the error, from a bug that produced no visible
+artifact — the dilation is sub-texel and it widens *every* occluder by the same
+relative amount, so it reads as a uniformly slightly-darker room rather than as
+anything wrong. The 31 gates did not catch it either: every one of them is either
+unoccluded or fully occluded, and a fractional penumbra error has nowhere to show
+up in a binary answer. What caught it was a light small enough to make the same
+mistake three orders of magnitude bigger.
 
 ## What this does not answer
 

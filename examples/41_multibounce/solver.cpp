@@ -232,7 +232,7 @@ void Solver::raster_level(uint32_t l, uint32_t count, const Scene& scene,
     raster_.set("u_block", li.block);
     raster_.set("u_bias", cfg.bias);
     raster_.set("u_inv_far", 1.0f / far);
-    raster_.set("u_sky", cfg.sky);
+    cfg.sky.bind(raster_);
     raster_.set("u_emissive", cfg.emissive);
     raster_.set("u_two_sided", cfg.two_sided ? 1u : 0u);
     raster_.set("u_dump", dump ? dump_mode_ : 0u);
@@ -249,7 +249,11 @@ void Solver::run_levels(uint32_t chunk, const Scene& scene, const SolveConfig& c
     // The GI image carries the residual whenever the direct term is not coming
     // from it -- because a per-pixel pass will add it back, or because
     // indirect_only wants it left out altogether.
-    const bool split = write_image && cfg.nee && scene.emitter_count() > 0 &&
+    // The sun counts as an analytic direct term whether or not the emitter list
+    // does: it has no geometry, so there is no quadrature path it could take
+    // instead, and MBG_NEE only decides how the EMITTERS are found.
+    const bool analytic = (cfg.nee && scene.emitter_count() > 0) || cfg.sky.has_sun();
+    const bool split = write_image && analytic &&
                        (cfg.direct_pixel || cfg.indirect_only);
     // Rasterize shallowest first: a level's cameras are spawned by the level
     // above it, so level l+1's camera buffer is written by level l's raster.
@@ -344,8 +348,9 @@ std::vector<uint32_t> Solver::raster_visibility(const Scene& scene, const SolveC
 
 void Solver::direct_pixel(const GBuffer& gb, const gfx::Camera& cam, const Scene& scene,
                           const SolveConfig& cfg) {
-    if (!allocated_ || !direct_px_.valid() || !cfg.direct_pixel || !cfg.nee ||
-        cfg.indirect_only || scene.emitter_count() == 0) {
+    const bool analytic = (cfg.nee && scene.emitter_count() > 0) || cfg.sky.has_sun();
+    if (!allocated_ || !direct_px_.valid() || !cfg.direct_pixel ||
+        cfg.indirect_only || !analytic) {
         t_direct_.skip();
         return;
     }
@@ -367,7 +372,8 @@ void Solver::direct_pixel(const GBuffer& gb, const gfx::Camera& cam, const Scene
     direct_px_.set("u_size", glm::ivec2(gb.width, gb.height));
     direct_px_.set("u_inv_view_proj", glm::inverse(cam.view_projection()));
     direct_px_.set("u_tri_count", scene.count());
-    direct_px_.set("u_emitters", scene.emitter_count());
+    direct_px_.set("u_emitters", cfg.nee ? scene.emitter_count() : 0u);
+    cfg.sky.bind(direct_px_);
     direct_px_.set("u_lv_res", res);
     direct_px_.set("u_inv_far", 1.0f / std::max(1e-4f, scene.bounds().diagonal() * 1.5f));
     direct_px_.set("u_two_sided", cfg.two_sided ? 1u : 0u);

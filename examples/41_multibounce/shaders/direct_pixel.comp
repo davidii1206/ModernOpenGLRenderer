@@ -42,6 +42,7 @@ layout(local_size_x = 64) in;
 #include "lightview.glsl"
 #include "raster.glsl"
 #include "gbuffer.glsl"
+#include "sky.glsl"
 
 layout(std430, binding = 8) readonly buffer MbgEmit { uint emitters[]; };
 
@@ -65,7 +66,7 @@ shared vec4 s_lvred[64];
 void main() {
     uint pix = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
     uint tid = gl_LocalInvocationID.x;
-    if (pix >= uint(u_size.x * u_size.y) || u_emitters == 0u) return;
+    if (pix >= uint(u_size.x * u_size.y)) return;
 
     ivec2 p = ivec2(int(pix) % u_size.x, int(pix) / u_size.x);
     if (texelFetch(u_albedo, p, 0).a <= 0.5) return;
@@ -127,6 +128,41 @@ void main() {
             E += mag;
         }
         barrier();
+    }
+
+    // --- The sun ---------------------------------------------------------------
+    //
+    // Per pixel for the same reason the emitters are: it is a direct term, so it
+    // carries the sharpest shadow boundaries in the image and the GI grid's
+    // 4x4 blocks cannot resolve them. Aimed at the disc, one rasterization, no
+    // denominator -- see common/sky.glsl.
+    //
+    // THE SKY IS NOT HERE, and that is not an omission. Sky visibility is an
+    // integral over the whole hemisphere, which is precisely what the secondary
+    // cameras already rasterize; a per-pixel version would be a second copy of
+    // the same integral at forty times the cost, for a term that is smooth
+    // enough that the GI grid resolves it. The sun is the opposite -- one
+    // direction, hard-edged -- which is why it is the half that moved here.
+    vec3 sun_mag = mbg_sun_unshadowed(N);
+    if (dot(sun_mag, vec3(1.0)) > 0.0) {
+        lv_setup_dir(P, N, u_sun_dir, u_sun_tan_r, lv_near_for(u_inv_far));
+        for (uint i = tid; i < texels; i += 64u) s_lv[i] = MBG_EMPTY;
+        barrier();
+        memoryBarrierShared();
+        for (uint t = tid; t < u_tri_count; t += 64u)
+            lv_raster_tri(t, u_lv_res, u_inv_far, false);
+        barrier();
+        memoryBarrierShared();
+
+        s_lvred[tid] = vec4(lv_mass_disc(u_lv_res, N, u_sun_cos_r, tid, texels, 64u),
+                            0.0, 0.0);
+        barrier();
+        for (uint r = 32u; r > 0u; r >>= 1u) {
+            if (tid < r) s_lvred[tid] += s_lvred[tid + r];
+            barrier();
+        }
+        vec2 m = s_lvred[0].xy;
+        E += sun_mag * (m.y > 1e-12 ? clamp(m.x / m.y, 0.0, 1.0) : 1.0);
     }
 
     if (tid == 0u) {

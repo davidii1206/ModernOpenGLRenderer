@@ -37,6 +37,7 @@ layout(local_size_x = 64) in;
 #include "raster.glsl"
 #include "emitter.glsl"
 #include "lightview.glsl"
+#include "sky.glsl"
 
 layout(std430, binding = 1) readonly  buffer MbgCams     { MbgCam cams[]; };
 layout(std430, binding = 3) writeonly buffer MbgIrrad    { vec4   irradiance[]; };
@@ -54,7 +55,6 @@ uniform uint  u_cam_count;
 uniform uint  u_tri_count;
 uniform uint  u_block;        // spawn block edge; 0 = terminal level, no children
 uniform float u_bias;         // camera offset along its own normal, world units
-uniform vec3  u_sky;          // radiance of an uncovered texel
 uniform float u_emissive;     // emissive scale
 uniform uint  u_two_sided;    // force every triangle to emit from both faces
 uniform uint  u_dump;         // 1 = dump visibility keys, 2 = dump per-texel direct
@@ -124,7 +124,7 @@ void main() {
                 if (abs(hden) > 1e-12) {
                     vec3 hp = g_P + hdir * (dot(ht.n.xyz, ht.p0.xyz - g_P) / hden);
                     vec3 hn = hden < 0.0 ? ht.n.xyz : -ht.n.xyz;
-                    vec3 e = vec3(0.0);
+                    vec3 e = mbg_sun_unshadowed(hn);
                     for (uint em = 0u; em < u_emitters; ++em)
                         e += mbg_emitter_unshadowed(hp, hn, tris[emitters[em]],
                                                     u_two_sided != 0u, 2.0 * u_bias,
@@ -147,7 +147,10 @@ void main() {
     for (uint i = tid; i < texels; i += 64u) {
         uint key = s_vis[i];
         vec4 q = quad[i];
-        if (key == MBG_EMPTY) { acc += u_sky * q.w; continue; }
+        // NOTHING IN THIS DIRECTION IS THE SKY. The visibility buffer already
+        // answered the only question a sky needs answered; all that is left is
+        // to ask the dome what colour it is (common/sky.glsl).
+        if (key == MBG_EMPTY) { acc += mbg_sky_dome(mbg_to_world(q.xyz)) * q.w; continue; }
         MbgTri tr = tris[mbg_key_tri(key)];
         // emission.w marks a triangle whose direct term is added analytically
         // below; taking it from the quadrature as well would double it.
@@ -212,6 +215,39 @@ void main() {
         }
         barrier();
     }
+    // --- The sun --------------------------------------------------------------
+    //
+    // The same two halves as an emitter -- exact magnitude, rasterized
+    // visibility -- with the frustum aimed at the disc instead of fitted to a
+    // triangle, and with no emitter pass to divide by (common/sky.glsl explains
+    // why a light at infinity needs only one rasterization). The test below is
+    // workgroup uniform: it depends on the receiver's normal and on uniforms,
+    // both identical in every invocation, so the barriers inside cannot split.
+    vec3 sun_mag = mbg_sun_unshadowed(g_N);
+    if (dot(sun_mag, vec3(1.0)) > 0.0) {
+        uint lvt = u_lv_res * u_lv_res;
+        lv_setup_dir(g_P, g_N, u_sun_dir, u_sun_tan_r, lv_near_for(u_inv_far));
+        for (uint i = tid; i < lvt; i += 64u) s_lv[i] = MBG_EMPTY;
+        barrier();
+        memoryBarrierShared();
+        for (uint t = tid; t < u_tri_count; t += 64u)
+            lv_raster_tri(t, u_lv_res, u_inv_far, false);
+        barrier();
+        memoryBarrierShared();
+
+        s_red2[tid] = vec4(lv_mass_disc(u_lv_res, g_N, u_sun_cos_r, tid, lvt, 64u),
+                           0.0, 0.0);
+        barrier();
+        for (uint r = 32u; r > 0u; r >>= 1u) {
+            if (tid < r) s_red2[tid] += s_red2[tid + r];
+            barrier();
+        }
+        vec2 m = s_red2[0].xy;
+        direct += sun_mag * (m.y > 1e-12 ? clamp(m.x / m.y, 0.0, 1.0) : 1.0);
+        unshadowed += dot(sun_mag, vec3(1.0));
+        barrier();
+    }
+
     if (tid == 0u) acc += direct;
 
     // Only `acc` is per-thread and needs reducing. `direct` and `unshadowed`
@@ -341,10 +377,12 @@ void main() {
                 // divide and it is exact.
                 vec3 hdir = mbg_to_world(quad[idx].xyz);
                 float hden = dot(ht.n.xyz, hdir);
-                if (abs(hden) > 1e-12 && u_emitters != 0u) {
+                if (abs(hden) > 1e-12) {
                     vec3 hp = g_P + hdir * (dot(ht.n.xyz, ht.p0.xyz - g_P) / hden);
                     vec3 hn = hden < 0.0 ? ht.n.xyz : -ht.n.xyz;
-                    vec3 e_dir = vec3(0.0);
+                    // The sun is analytic whether or not the emitter list is
+                    // in use, so it is part of M_dir even at MBG_NEE=0.
+                    vec3 e_dir = mbg_sun_unshadowed(hn);
                     for (uint em = 0u; em < u_emitters; ++em)
                         e_dir += mbg_emitter_unshadowed(hp, hn, tris[emitters[em]],
                                                         u_two_sided != 0u, 2.0 * u_bias,

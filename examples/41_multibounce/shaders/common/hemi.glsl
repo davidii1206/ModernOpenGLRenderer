@@ -75,9 +75,13 @@ vec2 mbg_square_to_px(vec2 e, uint res) { return (e * 0.5 + 0.5) * float(res); }
 // Sutherland-Hodgman needs no homogeneous coordinates: the origin is the centre
 // of projection, so a plane through it is a great circle in direction space.
 //
-// MBG_CLIP_MAX is 8: a triangle is 3, the horizon clip adds at most one vertex,
-// and each of the two fold clips adds at most one more.
-#define MBG_CLIP_MAX 8
+// MBG_CLIP_MAX is 10. The hemisphere rasterizer needs 6 (a triangle is 3, the
+// horizon clip adds at most one vertex, and each of the two fold clips adds one
+// more). The light view needs 8: its near plane adds one and its four side
+// planes add one each. 10 leaves two vertices of headroom, which costs two
+// vec3s of stack and removes the question of whether a clip that lands exactly
+// on a plane can ever emit a duplicate and overrun.
+#define MBG_CLIP_MAX 10
 
 int mbg_clip_plane(vec3 src[MBG_CLIP_MAX], int n, vec3 pn, out vec3 dst[MBG_CLIP_MAX]) {
     int m = 0;

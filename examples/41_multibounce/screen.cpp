@@ -197,6 +197,8 @@ void DisplayPass::render(const GBuffer& gb, const gl::Texture& recon,
     prog_.set("u_inv_view_proj", p.inv_view_proj);
     prog_.set("u_scene_min", p.scene_min);
     prog_.set("u_scene_extent", p.scene_extent);
+    prog_.set("u_eye", p.eye);
+    p.sky.bind(prog_);
 
     glBindVertexArray(empty_vao_);
     gl::draw_arrays(GL_TRIANGLES, 0, 3);
