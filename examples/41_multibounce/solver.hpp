@@ -53,7 +53,18 @@ constexpr uint32_t kMaxLevels = 3;
 
 struct SolveConfig {
     uint32_t bounces = 3;          // camera levels; 1 == direct only
-    uint32_t scale   = 4;          // GI grid = framebuffer / scale
+    // GI grid = framebuffer / scale.
+    //
+    // 3, not 4, and the reason is finding 21: this is the knob that resolves a
+    // CREASE. The contact darkening where two surfaces meet is two or three
+    // pixels wide, so at scale 4 the grid's nearest sample to a corner sits at a
+    // block centre two pixels away and the upsample has nothing closer to
+    // interpolate toward -- it clamps, and the ceiling/wall line comes out as a
+    // flat shelf and then a cliff where a path trace shows a smooth ramp.
+    // Nothing downstream can recover it; the feature is below the grid's
+    // Nyquist. Measured with the denoise switched off entirely, the shelf is
+    // WIDER, which is what rules the denoise out as the cause.
+    uint32_t scale   = 3;
     uint32_t budget  = 4096;       // level-1 cameras per frame
 
     // The resolution ladder of section 6.2 / 4.1: near cameras get the
@@ -101,24 +112,23 @@ struct SolveConfig {
     // representative's visibility. That one is deterministic, which is why every
     // gate runs on it, and it is the doc's variant A as written.
     //
-    // 40, which is not a round number and is not meant to be: at the three-bounce
-    // cap it is the split that costs EXACTLY what the branching tree costs. The
-    // tree spawns 16 then 4, so a primary hit carries 1 + 16 + 64 = 81 cameras;
-    // a path split of S carries 1 + 2S, and 1 + 2*40 = 81. Same cameras, same
-    // texels, same triangle-rasters, to the unit.
+    // 20, because PATHS SATURATE AND GRID PIXELS DO NOT (finding 21). At scale 3,
+    // 20 paths and 32 paths score the same RMSE to four digits and the same
+    // whole-image noise, for 58% more cameras -- the hemisphere is adequately
+    // sampled well before 20 and everything past it is spent on a quantity that
+    // has stopped moving. Grid resolution has not stopped moving, because it is
+    // what resolves creases, so the budget goes there instead.
     //
-    // Which is the comparison worth defaulting on, because at equal cost the
-    // path estimator wins on every axis that is not a tie (implementation.md,
-    // finding 20): RMSE 0.0402 against 0.0407, ceiling roughness 0.95 against
-    // 0.91, wall clock 51.4 s against 52.5 s -- and it is unbiased, where the
-    // tree's tile clustering is an approximation that more samples do not
-    // remove. The cap took the exponential argument away; this is what is left,
-    // and it still points the same way.
+    // Together with scale 3 that is 1.20e6 cameras a sweep against the 1.33e6
+    // the old scale-4/40-path default used: fewer cameras, RMSE 0.0375 against
+    // 0.0402, and a crease profile that matches the path-traced reference.
     //
-    // Raise kMaxLevels and this number stops meaning anything special -- the
-    // equal-cost split at four bounces is 168, at five 680 -- so treat it as the
-    // three-bounce answer rather than a constant.
-    uint32_t  paths = 40;
+    // 41 is also, coincidentally, close to the split that costs exactly what the
+    // branching tree costs at this depth (the tree carries 1 + 16 + 64 = 81
+    // cameras per primary hit, a split of S carries 1 + 2S, so S = 40 ties at
+    // scale 4). That comparison is in finding 20 and still runs with
+    // MBG_SCALE=4 MBG_PATHS=40 MBG_PATHS=0; it is not what this default is for.
+    uint32_t  paths = 20;
     // Russian roulette threshold on the path throughput (the running product of
     // what each bounce reflects, near enough). Below it a path survives with
     // probability throughput/threshold and is divided by that probability, so
