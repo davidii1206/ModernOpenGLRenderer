@@ -209,6 +209,76 @@ vec3 lv_px_to_dir(vec2 px, uint res) {
 
 // Does triangle `ti` cover direction `d` from lv_P, and at what packed depth?
 // MBG_EMPTY when it does not. `d` need not be normalized.
+// --- Culling ----------------------------------------------------------------
+//
+// THE CULL HAS TO LIVE OUTSIDE THE TEXEL LOOP, which is the only subtle part.
+// Inverting the rasterizer put texels on the outside and triangles on the
+// inside, so a cull evaluated where the triangles are would be paid once per
+// texel -- 4098 cluster tests times 64 texels, which is worse than not culling.
+// The frustum is a property of the light view, not of the texel, so it is
+// evaluated ONCE per view by the whole workgroup, and the survivors go in a
+// shared list the texel loop then walks.
+//
+// This is why the inversion matters beyond its own speedup: the loop order it
+// produced is the one culling attaches to.
+uniform uint u_cull;          // 0 = walk every cluster, for ablation
+
+#define MBG_MAX_VIS_CLUSTERS 256
+shared uint s_cl[MBG_MAX_VIS_CLUSTERS];
+shared uint s_cl_n;
+shared uint s_cl_overflow;
+
+// Is the box (relative to lv_P) anywhere inside the view's frustum?
+//
+// Six half-spaces: the four sides pass through the receiver so their offset is
+// zero, plus near and far along lv_F. For a box, the extreme of dot(n, x) is
+// dot(n, centre) +- dot(|n|, half-extent), which is why no corner is enumerated.
+// The receiver's own plane is a seventh: anything entirely behind it cannot be
+// between the receiver and anything else.
+bool lv_aabb_visible(vec3 c, vec3 e) {
+    vec2 hi2 = lv_lo + lv_span;
+    vec3 n;
+    n = lv_R - lv_lo.x * lv_F;   if (dot(n, c) + dot(abs(n), e) < 0.0) return false;
+    n = hi2.x * lv_F - lv_R;     if (dot(n, c) + dot(abs(n), e) < 0.0) return false;
+    n = lv_U - lv_lo.y * lv_F;   if (dot(n, c) + dot(abs(n), e) < 0.0) return false;
+    n = hi2.y * lv_F - lv_U;     if (dot(n, c) + dot(abs(n), e) < 0.0) return false;
+    float wc = dot(lv_F, c), we = dot(abs(lv_F), e);
+    if (wc + we < lv_near)  return false;              // entirely behind the view
+    if (wc - we > lv_wmax)  return false;              // entirely beyond the light
+    if (dot(lv_N, c) + dot(abs(lv_N), e) < 0.0) return false;   // behind the receiver
+    return true;
+}
+
+// Build the surviving-cluster list for the frustum lv_setup just established.
+// Overflow is not an error: the list is abandoned and the texel loop walks
+// everything, which is slower but exactly as correct.
+void lv_cull(uint tid, uint stride, uint cluster_count) {
+    // Below a handful of clusters the cull cannot pay for its own barriers, and
+    // saying so costs one branch. Cornell is 32 triangles -- a SINGLE cluster --
+    // and culling it made the sweep 1.8x slower before this early-out existed.
+    if (u_cull == 0u || cluster_count <= 8u) {
+        if (tid == 0u) { s_cl_n = 0u; s_cl_overflow = 1u; }
+        barrier();
+        return;
+    }
+    if (tid == 0u) { s_cl_n = 0u; s_cl_overflow = 0u; }
+    barrier();
+    for (uint c = tid; c < cluster_count; c += stride) {
+        vec3 lo = clusters[c].lo.xyz - lv_P;
+        vec3 hi = clusters[c].hi.xyz - lv_P;
+        if (!lv_aabb_visible((lo + hi) * 0.5, (hi - lo) * 0.5)) continue;
+        uint slot = atomicAdd(s_cl_n, 1u);
+        if (slot < MBG_MAX_VIS_CLUSTERS) s_cl[slot] = c;
+        else s_cl_overflow = 1u;
+    }
+    barrier();
+}
+
+uint lv_cl_count(uint cluster_count) {
+    return s_cl_overflow != 0u ? cluster_count : min(s_cl_n, MBG_MAX_VIS_CLUSTERS);
+}
+uint lv_cl_at(uint k) { return s_cl_overflow != 0u ? k : s_cl[k]; }
+
 bool lv_tri_hit(uint ti, vec3 d, out float dist) {
     MbgTri tr = tris[ti];
     vec3 v0 = tr.p0.xyz - lv_P;
@@ -257,7 +327,7 @@ bool lv_tri_hit(uint ti, vec3 d, out float dist) {
 // The emitter is tested FIRST and the scene loop is skipped when it does not
 // reach this texel, which the rasterized version could not do: it had to fill
 // the whole scene into the buffer before it knew.
-vec2 lv_mass_texel(uint res, vec3 N, uint emit_ti, uint tri_count,
+vec2 lv_mass_texel(uint res, vec3 N, uint emit_ti, uint cluster_count,
                    uint lo, uint stride) {
     vec2 m = vec2(0.0);
     uint n = res * res;
@@ -269,24 +339,38 @@ vec2 lv_mass_texel(uint res, vec3 N, uint emit_ti, uint tri_count,
         float de;
         if (!lv_tri_hit(emit_ti, d, de)) continue;
 
-        float dv = 1e30, dd;
-        for (uint t = 0u; t < tri_count; ++t)
-            if (lv_tri_hit(t, d, dd) && dd < dv) dv = dd;
+        // ANY BLOCKER, NOT THE NEAREST ONE. The question is whether this texel
+        // sees the emitter, so the search can stop at the first triangle in
+        // front of it rather than reducing over the whole scene. Identical
+        // answer, and it turns the inner loop from a min into a search that
+        // exits early exactly where the work is heaviest -- the shadowed texels.
+        //
+        // The threshold carries the relative tolerance that replaced the packed
+        // key's one-quantum slack: an emitter coplanar with a surface (Cornell's
+        // panel lies in the ceiling) must not be shadowed by the surface it
+        // sits in.
+        float thresh = de * (1.0 - 1e-4);
+        bool blocked = false;
+        float dd;
+        uint ncl = lv_cl_count(cluster_count);
+        for (uint k = 0u; k < ncl && !blocked; ++k) {
+            MbgCluster cl = clusters[lv_cl_at(k)];
+            uint first = uint(cl.lo.w), last = first + uint(cl.hi.w);
+            for (uint t = first; t < last; ++t)
+                if (lv_tri_hit(t, d, dd) && dd < thresh) { blocked = true; break; }
+        }
 
         float l2 = dot(d, d);
         float w = cosr / (l2 * l2);
         m.y += w;
-        // A RELATIVE tolerance, replacing the one-quantum slack the packed key
-        // used to give: an emitter coplanar with a surface -- Cornell's panel
-        // lies in the ceiling -- must not be shadowed by the surface it sits in.
-        if (dv >= de * (1.0 - 1e-4)) m.x += w;
+        if (!blocked) m.x += w;
     }
     return m;
 }
 
 // The sun's disc, same inversion. It needs only "is anything in the way", not
 // which thing, so the scene loop stops at the first blocker.
-vec2 lv_mass_disc_texel(uint res, vec3 N, float cos_r, uint tri_count,
+vec2 lv_mass_disc_texel(uint res, vec3 N, float cos_r, uint cluster_count,
                         uint lo, uint stride) {
     vec2 m = vec2(0.0);
     uint n = res * res;
@@ -299,8 +383,13 @@ vec2 lv_mass_disc_texel(uint res, vec3 N, float cos_r, uint tri_count,
 
         bool blocked = false;
         float dd;
-        for (uint t = 0u; t < tri_count; ++t)
-            if (lv_tri_hit(t, d, dd)) { blocked = true; break; }
+        uint ncl = lv_cl_count(cluster_count);
+        for (uint k = 0u; k < ncl && !blocked; ++k) {
+            MbgCluster cl = clusters[lv_cl_at(k)];
+            uint first = uint(cl.lo.w), last = first + uint(cl.hi.w);
+            for (uint t = first; t < last; ++t)
+                if (lv_tri_hit(t, d, dd)) { blocked = true; break; }
+        }
 
         float w = cosr / (l * l * l * l);
         m.y += w;

@@ -250,6 +250,8 @@ void Solver::raster_level(uint32_t l, uint32_t count, const Scene& scene,
     if (dump) dump->bind_base(kBindVisOut);
     raster_.set("u_cam_count", count);
     raster_.set("u_tri_count", scene.count());
+    raster_.set("u_cluster_count", scene.cluster_count());
+    raster_.set("u_cull", cfg.cull ? 1u : 0u);
     raster_.set("u_res", li.res);
     raster_.set("u_block", li.block);
     raster_.set("u_children", li.children);
@@ -404,6 +406,8 @@ void Solver::direct_pixel(const GBuffer& gb, const gfx::Camera& cam, const Scene
     direct_px_.set("u_size", glm::ivec2(gb.width, gb.height));
     direct_px_.set("u_inv_view_proj", glm::inverse(cam.view_projection()));
     direct_px_.set("u_tri_count", scene.count());
+    direct_px_.set("u_cluster_count", scene.cluster_count());
+    direct_px_.set("u_cull", cfg.cull ? 1u : 0u);
     direct_px_.set("u_emitters", cfg.nee ? scene.emitter_count() : 0u);
     cfg.sky.bind(direct_px_);
     direct_px_.set("u_lv_res", res);

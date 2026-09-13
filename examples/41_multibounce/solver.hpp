@@ -143,6 +143,10 @@ struct SolveConfig {
     // guess in it, and it costs nothing: the direct irradiance at every texel's
     // hit point is already evaluated for the mass. 0 ablates it.
     bool      importance = true;
+    // Cull triangle clusters against each light view's frustum before walking
+    // them. 0 walks the whole scene, which is the measurement this is compared
+    // against. See scene.hpp's GpuCluster and lightview.glsl's lv_cull.
+    bool      cull = true;
 
     // The direct term. `nee` routes every emissive triangle through the analytic
     // estimator in raster.comp instead of letting the quadrature find it, which

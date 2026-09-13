@@ -76,6 +76,7 @@ uniform uint  u_lv_res;        // light-view target edge
 uniform uint  u_two_sided;
 uniform float u_bias;
 uniform float u_emissive;
+uniform uint  u_cluster_count;
 
 shared vec4 s_lvred[64];
 
@@ -110,7 +111,11 @@ void main() {
         // shared buffer, no atomics and no barrier around the rasterization.
         // See lv_mass_texel in common/lightview.glsl for why this is the same
         // depth sort with the loops nested the other way.
-        s_lvred[tid] = vec4(lit ? lv_mass_texel(u_lv_res, N, ti, u_tri_count,
+        // Cull once for this emitter's frustum, then let the texel loop walk
+        // only what survived. `lit` is workgroup uniform, so the barriers inside
+        // lv_cull cannot split.
+        if (lit) lv_cull(tid, 64u, u_cluster_count);
+        s_lvred[tid] = vec4(lit ? lv_mass_texel(u_lv_res, N, ti, u_cluster_count,
                                                 tid, 64u)
                                 : vec2(0.0),
                             0.0, 0.0);
@@ -157,8 +162,9 @@ void main() {
         // per-pixel grain with no filter downstream to take it back out.
         lv_setup_dir(P, N, u_sun_dir, u_sun_tan_r, lv_near_for(u_inv_far),
                      2.0 * u_bias);
-        s_lvred[tid] = vec4(lv_mass_disc_texel(u_lv_res, N, u_sun_cos_r, u_tri_count,
-                                               tid, 64u),
+        lv_cull(tid, 64u, u_cluster_count);
+        s_lvred[tid] = vec4(lv_mass_disc_texel(u_lv_res, N, u_sun_cos_r,
+                                               u_cluster_count, tid, 64u),
                             0.0, 0.0);
         barrier();
         for (uint r = 32u; r > 0u; r >>= 1u) {

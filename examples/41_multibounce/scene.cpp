@@ -2,6 +2,7 @@
 
 #include <gllib/log.hpp>
 
+#include <algorithm>
 #include <cmath>
 
 namespace mbg {
@@ -90,6 +91,23 @@ bool Scene::build(const std::vector<Tri>& tris) {
                     tris.size(), kMaxTris);
         return false;
     }
+
+    // Cluster bounds first: a run of kClusterSize consecutive triangles and the
+    // box around them. Built here rather than on the fly because it is static
+    // scene data, and read by every light view that wants to skip most of it.
+    std::vector<GpuCluster> clusters;
+    for (std::size_t base = 0; base < tris.size(); base += kClusterSize) {
+        const std::size_t n = std::min<std::size_t>(kClusterSize, tris.size() - base);
+        glm::vec3 lo(1e30f), hi(-1e30f);
+        for (std::size_t i = 0; i < n; ++i)
+            for (int k = 0; k < 3; ++k) {
+                lo = glm::min(lo, tris[base + i].p[k]);
+                hi = glm::max(hi, tris[base + i].p[k]);
+            }
+        clusters.push_back({glm::vec4(lo, float(base)), glm::vec4(hi, float(n))});
+    }
+    cluster_count_ = uint32_t(clusters.size());
+    clusters_.data(clusters.data(), clusters.size() * sizeof(GpuCluster));
 
     std::vector<GpuTri> gpu(tris.size());
     std::vector<uint32_t> emitters;

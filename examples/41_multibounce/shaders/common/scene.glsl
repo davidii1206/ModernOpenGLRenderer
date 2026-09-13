@@ -57,7 +57,13 @@ struct MbgCam {
 // headers below the includes need them: a header cannot use a block the includer
 // declares after it. Everything else stays per-pass, because the same binding is
 // readonly in one shader and writeonly in another.
+struct MbgCluster {
+    vec4 lo;               // w: index of the first triangle
+    vec4 hi;               // w: how many
+};
+
 layout(std430, binding = 0) readonly buffer MbgTris { MbgTri tris[]; };
+layout(std430, binding = 11) readonly buffer MbgClusters { MbgCluster clusters[]; };
 layout(std430, binding = 2) readonly buffer MbgQuad { vec4   quad[]; };
 
 // Orthonormal basis around n. Duff et al. 2017, branchless and stable at both

@@ -59,6 +59,7 @@ uniform uint  u_paths;        // 0 = branching tiles; else single-sample continu
 uniform uint  u_level;        // this level's index, for the random streams
 uniform float u_rr;           // Russian-roulette throughput threshold; 0 = off
 uniform uint  u_importance;   // 1 = weight the continuation by the hit's radiance
+uniform uint  u_cluster_count;
 uniform float u_bias;         // camera offset along its own normal, world units
 uniform float u_emissive;     // emissive scale
 uniform uint  u_two_sided;    // force every triangle to emit from both faces
@@ -211,7 +212,10 @@ void main() {
         // shared buffer, no atomics, no barrier around the visibility itself.
         // Same depth sort with the loops nested the other way -- lv_mass_texel
         // in common/lightview.glsl, and implementation.md finding 22.
-        s_red2[tid] = vec4(fitted ? lv_mass_texel(u_lv_res, g_N, ti, u_tri_count,
+        // Cull once for this emitter's frustum. `fitted` is workgroup uniform,
+        // so the barriers inside lv_cull cannot split.
+        if (fitted) lv_cull(tid, 64u, u_cluster_count);
+        s_red2[tid] = vec4(fitted ? lv_mass_texel(u_lv_res, g_N, ti, u_cluster_count,
                                                   tid, 64u)
                                   : vec2(0.0), 0.0, 0.0);
         barrier();
@@ -246,8 +250,9 @@ void main() {
         // decorrelated for free -- see lv_spin. The salt keeps it independent of
         // the hemisphere's own rotation, which is driven by the same position.
         if (u_jitter != 0u) lv_spin(mbg_jitter_angle(c.pos.xyz, 0x9E3779B9u));
-        s_red2[tid] = vec4(lv_mass_disc_texel(u_lv_res, g_N, u_sun_cos_r, u_tri_count,
-                                              tid, 64u),
+        lv_cull(tid, 64u, u_cluster_count);
+        s_red2[tid] = vec4(lv_mass_disc_texel(u_lv_res, g_N, u_sun_cos_r,
+                                              u_cluster_count, tid, 64u),
                            0.0, 0.0);
         barrier();
         for (uint r = 32u; r > 0u; r >>= 1u) {

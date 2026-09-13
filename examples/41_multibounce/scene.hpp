@@ -74,9 +74,20 @@ enum Binding : uint32_t {
     kBindEmitters = 8,     // triangle indices of the analytic emitters
     kBindDirect   = 9,     // this level's (direct irradiance, visible fraction)
     kBindChildD   = 10,    // the next level's, read by the gather
+    kBindClusters = 11,    // triangle-cluster bounds, for culling
 };
 
 // The GPU triangle, mirroring MbgTri in shaders/common/scene.glsl.
+// A run of consecutive triangles and the box around them, which is the whole
+// acceleration structure this example has. Fixed size rather than per submesh:
+// a submesh is whatever the artist made it, and Sponza's floor is one enormous
+// one whose box culls nothing, while a fixed run stays spatially tight because
+// extract_triangles emits them in mesh order.
+struct GpuCluster {
+    glm::vec4 lo;          // w: index of the first triangle
+    glm::vec4 hi;          // w: how many
+};
+
 struct GpuTri {
     glm::vec4 p0, p1, p2;
     glm::vec4 n;           // w != 0: double-sided
@@ -90,7 +101,11 @@ public:
     // depth key allows (see hemi.glsl). That cap is a property of this
     // example's 32-bit key, not of the method.
     bool build(const std::vector<Tri>& tris);
-    void bind() const { buf_.bind_base(kBindTris); emit_.bind_base(kBindEmitters); }
+    void bind() const {
+        buf_.bind_base(kBindTris);
+        emit_.bind_base(kBindEmitters);
+        clusters_.bind_base(kBindClusters);
+    }
 
     uint32_t count() const { return count_; }
     const Bounds& bounds() const { return bounds_; }
@@ -99,13 +114,19 @@ public:
     // Triangles whose direct contribution is evaluated analytically rather than
     // being picked up by the hemisphere raster. See raster.comp.
     uint32_t emitter_count() const { return emitter_count_; }
+    uint32_t cluster_count() const { return cluster_count_; }
+    // Triangles per cluster. 64 matches the workgroup, so one cull step feeds
+    // one thread-per-triangle pass, and it is small enough that a cluster's box
+    // is tight even where the mesh is not.
+    static constexpr uint32_t kClusterSize = 64;
 
     static constexpr uint32_t kMaxTris = 0xFFFFFFFEu;   // MBG_EMPTY is the sentinel
 
 private:
     gl::Buffer buf_{gl::BufferType::shader, gl::BufferUsage::static_draw};
     gl::Buffer emit_{gl::BufferType::shader, gl::BufferUsage::static_draw};
-    uint32_t count_ = 0, emissive_ = 0, emitter_count_ = 0;
+    gl::Buffer clusters_{gl::BufferType::shader, gl::BufferUsage::static_draw};
+    uint32_t count_ = 0, emissive_ = 0, emitter_count_ = 0, cluster_count_ = 0;
     double area_ = 0.0;
     Bounds bounds_;
 };

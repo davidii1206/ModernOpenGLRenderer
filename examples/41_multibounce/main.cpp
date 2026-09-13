@@ -183,6 +183,7 @@ EnvOpts read_env() {
     if (const char* v = getenv("MBG_PATHS"))    u32(v, o.cfg.paths);
     if (const char* v = getenv("MBG_RR"))       o.cfg.rr = float(atof(v));
     if (const char* v = getenv("MBG_IMPORTANCE")) o.cfg.importance = atoi(v) != 0;
+    if (const char* v = getenv("MBG_CULL"))     o.cfg.cull = atoi(v) != 0;
     if (const char* v = getenv("MBG_SCALE"))    u32(v, o.cfg.scale);
     if (const char* v = getenv("MBG_BUDGET"))   u32(v, o.cfg.budget);
     if (const char* v = getenv("MBG_RES"))      u32(v, o.cfg.res[0]);
