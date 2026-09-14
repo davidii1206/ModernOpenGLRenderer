@@ -2221,6 +2221,48 @@ one sweep runs past 4.29e9, and they wrapped. They are now 64-bit as two words
 with a carry, like the work counters have been since finding 27 -- which is where
 the pattern should have been copied from in the first place.
 
+### 33. The per-pixel direct term was the last unmeasured pass, and it is where the light view actually hurts
+
+Finding 32 cut the light view inside the raster kernel. `direct_pixel.comp` calls
+the same `lv_mass_texel`, so it got the same cut for free -- but it was still
+unmeasured, and it is the pass that runs **once per frame per lit pixel** rather
+than once per sweep. That is the interactive cost, not the batch one.
+
+Instrumented with the same header, four phases, its own normalizer:
+
+| Cornell+bunny, daylight | cull off | cull on | |
+|---|---|---|---|
+| direct pass, total cycles | 1.948e11 | **5.475e10** | **3.56x** |
+| dp emitter LV, cycles/pixel | 349897 | **78887** | **4.44x** |
+| dp emitter LV, share of pass | 92.0% | 73.8% | |
+
+Even after the cut the emitter light view is **74%** of the pass, against 6.5%
+for the G-buffer read and 8.8% for finding 25's mask. Finding 25 bought 1.29x on
+this scene by deciding *whether* to run a light view; this buys 4.44x by making
+the one it does run cheaper, and the two compose.
+
+#### Two kernels sharing a header must not share a counter neither of them named
+
+`mbg_perf_init` stamped the camera slot itself, which was right while one kernel
+used it. When `direct_pixel.comp` adopted the header, every lit pixel counted
+itself as a camera: a sweep of 671744 reported **1183808**, which is exactly
+671744 + the pass's 512064 pixels, and every cycles-per-camera figure was low by
+that 1.76x. The normalizer now belongs to the caller, and each kernel stamps its
+own.
+
+The check that caught it is the one finding 31 already relied on -- the workgroup
+count must equal the sweep's camera count -- which is the argument for having a
+number in the report whose correct value is known in advance.
+
+#### And a headless run must not sample the window
+
+The ImGui panel reads the phase buffer every half second and RESETS it, so the
+readout is a recent window rather than a run total. Headless, that reset landed
+in the middle of the very sweep `MBG_BENCH` was about to report on, and the
+report read "no cameras tallied". The windowed sample is now GUI-only; the
+headless path resets once before the sweep and reads once at the end, after the
+frames, so the direct pass's phases are in it too.
+
 ## What this does not answer
 
 - **§8.1, the reuse radius experiment.** The gate the doc puts before everything

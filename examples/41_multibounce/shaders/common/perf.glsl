@@ -49,7 +49,16 @@ uniform int u_perf;           // 0 = phase timing off
 #define MBG_PF_SUN      5     // the sun's cone
 #define MBG_PF_REDUCE   6     // cross-thread reduction + the global writes
 #define MBG_PF_SPAWN    7     // CDF, continuation, child cameras
-#define MBG_PF_SLOTS    8
+// direct_pixel.comp, the per-pixel direct term. Its own slots rather than a
+// second buffer: the two kernels never run inside one another, but they DO run
+// in the same frame, and sharing slot names would silently add a per-pixel
+// light view to a per-camera one.
+#define MBG_PF_DP_PIXEL 8     // pixels that ran (this pass's normalizer)
+#define MBG_PF_DP_SETUP 9     // G-buffer read, position reconstruction
+#define MBG_PF_DP_MASK  10    // finding 25's decision: is a light view needed?
+#define MBG_PF_DP_EMIT  11    // per-emitter light view
+#define MBG_PF_DP_SUN   12    // the sun's cone
+#define MBG_PF_SLOTS    13
 
 layout(std430, binding = 15) buffer MbgPerf { uint perf[]; };
 shared uint s_perf[MBG_PF_SLOTS];
@@ -106,10 +115,15 @@ shared uint s_perf[MBG_PF_SLOTS];
 #define MBG_PF_END(slot, v)                                                    \
     if (u_perf != 0) { barrier(); if (tid == 0u) s_perf[slot] += MBG_CLOCK() - (v); }
 
+// Zero the slots. The NORMALIZER IS THE CALLER'S -- this used to stamp
+// MBG_PF_CAMERA here, and then direct_pixel.comp adopted the header and every
+// lit pixel counted itself as a camera: 671744 cameras reported as 1183808,
+// which is 671744 + the pass's 512064 pixels, and every cycles-per-camera figure
+// low by the same 1.76x. Two kernels sharing a header must not share a counter
+// neither of them named.
 void mbg_perf_init(uint tid) {
     if (u_perf != 0) {
         if (tid < uint(MBG_PF_SLOTS)) s_perf[tid] = 0u;
-        if (tid == 0u) s_perf[MBG_PF_CAMERA] = 1u;
         // `u_perf` is a uniform, so this branch is workgroup uniform and the
         // barrier inside it is legal.
         barrier();

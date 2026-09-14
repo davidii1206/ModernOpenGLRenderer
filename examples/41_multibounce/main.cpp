@@ -392,9 +392,24 @@ static void report_phases(const mbg::Solver& solver) {
     printf("[perf] raster kernel, %.0f workgroups, %.4g total cycles\n",
            p.cameras, total);
     for (int i = 0; i < 7; ++i)
-        printf("[perf]   %-12s %6.2f%%   %9.0f cycles/camera\n",
+        printf("[perf]   %-13s %6.2f%%   %9.0f cycles/camera\n",
                mbg::Solver::Phases::name(i), 100.0 * p.cyc[i] / total,
                p.cyc[i] / p.cameras);
+
+    // The per-pixel direct term is a separate kernel on a separate schedule --
+    // once per FRAME, per lit pixel -- so it gets its own normalizer and its own
+    // 100%. Adding it to the sweep's would compare a per-camera cost against a
+    // per-pixel one.
+    double dtot = 0.0;
+    for (int i = 0; i < 4; ++i) dtot += p.dp[i];
+    if (p.pixels > 0.0 && dtot > 0.0) {
+        printf("[perf] direct pass, %.0f lit pixels, %.4g total cycles\n",
+               p.pixels, dtot);
+        for (int i = 0; i < 4; ++i)
+            printf("[perf]   %-13s %6.2f%%   %9.0f cycles/pixel\n",
+                   mbg::Solver::Phases::name(7 + 1 + i), 100.0 * p.dp[i] / dtot,
+                   p.dp[i] / p.pixels);
+    }
 }
 
 // Numeric comparison against a reference PNG, in DISPLAY space.
@@ -788,7 +803,10 @@ int main() {
                    sweep_ms, chunks, solver.sweep_cameras(), solver.sweep_texels(),
                    solver.sweep_cameras() * double(scene.count()));
             if (run.count) report_counts(solver, scene, presolve);
-            if (run.perf) report_phases(solver);
+            // Phases are NOT reported here. The raster kernel is finished, but
+            // the per-pixel direct term runs in the frame loop below, so reading
+            // now would show its four phases empty. The report goes at the end
+            // of the bench summary, with both kernels in it.
             presolve = 0;
             cfg.running = false;
         } else {
@@ -1081,7 +1099,12 @@ int main() {
         if (window_accum >= 500.0) {
             for (PassTimer* t : timers) t->flush_window();
             for (PassTimer* t : solver_timers) t->flush_window();
-            if (cfg.perf && presolve == 0) {
+            // GUI ONLY. This read RESETS the buffer, which is what keeps the
+            // panel showing a recent window rather than a run total -- and it is
+            // why it must not run headless: MBG_BENCH reports once at the end,
+            // and a windowed reset partway through would wipe the sweep it is
+            // reporting on.
+            if (cfg.perf && presolve == 0 && !env.nogui) {
                 disp_phases = solver.perf_read();
                 solver.perf_reset();
             }
@@ -1125,6 +1148,7 @@ int main() {
             if (t->gpu()) continue;
             printf("    %-16s %7.3f\n", t->name(), t->avg_cpu());
         }
+        if (cfg.perf) report_phases(solver);
     }
 
     if (!env.nogui) gui.shutdown();

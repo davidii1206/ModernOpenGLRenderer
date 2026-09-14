@@ -83,7 +83,7 @@ Solver::Counts Solver::count_read() const {
 }
 
 // Seven slots: a camera count and the six phases. See shaders/common/perf.glsl.
-static constexpr uint32_t kPerfSlots = 8;
+static constexpr uint32_t kPerfSlots = 13;
 
 void Solver::perf_reset() {
     const uint32_t zero[kPerfSlots * 2] = {};
@@ -91,10 +91,12 @@ void Solver::perf_reset() {
 }
 
 const char* Solver::Phases::name(int i) {
-    static const char* kNames[7] = {"setup", "traverse", "quadrature",
-                                    "emitter LV", "sun LV", "reduce+write",
-                                    "spawn"};
-    return (i >= 0 && i < 7) ? kNames[i] : "?";
+    static const char* kNames[12] = {"setup", "traverse", "quadrature",
+                                     "emitter LV", "sun LV", "reduce+write",
+                                     "spawn",
+                                     "dp pixels", "dp setup", "dp mask",
+                                     "dp emitter LV", "dp sun LV"};
+    return (i >= 0 && i < 12) ? kNames[i] : "?";
 }
 
 Solver::Phases Solver::perf_read() const {
@@ -106,6 +108,8 @@ Solver::Phases Solver::perf_read() const {
     Phases p;
     p.cameras = u64(0);
     for (int i = 0; i < 7; ++i) p.cyc[i] = u64(1 + i);
+    p.pixels = u64(8);
+    for (int i = 0; i < 4; ++i) p.dp[i] = u64(9 + i);
     return p;
 }
 
@@ -507,6 +511,7 @@ void Solver::direct_pixel(const GBuffer& gb, const gfx::Camera& cam, const Scene
     direct_px_.use();
     scene.bind();
     counters_.bind_base(kBindCounters);
+    perf_.bind_base(kBindPerf);
     direct_quad_.bind();
     gb.bind_textures();
     full_.bind_image(1, 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA32F);
@@ -528,6 +533,7 @@ void Solver::direct_pixel(const GBuffer& gb, const gfx::Camera& cam, const Scene
     direct_px_.set("u_count", cfg.count ? 1u : 0u);
     direct_px_.set("u_angular", cfg.angular ? 1u : 0u);
     direct_px_.set("u_lv_angular", cfg.lv_angular ? 1u : 0u);
+    direct_px_.set("u_perf", cfg.perf ? 1 : 0);
     direct_px_.set("u_emitters", cfg.nee ? scene.emitter_count() : 0u);
     cfg.sky.bind(direct_px_);
     direct_px_.set("u_lv_res", res);

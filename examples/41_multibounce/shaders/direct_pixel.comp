@@ -1,4 +1,7 @@
 #version 460 core
+// See raster.comp: an #extension directive is only legal before any code, so
+// each kernel that wants phase timing declares it rather than perf.glsl.
+#extension GL_ARB_shader_clock : enable
 layout(local_size_x = 64) in;
 
 // ---------------------------------------------------------------------------
@@ -59,6 +62,7 @@ layout(local_size_x = 64) in;
 #include "lightview.glsl"
 #include "gbuffer.glsl"
 #include "sky.glsl"
+#include "perf.glsl"
 
 layout(std430, binding = 8) readonly buffer MbgEmit { uint emitters[]; };
 
@@ -202,6 +206,9 @@ void main() {
     // This pass has no hemisphere traversal, only light views, so it owns the
     // tally's lifetime itself. Both returns above are ahead of any counting.
     mbg_count_init();
+    mbg_perf_init(tid);
+    if (u_perf != 0 && tid == 0u) s_perf[MBG_PF_DP_PIXEL] = 1u;
+    MBG_PF_T0(pf_setup);
 
     vec3  N = normalize(texelFetch(u_normal, p, 0).xyz);
     float d = texelFetch(u_depth, p, 0).r;
@@ -211,6 +218,9 @@ void main() {
     // Ask the grid where the light view is worth running. Both answers are
     // workgroup uniform, which is what lets the branches below skip the
     // barriers inside the loops without splitting the workgroup.
+    MBG_PF_END(MBG_PF_DP_SETUP, pf_setup);
+
+    MBG_PF_T0(pf_mask);
     bool refine_e = true, refine_s = true;
     vec2 gfrac = vec2(0.0);
     if (u_mask != 0u && u_scale > 1u) {
@@ -220,6 +230,9 @@ void main() {
         refine_s = s_mval.w > 0.5;
     }
 
+    MBG_PF_END(MBG_PF_DP_MASK, pf_mask);
+
+    MBG_PF_T0(pf_emit);
     vec3 E = vec3(0.0);
     lv_jit = vec2(0.0);          // emitter views: their frames already differ per receiver
 
@@ -275,6 +288,9 @@ void main() {
         barrier();
     }
 
+    MBG_PF_END(MBG_PF_DP_EMIT, pf_emit);
+
+    MBG_PF_T0(pf_sun);
     // --- The sun ---------------------------------------------------------------
     //
     // Per pixel for the same reason the emitters are: it is a direct term, so it
@@ -340,9 +356,12 @@ void main() {
         E += sun_mag * (m.y > 1e-12 ? clamp(m.x / m.y, 0.0, 1.0) : 1.0);
     }
 
+    MBG_PF_END(MBG_PF_DP_SUN, pf_sun);
+
     if (tid == 0u) {
         vec4 cur = imageLoad(u_target, p);
         imageStore(u_target, p, vec4(cur.rgb + E, 1.0));
     }
     mbg_count_flush();
+    mbg_perf_flush(tid);
 }

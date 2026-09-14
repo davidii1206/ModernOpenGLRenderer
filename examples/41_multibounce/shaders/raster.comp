@@ -85,6 +85,7 @@ void main() {
     if (cam >= u_cam_count) return;
 
     mbg_perf_init(tid);
+    if (u_perf != 0 && tid == 0u) s_perf[MBG_PF_CAMERA] = 1u;
     MBG_PF_T0(pf_setup);
 
     // In tile mode the child count is fixed by the target and the tile edge; in

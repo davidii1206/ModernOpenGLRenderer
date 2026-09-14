@@ -346,6 +346,8 @@ public:
     struct Phases {
         double cameras = 0;
         double cyc[7] = {};      // setup traverse quad emitter sun reduce spawn
+        double pixels = 0;       // direct_pixel.comp's own normalizer
+        double dp[4] = {};       // dp: setup, mask, emitter LV, sun LV
         static const char* name(int i);
     };
     Phases perf_read() const;
