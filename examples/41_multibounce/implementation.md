@@ -1852,6 +1852,58 @@ than asserted.
 
 **And the distance bound was not working at all.** That is finding 28.
 
+### 28. Three slots in four held a bound they did not own, and the bound is the whole traversal
+
+The cooperative traversal gives each thread `MBG_TEXELS_PER_THREAD` texels,
+strided:
+
+```glsl
+uint i = base + k * stride + tid;
+```
+
+and keeps a per-texel distance bound `bd[k]`, with `worst = max(bd[0..3])` gating
+both box tests. Finding 24 is built on that bound; so is the sqrt(n) group level;
+so is the nearest-first order it added.
+
+At an 8x8 target `n` is 64 and so is the stride, so `i = k*64 + tid` is in range
+for `k = 0` alone. **Three slots in four are padding**, and padding was
+initialized to `1e18` exactly like a real texel. `worst` is the MAX over the
+four. So `worst` stayed at infinity for the entire traversal, both box tests
+compared every box against infinity, and the distance bound -- the lever the two
+box levels exist to feed -- did nothing at all. What remained was the tangent
+plane test in `mbg_cull`, which removes what is behind the receiver and no more.
+
+This is not an edge case. The default schedule is 1 camera at res 16 and 40 at
+res 8, so it held on **40 of every 41 cameras**, in every scene large enough to
+have clusters at all. Cornell hides it completely: 32 triangles is one cluster,
+below the eight-cluster floor, so it takes the uncooperative path and never
+executes this loop. Every scene the cluster levels were built for ran with them
+switched off.
+
+The fix is that a dead slot gets a bound of ZERO -- the identity for a max, so it
+cannot loosen `worst`, and no box is nearer than nothing -- and an `nk` count
+keeps dead slots out of the inner loop as well.
+
+| per camera-thread, best of one, counts are exact | before | after | |
+|---|---|---|---|
+| Cornell+bunny, 69k tris: clusters entered | 881.5 | **364.4** | **2.42x** |
+| ... triangles fetched per texel | 34545 | **14278** | **2.42x** |
+| ... hit tests per texel | 107501 | **24400** | **4.41x** |
+| Sponza, 262k tris: clusters entered | 681.7 | **473.3** | **1.44x** |
+| ... triangles fetched per texel | 27270 | **18934** | **1.44x** |
+| ... hit tests per texel | 77178 | **29677** | **2.60x** |
+
+The image is **bit-identical** -- verified on Cornell+bunny against an ablation
+differing in those two lines and nothing else. It has to be: a dead slot's
+`best[k]` was already discarded, and tightening `worst` to the true maximum over
+the live bounds only skips boxes that no live texel could have wanted.
+
+Two things are worth keeping from how this was found. It is invisible to every
+timer, because it makes the traversal slower rather than wrong and llvmpipe
+cannot rank the traversal anyway. And it is invisible to Cornell, which is the
+scene every gate and every render in this repository uses -- the instrument found
+it in the first measurement taken on a scene with clusters in it.
+
 ## What this does not answer
 
 - **§8.1, the reuse radius experiment.** The gate the doc puts before everything

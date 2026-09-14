@@ -388,7 +388,7 @@ void mbg_resolve_vis_coop(uint tid, uint stride, uint group_count) {
                         : vec3(0.0, 0.0, 1.0);
             len[k] = length(d[k]);
             best[k] = MBG_EMPTY;
-            bd[k] = 1e18;
+            bd[k] = live ? 1e18 : 0.0;
             if (live) nk = k + 1u;
         }
         worst = max(max(bd[0], bd[1]), max(bd[2], bd[3]));
@@ -423,7 +423,7 @@ void mbg_resolve_vis_coop(uint tid, uint stride, uint group_count) {
                     // One fetch and ONE setup, reused by every texel this
                     // thread owns -- see mbg_tri_setup.
                     MbgTriSetup h = mbg_tri_setup(geom[t]);
-                    for (uint k = 0u; k < MBG_TEXELS_PER_THREAD; ++k) {
+                    for (uint k = 0u; k < nk; ++k) {
                         // A texel that already has its answer under any-hit is
                         // done; its bound is zero, so the box tests above have
                         // stopped bringing it work, and this catches the boxes
