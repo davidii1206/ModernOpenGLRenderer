@@ -25,18 +25,26 @@ Reproduce any of them with, e.g.:
 
 ```bash
 cd build-release/examples/41_multibounce
-MBG_NOGUI=1 MBG_GTCAM=1 MBG_SKY=0.05 MBG_SOLVE=1 MBG_BENCH=3 \
+MBG_NOGUI=1 MBG_GTCAM=1 MBG_SKY=0.05 MBG_SOLVE=1 MBG_BENCH=1 \
   MBG_SHOT=02_gi_3bounce.png ./41_multibounce
 
-MBG_NOGUI=1 MBG_GTCAM=1 MBG_DAYLIGHT=1 MBG_SOLVE=1 MBG_BENCH=3 \
+MBG_NOGUI=1 MBG_GTCAM=1 MBG_DAYLIGHT=1 MBG_SOLVE=1 MBG_BENCH=1 \
   MBG_SHOT=06_daylight_3bounce.png ./41_multibounce
 ```
 
 `MBG_NOGUI=1` matters: the ImGui overlay is otherwise in the screenshot.
-`MBG_SOLVE=1` completes a sweep before the first present and `MBG_BENCH=3` then
-exits after three frames; without `MBG_BENCH` the app holds the solve and runs
-its interactive loop forever, screenshot or not. `01` and `04` compare against
-the direct reference, which is `MBG_REF=0`.
+`MBG_SOLVE=1` completes a sweep before the first present and `MBG_BENCH=1` then
+exits after one frame; without `MBG_BENCH` the app holds the solve and runs its
+interactive loop forever, screenshot or not. `01` and `04` compare against the
+direct reference, which is `MBG_REF=0`.
+
+**`MBG_BENCH=1`, not 3, and that is not cosmetic.** With the denoiser on, a run
+of more than one frame does not reproduce: four runs of the identical binary at
+`MBG_BENCH=3` gave four distinct images, differing by up to 18/255 on about
+twenty thousand pixels. One frame is bit-exact across runs, and so is any number
+of frames with `MBG_FILTER=0`. These images were regenerated at `MBG_BENCH=1` so
+that they reproduce; see implementation.md finding 29 for what is and is not
+established about why.
 
 The daylight images carry no `MBG_EXPOSURE`: the `MBG_DAYLIGHT` preset is scaled
 so that the **three-bounce** solve lands in the tone curve's usable range at

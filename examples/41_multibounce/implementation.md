@@ -1904,6 +1904,48 @@ cannot rank the traversal anyway. And it is invisible to Cornell, which is the
 scene every gate and every render in this repository uses -- the instrument found
 it in the first measurement taken on a scene with clusters in it.
 
+### 29. The denoiser makes a multi-frame run irreproducible, and the renders were taken that way
+
+Verifying a traversal change here means rendering the same image twice and
+comparing bytes. That method assumes the renderer is deterministic. It is not,
+under the configuration the repository's own renders were made with.
+
+Four runs of one binary, same flags, `MBG_BENCH=3`:
+
+| | distinct images | spread |
+|---|---|---|
+| default (denoise on, 3 frames) | **4 of 4** | up to 18/255 on ~21k pixels |
+| `MBG_FILTER=0` (denoise off, 3 frames) | 1 of 4 | bit-exact |
+| default, `MBG_BENCH=1` | 1 of 4 | bit-exact |
+
+So the solve is deterministic -- with the denoiser off, any number of frames
+reproduces -- and so is the G-buffer (an albedo view is bit-exact at three
+frames). What varies is `gi_disp_`, the texture the denoise writes and the
+upsample reads, and only when the frame runs more than once. It is not the
+ping-pong buffer: one iteration writes `gi_disp_` directly without touching
+`gi_tmp_` and is just as irreproducible as two or three.
+
+**What is not established is the cause.** `gi_filter.comp` is a pure function of
+its source image -- no atomics, no shared memory, no seed, no feedback -- the
+solve is held after the pre-solve so its input cannot be moving, and every
+barrier the chain needs is present. That leaves something below the API on this
+container, which is a hypothesis and not a measurement, and this machine cannot
+settle it. On hardware it may not reproduce at all.
+
+The practical consequences do not depend on the cause:
+
+- **The committed renders were made at `MBG_BENCH=3` and did not reproduce.**
+  They are regenerated at `MBG_BENCH=1`, which does, and renders/README.md now
+  says so.
+- **Image comparison is only valid at `MBG_BENCH=1` or with the denoise off.**
+  Finding 28's bit-identical result was taken at `MBG_BENCH=1` and stands.
+- **A small image difference is not evidence of a code change.** Earlier in this
+  work a 12/255 drift on 17 pixels of the one-bounce render was attributed to the
+  direct-term mask of finding 25. That attribution was wrong: one bounce has no
+  continuation, the mask changes no pixel Cornell renders, and the drift is this
+  effect. The renders moved because they were resampled, not because the transport
+  did.
+
 ## What this does not answer
 
 - **§8.1, the reuse radius experiment.** The gate the doc puts before everything
