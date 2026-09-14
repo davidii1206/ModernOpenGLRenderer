@@ -6,10 +6,19 @@ two path-traced PNGs one directory up), default configuration unless noted:
 path estimator at 20 paths with roulette at 0.15, analytic direct term with an
 8×8 light view per pixel, jitter + 2 a-trous iterations, Reinhard.
 
-One complete sweep is **6.7e5 cameras / 4.6e7 texels / 2.2e7 triangle-rasters**,
-split into 4 chunks. On llvmpipe (software GL, 4 CPU threads, shared container)
-that took **14 s**; that number is a property of this machine and not of the
-method, and the counts beside it are what to scale with.
+One complete sweep is **6.7e5 cameras / 4.6e7 texels**, split into 4 chunks. On
+llvmpipe (software GL, 4 CPU threads, shared container) that took **14 s**; that
+number is a property of this machine and not of the method, and the counts beside
+it are what to scale with.
+
+Those two are what the schedule ASKS for. What the sweep actually does, from
+`MBG_COUNT=1`, is **5.34e5 live cameras** (a fifth of the slots are background
+pixels or escaped paths, which write their zeros and return), **3.73e7 texels**,
+and **9.92e8 triangle fetches** — 26.6 of Cornell's 32 triangles per texel, the
+rest cut by the any-hit early-out. The sweep line also prints a
+"triangle-rasters" figure: ignore it. It is `cameras × scene.count()` computed on
+the host, it never multiplies by the texels a camera rasterizes, and on this
+scene it is low by a factor of 46. See implementation.md finding 27.
 
 | File | What | Compare against |
 |---|---|---|
