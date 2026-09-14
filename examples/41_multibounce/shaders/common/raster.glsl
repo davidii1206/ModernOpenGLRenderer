@@ -33,6 +33,7 @@ uniform uint  u_anyhit;
 #define MBG_ANG_EPS 1e-5
 #define MBG_ANG_ABS 1e-6
 
+
 // The largest target any level may use. The default schedule needs 256, but the
 // buffer is sized for the cap so MBG_RES can be raised without a recompile --
 // and a level-3 camera with an 8x8 target reserves the same 4 KB either way,
@@ -312,6 +313,32 @@ bool mbg_tri_hit(uint ti, vec3 d, out float dist) {
 // the wrong shape for a hemisphere, where 256 texels look at everything.
 #define MBG_TEXELS_PER_THREAD 4
 
+// Which of this thread's live directions pass through a box, as a bitmask.
+// Shared by both levels of the hierarchy -- the group boxes and the cluster
+// boxes inside them -- because the question is identical and only the box
+// changes. Origin is g_P; `inv` is the per-texel reciprocal direction, computed
+// once per texel rather than once per texel per box.
+//
+// Every comparison is written so a NaN falls through to ACCEPT: `tn > tf` is
+// false on NaN, and accepting costs some triangle tests while rejecting wrongly
+// loses geometry.
+uint mbg_box_mask(vec3 lo, vec3 hi, uint nk, vec3 inv[MBG_TEXELS_PER_THREAD]) {
+    vec3 e = (hi - lo) * MBG_ANG_EPS + vec3(MBG_ANG_ABS);
+    vec3 blo = lo - e - g_P;
+    vec3 bhi = hi + e - g_P;
+    uint m = 0u;
+    for (uint k = 0u; k < nk; ++k) {
+        vec3 t1 = blo * inv[k];
+        vec3 t2 = bhi * inv[k];
+        vec3 tlo = min(t1, t2), thi = max(t1, t2);
+        float tn = max(max(tlo.x, tlo.y), max(tlo.z, 0.0));
+        float tf = min(min(thi.x, thi.y), thi.z);
+        if (tn > tf) continue;
+        m |= 1u << k;
+    }
+    return m;
+}
+
 // ANY-HIT AT THE TERMINAL LEVEL, AND WHY IT IS EXACT THERE.
 //
 // A camera that spawns no children uses this buffer for one thing: the
@@ -410,6 +437,14 @@ void mbg_resolve_vis_coop(uint tid, uint stride, uint group_count) {
             // The loosest bound any of this thread's texels holds: if the whole
             // group is beyond that, none of them can want it.
             if (dot(gq, gq) > worst * worst) continue;
+            // AND THE SAME DIRECTION TEST, ONE LEVEL UP. Without this the group
+            // level is distance-only, so it admits a group whenever anything in
+            // it is near -- and then every one of its 64 clusters is tested
+            // individually. Measured before this line existed: 8.8 of 17 groups
+            // entered and 481 cluster tests to enter 3.5 of them.
+            if (u_angular != 0u &&
+                mbg_box_mask(groups[g].lo.xyz, groups[g].hi.xyz, nk, inv) == 0u)
+                continue;
             MBG_TALLY(MBG_CT_GRP_ENTER, 1u)
 
             uint cfirst = uint(groups[g].lo.w);
@@ -464,20 +499,8 @@ void mbg_resolve_vis_coop(uint tid, uint stride, uint group_count) {
                     // Every comparison is written so that a NaN falls through to
                     // ACCEPT: `tn > tf` is false on NaN, and accepting costs 64
                     // triangle tests while rejecting wrongly loses geometry.
-                    vec3 e = (clusters[c].hi.xyz - clusters[c].lo.xyz) * MBG_ANG_EPS
-                             + vec3(MBG_ANG_ABS);
-                    vec3 blo = clusters[c].lo.xyz - e - g_P;
-                    vec3 bhi = clusters[c].hi.xyz + e - g_P;
-                    amask = 0u;
-                    for (uint k = 0u; k < nk; ++k) {
-                        vec3 t1 = blo * inv[k];
-                        vec3 t2 = bhi * inv[k];
-                        vec3 tlo = min(t1, t2), thi = max(t1, t2);
-                        float tn = max(max(tlo.x, tlo.y), max(tlo.z, 0.0));
-                        float tf = min(min(thi.x, thi.y), thi.z);
-                        if (tn > tf) continue;
-                        amask |= 1u << k;
-                    }
+                    amask = mbg_box_mask(clusters[c].lo.xyz, clusters[c].hi.xyz,
+                                        nk, inv);
                     if (u_angular != 0u && amask == 0u) continue;
                 }
                 uint pmask = amask;

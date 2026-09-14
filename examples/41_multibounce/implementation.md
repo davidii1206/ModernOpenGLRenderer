@@ -2263,6 +2263,67 @@ report read "no cameras tallied". The windowed sample is now GUI-only; the
 headless path resets once before the sweep and reads once at the end, after the
 frames, so the direct pass's phases are in it too.
 
+### 34. The coarse level was distance-only, so it admitted a group whenever anything in it was near
+
+Finding 32 measured traversal at ~32% of the raster kernel on both Cornell and
+the bunny and concluded the phase had stopped growing with scene size. True, and
+I read too much into it: *stopped growing* is not *is small*. It remained the
+largest single phase, and inside it the counters said **481 cluster tests to
+enter 3.5** -- rejection outweighing intersection roughly two to one.
+
+The reason was one line. Finding 30 put the direction test on the CLUSTER boxes
+and left the group boxes above them exactly as they were:
+
+```glsl
+if (dot(gq, gq) > worst * worst) continue;   // the whole group test
+```
+
+Distance only. A group of 64 clusters is admitted whenever *anything in it* is
+nearer than the loosest bound this thread holds, and then all 64 of its clusters
+are tested one at a time. 8.8 groups of 17 entered, and 8.8 x 64 = 563, which is
+essentially the 481 cluster tests observed.
+
+The same `mbg_box_mask` now runs at both levels -- the question is identical and
+only the box changes -- so the helper is shared rather than duplicated.
+
+| Cornell+bunny, one A/B pair differing in three lines | without | with | |
+|---|---|---|---|
+| groups entered per camera-thread | 7.9 | **3.2** | 2.47x |
+| cluster tests per camera-thread | 444.8 | **180.5** | **2.46x** |
+| clusters entered | 3.5 | 3.5 | unchanged |
+| triangles fetched per texel | 132.36 | 132.36 | **identical** |
+| sweep, llvmpipe | 3813 ms | 849 ms | 4.5x |
+
+Sponza: 22.0 groups entered to **17.6**, and 1072 cluster tests to **849**.
+
+**The two unchanged rows are the result, not the changed ones.** A cull that
+removes box tests while touching neither the clusters entered nor a single
+triangle fetched is doing exactly what a cull should and nothing else -- and the
+image is **bit-identical**, which it has to be for the same reason: no triangle
+that was tested before goes untested now.
+
+Cornell is unaffected and still matches its committed render: one cluster in one
+group, whose box every direction hits.
+
+#### Why this rather than `reduce+write`
+
+Finding 31 put `reduce+write` at 16-20% of the kernel, second only to traversal,
+and it was the obvious next target. It was the wrong one to take here for two
+reasons that are worth separating.
+
+It is the row this container is least able to measure. Six barriers and two
+global stores per camera, and a barrier on llvmpipe is CPU thread synchronization
+rather than a hardware fence, so it is the phase most likely inflated -- by
+exactly the mechanism finding 22 warned about.
+
+And the natural fix costs something this example has been careful about. A
+64-thread tree reduction with six barriers wants `subgroupAdd`, which is one
+instruction and no barriers. But subgroup reduction has an implementation-defined
+summation order, so the result changes in the last bits: the gates would still
+pass on tolerance, and every bit-identical claim in findings 26 through 34 would
+stop being reproducible. That is a real trade and it should be made against a
+real number, on hardware, not against this machine's guess.
+
 ## What this does not answer
 
 - **§8.1, the reuse radius experiment.** The gate the doc puts before everything
