@@ -30,10 +30,6 @@ uniform uint  u_order;        // 1 = visit groups nearest-first
 // See mbg_resolve_vis_coop: it turns the closest-hit search into an any-hit one,
 // which the existing distance bound then terminates almost immediately.
 uniform uint  u_anyhit;
-// 1 = reject a cluster no live direction passes through, before fetching its
-// triangles. The distance bound asks whether a box is near enough; this asks
-// whether it is in the way. See mbg_resolve_vis_coop.
-uniform uint  u_angular;
 #define MBG_ANG_EPS 1e-5
 #define MBG_ANG_ABS 1e-6
 

@@ -151,6 +151,12 @@ struct SolveConfig {
     // whether it is in the way, which on a scene with clusters is the question
     // that removes almost everything. 0 ablates it. See raster.glsl.
     bool      angular = true;
+    // The SAME test in the light view's occlusion loop, which is a second
+    // traversal that never got any of the hemisphere's work. Separate from
+    // `angular` so the two can be attributed apart -- they have different
+    // conservativeness, because lv_tri_hit carries finding 19's half-space rule
+    // and that reports a hit for rays which miss the triangle geometrically.
+    bool      lv_angular = true;
     // Draw the continuation direction from the micro-buffer's own radiance --
     // cos * dOmega * albedo * (unshadowed direct irradiance at the hit) --
     // rather than from cos * dOmega * albedo alone. The extra factor is the only
@@ -324,7 +330,8 @@ public:
     struct Counts {
         double cameras = 0, grp_test = 0, grp_enter = 0, clu_test = 0,
                clu_enter = 0, tri_setup = 0, tex_test = 0, texels = 0,
-               clu_ang = 0, tex_ang = 0, clu_pair = 0, ang_viol = 0;
+               clu_ang = 0, tex_ang = 0, clu_pair = 0, ang_viol = 0,
+               lv_pair = 0, lv_ang = 0;
     };
     Counts count_read() const;
 

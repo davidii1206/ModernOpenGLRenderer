@@ -1,6 +1,8 @@
 #ifndef MBG_LIGHTVIEW_GLSL
 #define MBG_LIGHTVIEW_GLSL
 
+#include "counters.glsl"   // the probe below tallies into it
+
 // ---------------------------------------------------------------------------
 // The light view: a per-receiver perspective frustum fitted around one emitter,
 // rasterized with the same atomicMin depth sort as everything else here.
@@ -280,6 +282,28 @@ uint lv_cl_count(uint cluster_count) {
 }
 uint lv_cl_at(uint k) { return s_cl_overflow != 0u ? k : s_cl[k]; }
 
+// Does the ray from the light view's origin along `d` miss this cluster's box?
+// Same slab test as the hemisphere's (finding 30), same NaN-falls-through-to-
+// ACCEPT discipline: rejecting wrongly loses geometry and reads as a light leak.
+bool lv_slab_miss(MbgCluster cl, vec3 d, vec3 inv) {
+    // EXPANDED BY lv_peps, NOT BY AN EPSILON. lv_tri_hit is not purely a ray
+    // test: finding 19's half-space rule reports a hit when the receiver lies
+    // within lv_peps of a triangle's plane AND inside its bounds, whether or not
+    // `d` geometrically passes through the triangle -- that rule is what stops
+    // the sun leaking through concave creases. A box expanded only by a float
+    // epsilon rejects those clusters and the leak comes back: measured at 92/255
+    // on two pixels before this term was added. At lv_peps the rule can only
+    // fire where the origin is already inside the expanded box, which the slab
+    // test always accepts.
+    vec3 e = (cl.hi.xyz - cl.lo.xyz) * 1e-5 + vec3(lv_peps + 1e-6);
+    vec3 t1 = (cl.lo.xyz - e - lv_P) * inv;
+    vec3 t2 = (cl.hi.xyz + e - lv_P) * inv;
+    vec3 tlo = min(t1, t2), thi = max(t1, t2);
+    float tn = max(max(tlo.x, tlo.y), max(tlo.z, 0.0));
+    float tf = min(min(thi.x, thi.y), thi.z);
+    return tn > tf;
+}
+
 bool lv_tri_hit(uint ti, vec3 d, out float dist) {
     // geom[], not mbg_tri(): this is the light view's inner loop and the shading
     // half of the record is never read here.
@@ -356,9 +380,14 @@ vec2 lv_mass_texel(uint res, vec3 N, uint emit_ti, uint cluster_count,
         bool blocked = false;
         float dd;
         uint ncl = lv_cl_count(cluster_count);
+        // Reciprocal once per texel, not once per texel per cluster.
+        vec3 inv = 1.0 / d;
         for (uint k = 0u; k < ncl && !blocked; ++k) {
             MbgCluster cl = clusters[lv_cl_at(k)];
             uint first = uint(cl.lo.w), last = first + uint(cl.hi.w);
+            if (u_count != 0u) { g_tally[MBG_CT_LV_PAIR] += 1u;
+                                 if (lv_slab_miss(cl, d, inv)) ++g_tally[MBG_CT_LV_ANG]; }
+            if (u_lv_angular != 0u && lv_slab_miss(cl, d, inv)) continue;
             for (uint t = first; t < last; ++t)
                 if (lv_tri_hit(t, d, dd) && dd < thresh) { blocked = true; break; }
         }
@@ -387,9 +416,13 @@ vec2 lv_mass_disc_texel(uint res, vec3 N, float cos_r, uint cluster_count,
         bool blocked = false;
         float dd;
         uint ncl = lv_cl_count(cluster_count);
+        vec3 inv = 1.0 / d;
         for (uint k = 0u; k < ncl && !blocked; ++k) {
             MbgCluster cl = clusters[lv_cl_at(k)];
             uint first = uint(cl.lo.w), last = first + uint(cl.hi.w);
+            if (u_count != 0u) { g_tally[MBG_CT_LV_PAIR] += 1u;
+                                 if (lv_slab_miss(cl, d, inv)) ++g_tally[MBG_CT_LV_ANG]; }
+            if (u_lv_angular != 0u && lv_slab_miss(cl, d, inv)) continue;
             for (uint t = first; t < last; ++t)
                 if (lv_tri_hit(t, d, dd)) { blocked = true; break; }
         }

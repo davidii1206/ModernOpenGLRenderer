@@ -43,6 +43,15 @@ struct MbgTriShade {
     vec4 emission;
 };
 
+// 1 = reject a cluster that no live direction passes through, before fetching
+// its 64 triangles. The distance bound asks whether a box is near ENOUGH; this
+// asks whether it is IN THE WAY. Declared here rather than in raster.glsl
+// because both traversals want it and they do not share a header: the hemisphere
+// (mbg_resolve_vis_coop) and the light view (lv_mass_texel), the latter reached
+// by direct_pixel.comp, which includes neither raster.glsl nor the other.
+uniform uint u_angular;
+uniform uint u_lv_angular;   // the same, for the light view's occlusion loop
+
 // A secondary camera: a point on a surface plus the normal its hemisphere is
 // built around.
 //   pos.w != 0  active. Inactive slots exist so that camera i of a level always

@@ -325,6 +325,11 @@ void main() {
         direct_out[cam * 2u + 1u] = vec4(direct_s, vis_s);
     }
 
+    // The emitter and sun light views ran after mbg_resolve_vis* already
+    // flushed, so their probe tallies need a flush of their own. It zeroes as it
+    // goes, so nothing is counted twice.
+    mbg_count_flush();
+
     MBG_PF_END(MBG_PF_REDUCE, pf_reduce);
 
     if (u_children == 0u) { mbg_perf_flush(tid); return; }

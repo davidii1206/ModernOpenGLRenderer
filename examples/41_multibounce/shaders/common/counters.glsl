@@ -58,7 +58,14 @@ uniform uint u_count;         // 1 = tally traversal work into MbgCount
 // This counts the times a hit was found anyway. It must be zero, and if it is
 // not, the test is rejecting geometry and the cull is wrong.
 #define MBG_CT_ANG_VIOL 11u
-#define MBG_CT_SLOTS    12u
+// The LIGHT VIEW is a second traversal, and it has had none of the work the
+// hemisphere got. Its occlusion loop walks every cluster lv_cull's frustum let
+// through, for every texel, with no per-texel box test of any kind. These two
+// ask the finding-30 question about it: how many (cluster, texel) pairs could a
+// slab test reject? Probe only -- nothing acts on them.
+#define MBG_CT_LV_PAIR  12u
+#define MBG_CT_LV_ANG   13u
+#define MBG_CT_SLOTS    14u
 
 layout(std430, binding = 14) buffer MbgCount { uint counters[]; };
 
@@ -82,10 +89,15 @@ void mbg_count_add64(uint slot, uint v) {
     if (old + v < old) atomicAdd(counters[slot * 2u + 1u], 1u);
 }
 
-// Push this invocation's tally to global memory. Call once, after the traversal.
+// Push this invocation's tally to global memory and ZERO it, so a kernel that
+// has two instrumented traversals in it -- the hemisphere and then a light view
+// per emitter -- can flush after each without counting the first one twice.
 void mbg_count_flush() {
     if (u_count == 0u) return;
-    for (uint i = 0u; i < MBG_CT_SLOTS; ++i) mbg_count_add64(i, g_tally[i]);
+    for (uint i = 0u; i < MBG_CT_SLOTS; ++i) {
+        mbg_count_add64(i, g_tally[i]);
+        g_tally[i] = 0u;
+    }
 }
 
 #endif

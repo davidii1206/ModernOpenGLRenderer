@@ -48,7 +48,7 @@ constexpr std::size_t kCamBytes = 32, kIrradBytes = 16, kDirectBytes = 32,
 // Seven 64-bit counts as fourteen 32-bit words. Allocated once at init and
 // always bound, so a shader that declares the buffer never writes into an
 // unbound binding point even when counting is off.
-static constexpr uint32_t kCountSlots = 12;
+static constexpr uint32_t kCountSlots = 14;
 static constexpr uint32_t kCountWords = kCountSlots * 2;
 
 void Solver::count_reset() {
@@ -77,6 +77,8 @@ Solver::Counts Solver::count_read() const {
     c.tex_ang   = u64(9);
     c.clu_pair  = u64(10);
     c.ang_viol  = u64(11);
+    c.lv_pair   = u64(12);
+    c.lv_ang    = u64(13);
     return c;
 }
 
@@ -84,7 +86,7 @@ Solver::Counts Solver::count_read() const {
 static constexpr uint32_t kPerfSlots = 8;
 
 void Solver::perf_reset() {
-    const uint32_t zero[kPerfSlots] = {};
+    const uint32_t zero[kPerfSlots * 2] = {};
     perf_.data(zero, sizeof(zero));
 }
 
@@ -96,11 +98,14 @@ const char* Solver::Phases::name(int i) {
 }
 
 Solver::Phases Solver::perf_read() const {
-    uint32_t w[kPerfSlots] = {};
+    uint32_t w[kPerfSlots * 2] = {};
     glGetNamedBufferSubData(perf_.handle(), 0, GLsizeiptr(sizeof(w)), w);
+    auto u64 = [&](int slot) {
+        return double(w[slot * 2 + 1]) * 4294967296.0 + double(w[slot * 2]);
+    };
     Phases p;
-    p.cameras = double(w[0]);
-    for (int i = 0; i < 7; ++i) p.cyc[i] = double(w[1 + i]);
+    p.cameras = u64(0);
+    for (int i = 0; i < 7; ++i) p.cyc[i] = u64(1 + i);
     return p;
 }
 
@@ -332,6 +337,7 @@ void Solver::raster_level(uint32_t l, uint32_t count, const Scene& scene,
     raster_.set("u_perf", cfg.perf ? 1 : 0);
     // Only the cooperative path has the per-texel direction mask this needs.
     raster_.set("u_angular", cfg.angular ? 1u : 0u);
+    raster_.set("u_lv_angular", cfg.lv_angular ? 1u : 0u);
     // The order only matters if there are cluster levels to reorder.
     raster_.set("u_order", (cfg.order && cfg.cull) ? 1u : 0u);
     raster_.set("u_res", li.res);
@@ -520,6 +526,8 @@ void Solver::direct_pixel(const GBuffer& gb, const gfx::Camera& cam, const Scene
     direct_px_.set("u_cluster_count", scene.cluster_count());
     direct_px_.set("u_cull", cfg.cull ? 1u : 0u);
     direct_px_.set("u_count", cfg.count ? 1u : 0u);
+    direct_px_.set("u_angular", cfg.angular ? 1u : 0u);
+    direct_px_.set("u_lv_angular", cfg.lv_angular ? 1u : 0u);
     direct_px_.set("u_emitters", cfg.nee ? scene.emitter_count() : 0u);
     cfg.sky.bind(direct_px_);
     direct_px_.set("u_lv_res", res);

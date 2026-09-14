@@ -261,6 +261,7 @@ EnvOpts read_env() {
     if (const char* v = getenv("MBG_COUNT"))    o.cfg.count = atoi(v) != 0;
     if (const char* v = getenv("MBG_PERF"))     o.cfg.perf = atoi(v) != 0;
     if (const char* v = getenv("MBG_ANGULAR"))  o.cfg.angular = atoi(v) != 0;
+    if (const char* v = getenv("MBG_LV_ANGULAR")) o.cfg.lv_angular = atoi(v) != 0;
     if (const char* v = getenv("MBG_TONEMAP"))  o.tonemap = atoi(v);
     if (const char* v = getenv("MBG_EXPOSURE")) o.exposure = float(atof(v));
     if (const char* v = getenv("MBG_PAUSE"))    o.paused = atoi(v) != 0;
@@ -352,6 +353,14 @@ static void report_counts(const mbg::Solver& solver, const mbg::Scene& scene,
                "direction this thread holds, %.1f%% of (cluster, texel) pairs "
                "unreachable\n",
                100.0 * c.clu_ang / c.clu_enter, 100.0 * c.tex_ang / c.clu_pair);
+    }
+    if (c.lv_pair > 0.0) {
+        // The light view is a SECOND traversal and has had none of the work the
+        // hemisphere got: no per-texel box test at all, just lv_cull's frustum
+        // once per view. This is finding 30's question asked about it.
+        printf("[count] light view: %.4g (cluster, texel) pairs walked, %.1f%% "
+               "of them unreachable by that texel's direction\n",
+               c.lv_pair, 100.0 * c.lv_ang / c.lv_pair);
     }
     printf("[count] per sweep: %.4g triangle fetches, %.4g hit tests  "
            "(the sweep line's \"triangle-rasters\" assumes %.4g)\n",

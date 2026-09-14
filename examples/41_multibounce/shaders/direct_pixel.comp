@@ -199,6 +199,10 @@ void main() {
     ivec2 p = ivec2(int(pix) % u_size.x, int(pix) / u_size.x);
     if (texelFetch(u_albedo, p, 0).a <= 0.5) return;
 
+    // This pass has no hemisphere traversal, only light views, so it owns the
+    // tally's lifetime itself. Both returns above are ahead of any counting.
+    mbg_count_init();
+
     vec3  N = normalize(texelFetch(u_normal, p, 0).xyz);
     float d = texelFetch(u_depth, p, 0).r;
     vec3  x0 = world_from_depth(d, (vec2(p) + 0.5) / vec2(u_size), u_inv_view_proj);
@@ -340,4 +344,5 @@ void main() {
         vec4 cur = imageLoad(u_target, p);
         imageStore(u_target, p, vec4(cur.rgb + E, 1.0));
     }
+    mbg_count_flush();
 }

@@ -123,7 +123,18 @@ void mbg_perf_init(uint tid) {
 void mbg_perf_flush(uint tid) {
     if (u_perf == 0) return;
     barrier();
-    if (tid < uint(MBG_PF_SLOTS)) atomicAdd(perf[tid], s_perf[tid]);
+    // 64-BIT, AS TWO WORDS WITH A CARRY. A uint32 holds 4.29e9 and a single
+    // phase of one sweep runs past that -- the first version wrapped, and the
+    // tell was a phase reporting FEWER cycles in the configuration that was
+    // 17x slower. Same carry as counters.glsl: a sum smaller than its addend
+    // wrapped exactly once, the addend itself being a 32-bit value.
+    if (tid < uint(MBG_PF_SLOTS)) {
+        uint v = s_perf[tid];
+        if (v != 0u) {
+            uint old = atomicAdd(perf[tid * 2u], v);
+            if (old + v < old) atomicAdd(perf[tid * 2u + 1u], 1u);
+        }
+    }
 }
 
 #endif

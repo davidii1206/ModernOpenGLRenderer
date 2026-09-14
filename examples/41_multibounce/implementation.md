@@ -39,6 +39,7 @@ reload sees it.
 | `MBG_PATHS=n` | **single-sample continuation**: split this many ways at the primary hit, branch factor 1 below it, so the cost is `paths × bounces` instead of `K^bounces` (default 20, where the estimator has saturated; 40 is the split that costs exactly what the branching tree costs at 3 bounces and is what the equal-cost comparison uses, see findings 21 and 26). `0` selects the branching tile estimator; see finding 20 |
 | `MBG_RR=f` | Russian-roulette threshold on path throughput (default 0.15). Below it a path survives with probability `throughput/f` and is divided by it. 0 disables |
 | `MBG_PERF=1` | bracket the raster kernel's seven phases with `GL_ARB_shader_clock`, so a dispatch that reads 3 s can say WHICH phase it spent it in. Cycles, comparable only within a dispatch; costs ~5% and is off by default. See finding 31 |
+| `MBG_LV_ANGULAR=1` | the same test in the LIGHT VIEW's occlusion loop, which is a second traversal that had no per-texel box test at all. 3.75x on a bunny sweep; see finding 32. `0` ablates it |
 | `MBG_ANGULAR=1` | skip a cluster no live texel direction passes through, before fetching its 64 triangles. 18x to 110x fewer clusters entered; see finding 30. `0` ablates it exactly |
 | `MBG_COUNT=1` | tally what the traversal actually TOUCHED -- clusters entered, triangles fetched, texel-triangle tests -- and print it beside the sweep. The sweep line's own "triangle-rasters" is an unculled upper bound computed on the host and is wrong by 46x on Cornell; see finding 27. Off by default |
 | `MBG_IMPORTANCE=0\|1` | draw the continuation from the micro-buffer's radiance rather than from `cos × dΩ × albedo` alone (default 1) |
@@ -2133,6 +2134,92 @@ compute synchronously, so "submit" is really "run". On hardware that time moves
 to `present`, and a frame that is slow in `present` is waiting on the GPU while
 one slow in `solve_submit` is CPU-bound in the driver. Those want opposite fixes,
 and before this there was no way to tell them apart.
+
+### 32. There are two traversals in this renderer, and only one of them got any work
+
+Finding 31's phase split was measured on Cornell, which is 32 triangles in one
+cluster and takes the UNCOOPERATIVE path -- the one scene where findings 26, 28
+and 30 do not execute. Drawing a conclusion from it was a mistake of exactly the
+kind finding 28 is about. Measured again on the bunny, which does exercise them:
+
+| phase | Cornell | Cornell+bunny |
+|---|---|---|
+| traverse | 33.1% | **31.6%** |
+| emitter light view | 14.6% | **20.4%** |
+| reduce+write | 20.0% | 16.1% |
+| spawn | 11.7% | 14.8% |
+
+**Traversal is about a third on both** -- 6017 cycles per camera against
+Cornell's 4440-5899, for 2170x the triangles. The angular cull has already made
+it close to scene independent, which is the argument against a BVH: a tree
+attacks the 481 box tests, and those sit inside the one phase that has stopped
+growing.
+
+The light view went the other way, 14.6% to 20.4%, and reading it explains why:
+
+```glsl
+for (uint k = 0u; k < ncl && !blocked; ++k) {
+    MbgCluster cl = clusters[lv_cl_at(k)];
+    for (uint t = first; t < last; ++t)
+        if (lv_tri_hit(t, d, dd) && dd < thresh) { blocked = true; break; }
+}
+```
+
+**No per-texel box test of any kind.** Every cluster lv_cull's frustum lets
+through has all 64 of its triangles fetched, for every texel. It is a second
+traversal, written separately, and findings 26, 28 and 30 all went into the other
+one.
+
+Probed before building, the same way finding 30 was: **71.8%** of (cluster,
+texel) pairs on Cornell+bunny and **44.8%** on Sponza are unreachable by the
+texel's own direction. Lower than the hemisphere's 90-99%, because lv_cull's
+frustum is narrow and has already removed most clusters -- but each rejected pair
+still skips 64 triangle tests.
+
+| bunny, 2 bounces, daylight | cull off | cull on | |
+|---|---|---|---|
+| sweep | 5006 ms | **1334 ms** | **3.75x** |
+| emitter LV, share of kernel | 54.6% | **24.3%** | |
+| emitter LV, cycles/camera | 841849 | **227993** | 3.7x |
+| traverse, cycles/camera | 607071 | 631876 | unchanged, as it should be |
+
+Sponza moves 21.0 s to 20.0 s: it has no emitters, so only the sun's cone is
+culled, and that cone is a degree wide and already tightly bounded. Cornell is
+untouched and bit-identical -- one cluster, whose box every direction hits.
+
+#### The tolerance is not an epsilon here, and pretending otherwise leaks light
+
+The first version expanded the cluster box by a float epsilon, as the
+hemisphere's does, and the image moved by **92/255 on two pixels**. That is not
+rounding; it is a light leak, and finding 19 is the reason.
+
+`lv_tri_hit` is not a pure ray test. It carries a half-space rule: where the
+receiver lies within `lv_peps` of a triangle's plane AND inside its bounds, the
+triangle blocks *whether or not `d` passes through it*, because everything on the
+far side is inside the material. That rule is what stops the sun leaking through
+concave creases where a reconstructed position lands microns outside the wall. A
+box expanded by 1e-6 rejects those clusters and undoes it.
+
+Expanding by `lv_peps` instead makes the cull conservative with respect to the
+rule rather than to the geometry: the rule can only fire where the ray ORIGIN is
+already inside the expanded box, and the slab test always accepts that. With that
+term the result is **bit-identical** on the bunny, on Sponza and on Cornell, and
+the speedup is unchanged.
+
+Worth stating plainly, because it is the general lesson: a bounding-volume
+rejection is only conservative with respect to the hit test it is guarding, and
+this renderer's two hit tests are not the same function. `mbg_hit_dir` is a ray
+test with an edge tolerance; `lv_tri_hit` is a ray test *plus* a proximity rule
+with a world-space tolerance. The cull has to be built against whichever it
+guards, and finding 30's version is not transplantable without this term.
+
+#### And the phase counters were wrapping
+
+The first isolated A/B reported a phase costing FEWER cycles in the configuration
+that was four times slower. The perf counters were `uint32`, a single phase of
+one sweep runs past 4.29e9, and they wrapped. They are now 64-bit as two words
+with a carry, like the work counters have been since finding 27 -- which is where
+the pattern should have been copied from in the first place.
 
 ## What this does not answer
 
