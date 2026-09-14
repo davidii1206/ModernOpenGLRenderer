@@ -38,6 +38,7 @@ reload sees it.
 | `MBG_BOUNCES=n` | camera levels, 1–`kMaxLevels`. **3 is the cap** (solver.hpp); 1 = direct only |
 | `MBG_PATHS=n` | **single-sample continuation**: split this many ways at the primary hit, branch factor 1 below it, so the cost is `paths × bounces` instead of `K^bounces` (default 20, where the estimator has saturated; 40 is the split that costs exactly what the branching tree costs at 3 bounces and is what the equal-cost comparison uses, see findings 21 and 26). `0` selects the branching tile estimator; see finding 20 |
 | `MBG_RR=f` | Russian-roulette threshold on path throughput (default 0.15). Below it a path survives with probability `throughput/f` and is divided by it. 0 disables |
+| `MBG_PERF=1` | bracket the raster kernel's seven phases with `GL_ARB_shader_clock`, so a dispatch that reads 3 s can say WHICH phase it spent it in. Cycles, comparable only within a dispatch; costs ~5% and is off by default. See finding 31 |
 | `MBG_ANGULAR=1` | skip a cluster no live texel direction passes through, before fetching its 64 triangles. 18x to 110x fewer clusters entered; see finding 30. `0` ablates it exactly |
 | `MBG_COUNT=1` | tally what the traversal actually TOUCHED -- clusters entered, triangles fetched, texel-triangle tests -- and print it beside the sweep. The sweep line's own "triangle-rasters" is an unculled upper bound computed on the host and is wrong by 46x on Cornell; see finding 27. Off by default |
 | `MBG_IMPORTANCE=0\|1` | draw the continuation from the micro-buffer's radiance rather than from `cos × dΩ × albedo` alone (default 1) |
@@ -2034,6 +2035,104 @@ So this ships on, with `MBG_ANGULAR=0` as the exact ablation and the assertion
 left in the shader, because the honest claim is "conservative except for one
 knife-edge in 1e10, cause unknown" and not "bit-identical". On hardware, with
 different float behaviour, the counter is the first thing to re-run.
+
+### 31. A pass timer cannot say which part of a pass, and this kernel does six things
+
+`PassTimer` reports that the level-1 raster dispatch took N milliseconds. The
+kernel it is timing resolves a hemisphere, integrates it, fits a light view per
+emitter, fits another for the sun, reduces across 64 threads, and spawns the next
+level. N tells you nothing about which of the six to attack, and finding 7
+already established that these per-pass timers are unreliable under `MBG_SOLVE`
+anyway, because the frame's first dispatch absorbs the JIT.
+
+`GL_ARB_shader_clock` reads a free-running counter from inside the shader, so a
+phase can be bracketed the way a CPU scope is -- the same instrument as example
+38's ray kernel. `MBG_PERF=1` turns it on; it is off by default.
+
+#### Two ways to build it wrong, both of which happened
+
+**All threads, shared atomic** (example 38's scheme, which is right *there*
+because each of its threads is a different ray). Here a workgroup is one camera
+and its 64 threads cooperate, so 64 lanes hit one address per phase and
+serialize. The tell was unmissable once looked for: on a scene with **no sun**,
+where the sun block evaluates one dot product and skips, the sun phase read
+**1283 cycles per camera**. That was the instrument timing itself, as a large
+additive constant on every phase.
+
+**Thread 0, no barrier.** Cheap, and it misattributes. A phase whose work is
+spread across the threads (`for i = tid; i < texels; i += 64`) ends for thread 0
+after a 64th of it, and the remainder lands in whichever LATER phase contains the
+barrier the others are still walking toward. Quadrature read **0.94%** while a
+downstream phase absorbed its time.
+
+What works is thread 0 sampling with a barrier at each boundary, so a phase spans
+what the WORKGROUP did -- which is what a cycles-per-camera figure should mean.
+The barriers exist only while `u_perf` is set.
+
+**Two scoping bugs the instrument caught in itself**, which is the argument for
+sanity checks that can fail. The "sun" bracket actually enclosed the sun block
+*plus* the six-step cross-thread reduction and both global writes -- now its own
+`reduce+write` phase. And the spawn phase read exactly **0.00%**, because path
+mode returns from the middle of the kernel and that return had no flush: the
+default estimator leaves through it at levels 1 and 2, so the phase and those
+levels' camera count were both simply missing.
+
+#### What makes the numbers trustworthy, and what does not
+
+Two checks the earlier versions failed and this one passes:
+
+- the workgroup count equals the sweep's camera count **exactly** (671744), so no
+  path out of the kernel is unaccounted for;
+- the sun phase **responds to the sun**: 5.0% and 671 cycles with none, 22.2% and
+  3844 with `MBG_DAYLIGHT=1`. The 671 is the bracket's own floor, now a stated
+  noise floor rather than a constant hidden in every row.
+
+Cost is **~5%** of sweep time on llvmpipe, and the image is **bit-identical**
+with it on and off.
+
+| Cornell, default, no sun | share | cycles/camera |
+|---|---|---|
+| traverse | **33-39%** | 4440-5899 |
+| reduce+write | 18-20% | 2685-2697 |
+| emitter light view | 15% | 1952-2265 |
+| spawn | 10-12% | 1569-1574 |
+| setup | 7-8% | 1105-1119 |
+| quadrature | 6.5-7% | 985-997 |
+| sun light view (inactive) | 4.4-5% | 671 = the floor |
+
+**Read that as a shape, not as figures.** Barriers on llvmpipe are CPU thread
+synchronization and disproportionately expensive, so `reduce+write` -- six
+barriers and two global writes -- is the row most likely overstated here. Finding
+22's rule still holds: this container cannot rank two versions of a loop. A
+within-dispatch split is a weaker claim than that, measured by one clock on one
+run, but it is not a free pass.
+
+The shape is still worth having, because it contradicts where the work has been
+going. **Traversal is about a third of the kernel**, and findings 26, 28 and 30
+all went into traversal. The other two thirds have had no attention at all, and
+`reduce+write` at a fifth of the kernel -- a 64-thread tree reduction and two
+stores, per camera -- is a target nothing before this instrument would have
+pointed at.
+
+#### The CPU side
+
+The GPU pass list never added up to the frame, and the difference was invisible.
+Four CPU-only timers now split it: poll, input, submit, present. On llvmpipe at
+one bounce they read
+
+```
+Frame            2478.560 ms
+poll_events         0.017
+camera_input        0.048
+solve_submit     2263.663
+present             4.063
+```
+
+which says the CPU is *blocking inside dispatch submission* -- llvmpipe executes
+compute synchronously, so "submit" is really "run". On hardware that time moves
+to `present`, and a frame that is slow in `present` is waiting on the GPU while
+one slow in `solve_submit` is CPU-bound in the driver. Those want opposite fixes,
+and before this there was no way to tell them apart.
 
 ## What this does not answer
 

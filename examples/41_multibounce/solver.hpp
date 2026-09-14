@@ -246,6 +246,10 @@ struct SolveConfig {
     // a position to verify on llvmpipe (finding 22), so the shipped path does
     // not carry it. See shaders/common/counters.glsl and MBG_COUNT.
     bool      count = false;
+    // Bracket the kernel's five phases with GL_ARB_shader_clock, so a dispatch
+    // that reads 3 s can say WHICH of the five it spent it in. Off by default
+    // for the same reason as `count`. See shaders/common/perf.glsl.
+    bool      perf = false;
 
     // Only the fields that change buffer sizes.
     bool layout_equals(const SolveConfig& o) const {
@@ -324,6 +328,21 @@ public:
     };
     Counts count_read() const;
 
+    // --- In-shader phase cycles (SolveConfig::perf) --------------------------
+    //
+    // Cycles, not milliseconds, and only comparable WITHIN one dispatch: the
+    // clock counts issue cycles on whatever unit ran the invocation. Read every
+    // half second rather than every frame -- the readback synchronizes, and two
+    // stalls a second on a diagnostic that is off by default is a fair trade for
+    // not double-buffering a 28-byte buffer.
+    void perf_reset();
+    struct Phases {
+        double cameras = 0;
+        double cyc[7] = {};      // setup traverse quad emitter sun reduce spawn
+        static const char* name(int i);
+    };
+    Phases perf_read() const;
+
     uint32_t cursor() const { return cursor_; }
     uint32_t sweeps() const { return sweeps_; }
     uint32_t gi_pixels() const { return uint32_t(gi_w_ * gi_h_); }
@@ -371,6 +390,7 @@ private:
 
     // Seven 64-bit counters as pairs of 32-bit words; see counters.glsl.
     mutable gl::Buffer counters_{gl::BufferType::shader, gl::BufferUsage::dynamic_draw};
+    mutable gl::Buffer perf_{gl::BufferType::shader, gl::BufferUsage::dynamic_draw};
 
     gl::Texture gi_{gl::TextureType::tex_2d};      // GI grid, RGBA32F, (E, 1)
     gl::Texture gi_tmp_{gl::TextureType::tex_2d};  // ping-pong for the denoise

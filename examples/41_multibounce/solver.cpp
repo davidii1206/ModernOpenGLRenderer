@@ -80,8 +80,33 @@ Solver::Counts Solver::count_read() const {
     return c;
 }
 
+// Seven slots: a camera count and the six phases. See shaders/common/perf.glsl.
+static constexpr uint32_t kPerfSlots = 8;
+
+void Solver::perf_reset() {
+    const uint32_t zero[kPerfSlots] = {};
+    perf_.data(zero, sizeof(zero));
+}
+
+const char* Solver::Phases::name(int i) {
+    static const char* kNames[7] = {"setup", "traverse", "quadrature",
+                                    "emitter LV", "sun LV", "reduce+write",
+                                    "spawn"};
+    return (i >= 0 && i < 7) ? kNames[i] : "?";
+}
+
+Solver::Phases Solver::perf_read() const {
+    uint32_t w[kPerfSlots] = {};
+    glGetNamedBufferSubData(perf_.handle(), 0, GLsizeiptr(sizeof(w)), w);
+    Phases p;
+    p.cameras = double(w[0]);
+    for (int i = 0; i < 7; ++i) p.cyc[i] = double(w[1 + i]);
+    return p;
+}
+
 bool Solver::init() {
     count_reset();
+    perf_reset();
     place_    = Pipeline::compute("shaders/place.comp");
     raster_   = Pipeline::compute("shaders/raster.comp");
     gather_   = Pipeline::compute("shaders/gather.comp");
@@ -278,6 +303,7 @@ void Solver::raster_level(uint32_t l, uint32_t count, const Scene& scene,
     raster_.use();
     scene.bind();
     counters_.bind_base(kBindCounters);
+    perf_.bind_base(kBindPerf);
     cams_[l].bind_base(kBindCams);
     quad_[l].bind();
     irrad_[l].bind_base(kBindIrrad);
@@ -303,6 +329,7 @@ void Solver::raster_level(uint32_t l, uint32_t count, const Scene& scene,
                 (cfg.coop && scene.cluster_count() > 8u) ? 1u : 0u);
     raster_.set("u_cull", cfg.cull ? 1u : 0u);
     raster_.set("u_count", cfg.count ? 1u : 0u);
+    raster_.set("u_perf", cfg.perf ? 1 : 0);
     // Only the cooperative path has the per-texel direction mask this needs.
     raster_.set("u_angular", cfg.angular ? 1u : 0u);
     // The order only matters if there are cluster levels to reorder.

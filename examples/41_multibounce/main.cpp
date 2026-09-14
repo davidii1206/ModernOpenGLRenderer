@@ -100,6 +100,10 @@
 //                           inside rather than from 2.2 radii away
 //   MBG_SOLVE=n             complete n sweeps before the first present, then hold
 //   MBG_COMPARE=0|1         print RMSE against the reference after the solve
+//   MBG_PERF=1              bracket the raster kernel's five phases with the
+//                           shader clock, so a dispatch that reads 3 s can say
+//                           WHICH phase it spent it in. Cycles, comparable only
+//                           within a dispatch. Off by default
 //   MBG_COUNT=1             tally what the traversal actually touched (clusters
 //                           entered, triangles fetched, texel-triangle tests)
 //                           and print it beside the sweep. The honest version of
@@ -255,6 +259,7 @@ EnvOpts read_env() {
     if (const char* v = getenv("MBG_NOGUI"))    o.nogui = atoi(v) != 0;
     if (const char* v = getenv("MBG_COMPARE"))  o.compare = atoi(v) != 0;
     if (const char* v = getenv("MBG_COUNT"))    o.cfg.count = atoi(v) != 0;
+    if (const char* v = getenv("MBG_PERF"))     o.cfg.perf = atoi(v) != 0;
     if (const char* v = getenv("MBG_ANGULAR"))  o.cfg.angular = atoi(v) != 0;
     if (const char* v = getenv("MBG_TONEMAP"))  o.tonemap = atoi(v);
     if (const char* v = getenv("MBG_EXPOSURE")) o.exposure = float(atof(v));
@@ -352,6 +357,35 @@ static void report_counts(const mbg::Solver& solver, const mbg::Scene& scene,
            "(the sweep line's \"triangle-rasters\" assumes %.4g)\n",
            c.tri_setup / n, c.tex_test / n,
            solver.sweep_cameras() * tris);
+}
+
+// --- Where the time went inside the kernel -----------------------------------
+//
+// A share, not a duration. The shader clock counts issue cycles on whatever unit
+// ran the invocation, so cycles against milliseconds means nothing -- but phase
+// against phase, measured by the same clock in the same dispatch, is a ratio,
+// and a ratio is what decides which phase to attack. That is a far weaker claim
+// than ranking two versions of a loop, which finding 22 established this
+// container cannot do.
+static void report_phases(const mbg::Solver& solver) {
+    const mbg::Solver::Phases p = solver.perf_read();
+    if (p.cameras <= 0.0) {
+        printf("[perf] no cameras tallied -- is MBG_PERF reaching the kernel?\n");
+        return;
+    }
+    double total = 0.0;
+    for (int i = 0; i < 7; ++i) total += p.cyc[i];
+    if (total <= 0.0) {
+        printf("[perf] the shader clock read zero: GL_ARB_shader_clock is "
+               "probably unsupported here, so the phase split is unavailable\n");
+        return;
+    }
+    printf("[perf] raster kernel, %.0f workgroups, %.4g total cycles\n",
+           p.cameras, total);
+    for (int i = 0; i < 7; ++i)
+        printf("[perf]   %-12s %6.2f%%   %9.0f cycles/camera\n",
+               mbg::Solver::Phases::name(i), 100.0 * p.cyc[i] / total,
+               p.cyc[i] / p.cameras);
 }
 
 // Numeric comparison against a reference PNG, in DISPLAY space.
@@ -617,10 +651,20 @@ int main() {
     // --- Timers --------------------------------------------------------------
 
     PassTimer t_frame("Frame", false);
+    // CPU-only, and the point of them is that the GPU pass list does not add up
+    // to the frame: the difference is host work. Example 38 splits it the same
+    // way -- poll, input, submit, present -- because a frame that is slow in
+    // `present` is waiting on the GPU, and one that is slow in `submit` is
+    // CPU bound in the driver, and those want opposite fixes.
+    PassTimer t_poll("poll_events", false);
+    PassTimer t_input("camera_input", false);   // camera, resize, hot reload
+    PassTimer t_submit("solve_submit", false);  // the CPU cost of issuing the solve
+    PassTimer t_present("present", false);      // gui.render + swap_buffers
     PassTimer t_gbuf("G-buffer");
     PassTimer t_display("Display");
     PassTimer t_imgui("ImGui");
-    PassTimer* const timers[] = {&t_frame, &t_gbuf, &t_display, &t_imgui};
+    PassTimer* const timers[] = {&t_frame, &t_poll, &t_input, &t_submit,
+                                 &t_present, &t_gbuf, &t_display, &t_imgui};
     // One per LEVEL, so this list is kMaxLevels long and not one longer: the cap
     // came down from 4 to 3 when the recursion was limited to three bounces, and
     // the stale fourth entry was an out-of-bounds std::array read that a release
@@ -647,6 +691,10 @@ int main() {
     bool shot_done = false;
     double last_time = window.time();
     double window_accum = 0.0;
+    // Sampled on the same 0.5 s cadence as the pass timers. The readback
+    // synchronizes, so twice a second on an opt-in diagnostic rather than every
+    // frame is the trade; a 32-byte buffer does not justify double-buffering.
+    mbg::Solver::Phases disp_phases{};
     std::vector<double> bench_ms;
     glm::mat4 last_view_proj = cam.view_projection();
 
@@ -665,8 +713,11 @@ int main() {
         // point the CPU runs far ahead and would report submission cost.
         if (frame_index > 0) t_frame.submit_external(frame_ms);
 
+        t_poll.begin();
         window.poll_events();
+        t_poll.end();
 
+        t_input.begin();
         const int fw = window.framebuffer_width();
         const int fh = window.framebuffer_height();
         if (fw > 0 && fh > 0 && (fw != gbuf.width || fh != gbuf.height)) {
@@ -691,6 +742,8 @@ int main() {
             last_view_proj = view_proj;
         }
 
+        t_input.end();
+
         // 1. Primary G-buffer, the one hardware raster pass (doc section 5.5).
         {
             ScopedPass p(t_gbuf);
@@ -698,6 +751,7 @@ int main() {
         }
 
         // 2. One chunk of the recursive solve.
+        t_submit.begin();
         solver.configure(cfg, gbuf.width, gbuf.height);
         if (presolve > 0) {
             // Run whole sweeps up front. Each sweep is ceil(pixels/budget) chunks.
@@ -712,6 +766,7 @@ int main() {
             // a frame is an arbitrary slice of one.
             glFinish();
             if (run.count) solver.count_reset();
+            if (run.perf) solver.perf_reset();
             const double t0 = window.time();
             for (uint32_t s = 0; s < presolve; ++s)
                 for (uint32_t c = 0; c < chunks; ++c) solver.step(gbuf, cam, scene, run);
@@ -724,6 +779,7 @@ int main() {
                    sweep_ms, chunks, solver.sweep_cameras(), solver.sweep_texels(),
                    solver.sweep_cameras() * double(scene.count()));
             if (run.count) report_counts(solver, scene, presolve);
+            if (run.perf) report_phases(solver);
             presolve = 0;
             cfg.running = false;
         } else {
@@ -739,6 +795,7 @@ int main() {
         // wraps a GL query object, and a query cannot begin while another is
         // active.
         solver.direct_pixel(gbuf, cam, scene, cfg);
+        t_submit.end();
 
         // 3. Display.
         {
@@ -927,12 +984,53 @@ int main() {
 
             if (ImGui::CollapsingHeader("Timing", ImGuiTreeNodeFlags_DefaultOpen)) {
                 ImGui::Text("Frame    %6.2f ms", t_frame.disp_cpu());
+                ImGui::SeparatorText("GPU passes");
                 for (PassTimer* t : timers) {
                     if (!t->gpu()) continue;
-                    ImGui::Text("%-8s %6.3f ms", t->name(), t->disp_gpu());
+                    ImGui::Text("%-12s %6.3f ms", t->name(), t->disp_gpu());
                 }
                 for (PassTimer* t : solver_timers)
-                    ImGui::Text("%-8s %6.3f ms", t->name(), t->disp_gpu());
+                    ImGui::Text("%-12s %6.3f ms", t->name(), t->disp_gpu());
+                // The GPU list does not add up to the frame; the rest is host
+                // work, and which part of it matters tells you whether to fix
+                // the driver submission or wait on the GPU.
+                ImGui::SeparatorText("CPU");
+                for (PassTimer* t : timers) {
+                    if (t->gpu() || t == &t_frame) continue;
+                    ImGui::Text("%-12s %6.3f ms", t->name(), t->disp_cpu());
+                }
+            }
+
+            // Inside the kernel. A pass timer says the raster dispatch took N
+            // ms; this says which of its seven phases took it. See
+            // shaders/common/perf.glsl for why these are cycles and not ms, and
+            // why they may only be compared with each other.
+            if (ImGui::CollapsingHeader("Kernel phases (shader clock)")) {
+                bool perf_on = cfg.perf;
+                if (ImGui::Checkbox("Enabled (MBG_PERF)", &perf_on)) {
+                    cfg.perf = perf_on;
+                    solver.perf_reset();
+                    disp_phases = mbg::Solver::Phases{};
+                }
+                if (!cfg.perf) {
+                    ImGui::TextWrapped("Off. Costs a few percent -- one barrier "
+                                       "and one clock read per phase -- so it is "
+                                       "not carried by default.");
+                } else if (disp_phases.cameras <= 0.0) {
+                    ImGui::TextUnformatted("sampling...");
+                } else {
+                    double tot = 0.0;
+                    for (int i = 0; i < 7; ++i) tot += disp_phases.cyc[i];
+                    ImGui::Text("%.0f cameras, %.4g cycles", disp_phases.cameras, tot);
+                    for (int i = 0; i < 7 && tot > 0.0; ++i) {
+                        const double f = disp_phases.cyc[i] / tot;
+                        ImGui::Text("%-13s %5.1f%%  %8.0f cyc/cam",
+                                    mbg::Solver::Phases::name(i), 100.0 * f,
+                                    disp_phases.cyc[i] / disp_phases.cameras);
+                        ImGui::SameLine();
+                        ImGui::ProgressBar(float(f), ImVec2(-1.0f, 0.0f), "");
+                    }
+                }
             }
 
             ImGui::End();
@@ -956,7 +1054,9 @@ int main() {
                         env.shot_path.c_str());
         }
 
+        t_present.begin();
         window.swap_buffers();
+        t_present.end();
 
         for (PassTimer* t : timers) t->readback();
         for (PassTimer* t : solver_timers) t->readback();
@@ -972,6 +1072,10 @@ int main() {
         if (window_accum >= 500.0) {
             for (PassTimer* t : timers) t->flush_window();
             for (PassTimer* t : solver_timers) t->flush_window();
+            if (cfg.perf && presolve == 0) {
+                disp_phases = solver.perf_read();
+                solver.perf_reset();
+            }
             window_accum = 0.0;
         }
 
@@ -1007,6 +1111,11 @@ int main() {
             printf(" %ux%u", solver.level(l).res, solver.level(l).res);
         printf(", %.0f cameras and %.3g texels per chunk\n",
                solver.chunk_cameras(), solver.chunk_texels());
+        printf("[bench] CPU per phase (avg ms):\n");
+        for (PassTimer* t : timers) {
+            if (t->gpu()) continue;
+            printf("    %-16s %7.3f\n", t->name(), t->avg_cpu());
+        }
     }
 
     if (!env.nogui) gui.shutdown();

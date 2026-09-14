@@ -78,6 +78,7 @@ enum Binding : uint32_t {
     kBindGroups   = 12,    // bounds over RUNS of clusters: the coarse level
     kBindTriShade = 13,    // albedo and emission, read only for a winner
     kBindCounters = 14,    // traversal work counters; MBG_COUNT only
+    kBindPerf     = 15,    // in-shader phase cycles; MBG_PERF only
 };
 
 // The GPU triangle, mirroring MbgTri in shaders/common/scene.glsl.

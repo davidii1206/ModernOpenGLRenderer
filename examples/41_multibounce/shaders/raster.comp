@@ -1,4 +1,8 @@
 #version 460 core
+// perf.glsl reads the shader clock; an #extension directive is only legal
+// before any code, and an include expands in the middle of one -- so it is
+// declared here, exactly as example 38's ray kernel declares it.
+#extension GL_ARB_shader_clock : enable
 layout(local_size_x = 64) in;
 
 // ---------------------------------------------------------------------------
@@ -38,6 +42,7 @@ layout(local_size_x = 64) in;
 #include "emitter.glsl"
 #include "lightview.glsl"
 #include "sky.glsl"
+#include "perf.glsl"
 
 layout(std430, binding = 1) readonly  buffer MbgCams     { MbgCam cams[]; };
 layout(std430, binding = 3) writeonly buffer MbgIrrad    { vec4   irradiance[]; };
@@ -79,6 +84,9 @@ void main() {
     // barrier: every invocation of a workgroup takes the same branch.
     if (cam >= u_cam_count) return;
 
+    mbg_perf_init(tid);
+    MBG_PF_T0(pf_setup);
+
     // In tile mode the child count is fixed by the target and the tile edge; in
     // path mode the host sets it directly (the split factor at the primary hit,
     // one everywhere below it). Either way u_children is the authority on how
@@ -107,6 +115,8 @@ void main() {
             child_cam[cam * nblock + b].pos = vec4(0.0);
             child_cam[cam * nblock + b].nrm = vec4(0.0);
         }
+        MBG_PF_END(MBG_PF_SETUP, pf_setup);
+        mbg_perf_flush(tid);
         return;
     }
 
@@ -114,11 +124,17 @@ void main() {
 
     uint texels = u_res * u_res;
 
+    MBG_PF_END(MBG_PF_SETUP, pf_setup);
+
+    MBG_PF_T0(pf_trav);
     mbg_cull(tid, 64u, u_cluster_count);
     if (u_coop != 0u) mbg_resolve_vis_coop(tid, 64u, u_group_count);
     else              mbg_resolve_vis(tid, 64u, u_group_count, u_tri_count);
     barrier();
     memoryBarrierShared();
+    MBG_PF_END(MBG_PF_TRAVERSE, pf_trav);
+
+    MBG_PF_T0(pf_quad);
 
     if (u_dump == 1u)
         for (uint i = tid; i < texels; i += 64u) vis_out[cam * texels + i] = s_vis[i];
@@ -199,6 +215,9 @@ void main() {
     // visibility it actually describes.
     vec3  direct_e = vec3(0.0), direct_s = vec3(0.0);
     float unsh_e = 0.0, unsh_s = 0.0;
+    MBG_PF_END(MBG_PF_QUAD, pf_quad);
+
+    MBG_PF_T0(pf_emit);
     for (uint e = 0u; e < u_emitters; ++e) {
         uint ti = emitters[e];
         vec3 mag = mbg_emitter_unshadowed(g_P, g_N, mbg_tri(ti), u_two_sided != 0u,
@@ -246,6 +265,9 @@ void main() {
     // why a light at infinity needs only one rasterization). The test below is
     // workgroup uniform: it depends on the receiver's normal and on uniforms,
     // both identical in every invocation, so the barriers inside cannot split.
+    MBG_PF_END(MBG_PF_EMITTER, pf_emit);
+
+    MBG_PF_T0(pf_sun);
     vec3 sun_mag = mbg_sun_unshadowed(g_N);
     if (dot(sun_mag, vec3(1.0)) > 0.0) {
         lv_setup_dir(g_P, g_N, u_sun_dir, u_sun_tan_r, lv_near_for(u_inv_far),
@@ -269,6 +291,9 @@ void main() {
         barrier();
     }
 
+    MBG_PF_END(MBG_PF_SUN, pf_sun);
+
+    MBG_PF_T0(pf_reduce);
     vec3 direct = direct_e + direct_s;
     if (tid == 0u) acc += direct;
 
@@ -300,7 +325,11 @@ void main() {
         direct_out[cam * 2u + 1u] = vec4(direct_s, vis_s);
     }
 
-    if (u_children == 0u) return;
+    MBG_PF_END(MBG_PF_REDUCE, pf_reduce);
+
+    if (u_children == 0u) { mbg_perf_flush(tid); return; }
+
+    MBG_PF_T0(pf_spawn);
 
     // --- Spawn the next level, A: single-sample continuation -----------------
     //
@@ -512,6 +541,12 @@ void main() {
             // roulette without a buffer of its own.
             child_cam[slot].nrm = vec4(hn, alive != 0.0 ? thr : 0.0);
         }
+        // `u_paths` is a uniform, so this return is workgroup uniform and the
+        // barrier inside the flush is legal. It is also the DEFAULT path out of
+        // this kernel -- levels 1 and 2 both leave here -- so forgetting it
+        // costs the spawn phase and those levels' camera count entirely.
+        MBG_PF_END(MBG_PF_SPAWN, pf_spawn);
+        mbg_perf_flush(tid);
         return;
     }
 
@@ -670,4 +705,7 @@ void main() {
         child_cam[slot].pos = vec4(hit, alive);
         child_cam[slot].nrm = vec4(hn, alive);
     }
+
+    MBG_PF_END(MBG_PF_SPAWN, pf_spawn);
+    mbg_perf_flush(tid);
 }
