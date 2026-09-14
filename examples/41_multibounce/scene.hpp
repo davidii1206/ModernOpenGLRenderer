@@ -77,6 +77,7 @@ enum Binding : uint32_t {
     kBindClusters = 11,    // triangle-cluster bounds, for culling
     kBindGroups   = 12,    // bounds over RUNS of clusters: the coarse level
     kBindTriShade = 13,    // albedo and emission, read only for a winner
+    kBindCounters = 14,    // traversal work counters; MBG_COUNT only
 };
 
 // The GPU triangle, mirroring MbgTri in shaders/common/scene.glsl.

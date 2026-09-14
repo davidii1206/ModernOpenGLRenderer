@@ -235,6 +235,13 @@ struct SolveConfig {
     float     plane_tol = 0.05f;   // upsample plane cutoff, world units
     bool      running = true;
 
+    // TALLY WHAT THE TRAVERSAL ACTUALLY TOUCHED. Off by default: it costs a
+    // workgroup-uniform branch per loop iteration and one atomic per counter per
+    // camera, which is nothing, but "nothing" is a claim this example is not in
+    // a position to verify on llvmpipe (finding 22), so the shipped path does
+    // not carry it. See shaders/common/counters.glsl and MBG_COUNT.
+    bool      count = false;
+
     // Only the fields that change buffer sizes.
     bool layout_equals(const SolveConfig& o) const {
         if (bounces != o.bounces || scale != o.scale || budget != o.budget ||
@@ -299,6 +306,18 @@ public:
 
     const gl::Texture& target() const { return full_; }
 
+    // --- Traversal work counters (SolveConfig::count) -----------------------
+    //
+    // Zero them, run whatever is being measured, then read them back. The
+    // readback maps the buffer and so synchronizes; it is a measurement tool
+    // and belongs nowhere near a frame.
+    void count_reset();
+    struct Counts {
+        double cameras = 0, grp_test = 0, grp_enter = 0, clu_test = 0,
+               clu_enter = 0, tri_setup = 0, tex_test = 0, texels = 0;
+    };
+    Counts count_read() const;
+
     uint32_t cursor() const { return cursor_; }
     uint32_t sweeps() const { return sweeps_; }
     uint32_t gi_pixels() const { return uint32_t(gi_w_ * gi_h_); }
@@ -343,6 +362,9 @@ private:
     Quadrature direct_quad_;       // for the per-pixel direct pass
     std::array<LevelInfo, kMaxLevels> info_{};
     uint32_t levels_ = 0;
+
+    // Seven 64-bit counters as pairs of 32-bit words; see counters.glsl.
+    mutable gl::Buffer counters_{gl::BufferType::shader, gl::BufferUsage::dynamic_draw};
 
     gl::Texture gi_{gl::TextureType::tex_2d};      // GI grid, RGBA32F, (E, 1)
     gl::Texture gi_tmp_{gl::TextureType::tex_2d};  // ping-pong for the denoise

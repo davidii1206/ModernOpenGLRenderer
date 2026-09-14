@@ -98,6 +98,11 @@
 //                           inside rather than from 2.2 radii away
 //   MBG_SOLVE=n             complete n sweeps before the first present, then hold
 //   MBG_COMPARE=0|1         print RMSE against the reference after the solve
+//   MBG_COUNT=1             tally what the traversal actually touched (clusters
+//                           entered, triangles fetched, texel-triangle tests)
+//                           and print it beside the sweep. The honest version of
+//                           the sweep line's "triangle-rasters", which is an
+//                           UNCULLED upper bound. Off by default
 //   MBG_BENCH=n             n frames, print per-pass timings, exit
 //   MBG_SHOT=path.png       write the final frame
 //   MBG_NOGUI=1             no ImGui -- required for a clean screenshot
@@ -247,6 +252,7 @@ EnvOpts read_env() {
     if (const char* v = getenv("MBG_SHOT"))     { o.shot = true; o.shot_path = v; }
     if (const char* v = getenv("MBG_NOGUI"))    o.nogui = atoi(v) != 0;
     if (const char* v = getenv("MBG_COMPARE"))  o.compare = atoi(v) != 0;
+    if (const char* v = getenv("MBG_COUNT"))    o.cfg.count = atoi(v) != 0;
     if (const char* v = getenv("MBG_TONEMAP"))  o.tonemap = atoi(v);
     if (const char* v = getenv("MBG_EXPOSURE")) o.exposure = float(atof(v));
     if (const char* v = getenv("MBG_PAUSE"))    o.paused = atoi(v) != 0;
@@ -264,6 +270,69 @@ void report_bench(std::vector<double> ms) {
     auto pct = [&](double p) { return ms[std::size_t(p * double(ms.size() - 1))]; };
     printf("[bench] n=%zu  min=%.3f  p10=%.3f  p50=%.3f  p90=%.3f ms\n",
            ms.size(), ms.front(), pct(0.10), pct(0.50), pct(0.90));
+}
+
+// --- What the traversal actually touched -------------------------------------
+//
+// The sweep line's "triangle-rasters" is `cameras x scene.count()`: the work a
+// traversal with no cull, no distance bound and no hierarchy would do. It is
+// exact on Cornell, where the cull is disabled below eight clusters, and it is
+// fiction on anything larger -- which is a problem, because the cull, the bound
+// and the order are three of this example's levers and that number does not move
+// when any of them does.
+//
+// These counts do. They are gathered in the shader (see counters.glsl) and are
+// identical on every machine, which matters more here than usual: finding 22
+// settled that llvmpipe cannot rank these loops, so a count is the only evidence
+// this container can produce about a traversal change.
+//
+// PER CAMERA-THREAD, not per camera. In the cooperative traversal all 64 threads
+// of a workgroup walk the same group and cluster lists, each carrying its own
+// texels and its own distance bound, so each does its own fetch and its own
+// setup. Dividing by 64 gives what ONE thread walked, which is the number that
+// compares against the scene's triangle count -- and the ratio between them is
+// exactly what the cull and the bound are worth.
+static void report_counts(const mbg::Solver& solver, const mbg::Scene& scene,
+                          uint32_t sweeps) {
+    const mbg::Solver::Counts c = solver.count_read();
+    if (c.cameras <= 0.0 || c.texels <= 0.0) {
+        printf("[count] nothing tallied -- is the traversal running?\n");
+        return;
+    }
+    const double n = double(sweeps);
+    const double tris = double(std::max(1u, scene.count()));
+
+    // ACTIVE cameras, not scheduled ones. A slot whose pos.w is zero -- a
+    // background pixel, or a path that escaped through the opening -- writes its
+    // zeros and returns before any traversal, so it costs a dispatch and nothing
+    // else. The schedule's count is what the sweep line reports.
+    printf("[count] cameras: %.4g active of %.4g scheduled (%.1f%% live), "
+           "%.4g texels rasterized\n",
+           c.cameras / n, solver.sweep_cameras(),
+           100.0 * (c.cameras / n) / std::max(1.0, solver.sweep_cameras()),
+           c.texels / n);
+
+    // PER TEXEL is the one denominator both traversal paths share. The
+    // per-texel path fetches a triangle for one texel; the cooperative one
+    // fetches it once for the four its thread carries, so a fetch count that
+    // falls below the test count is exactly the amortization coop exists for.
+    printf("[count] per texel: %.2f triangles fetched, %.2f hit tests "
+           "(the scene has %.0f; unculled would be %.0f)\n",
+           c.tri_setup / c.texels, c.tex_test / c.texels, tris, tris);
+
+    if (c.grp_test > 0.0) {
+        // Summed over the 64 threads of a workgroup, each of which walks the
+        // whole list with its own distance bound, so divide by both.
+        const double ct = c.cameras * 64.0;
+        printf("[count] per camera-thread: %.1f group tests -> %.1f entered, "
+               "%.1f cluster tests -> %.1f entered\n",
+               c.grp_test / ct, c.grp_enter / ct, c.clu_test / ct, c.clu_enter / ct);
+    }
+
+    printf("[count] per sweep: %.4g triangle fetches, %.4g hit tests  "
+           "(the sweep line's \"triangle-rasters\" assumes %.4g)\n",
+           c.tri_setup / n, c.tex_test / n,
+           solver.sweep_cameras() * tris);
 }
 
 // Numeric comparison against a reference PNG, in DISPLAY space.
@@ -623,6 +692,7 @@ int main() {
             // for the technique: one complete sweep is one finished image, where
             // a frame is an arbitrary slice of one.
             glFinish();
+            if (run.count) solver.count_reset();
             const double t0 = window.time();
             for (uint32_t s = 0; s < presolve; ++s)
                 for (uint32_t c = 0; c < chunks; ++c) solver.step(gbuf, cam, scene, run);
@@ -634,6 +704,7 @@ int main() {
                    "%.4g triangle-rasters)\n",
                    sweep_ms, chunks, solver.sweep_cameras(), solver.sweep_texels(),
                    solver.sweep_cameras() * double(scene.count()));
+            if (run.count) report_counts(solver, scene, presolve);
             presolve = 0;
             cfg.running = false;
         } else {

@@ -19,6 +19,7 @@
 
 #include "scene.glsl"
 #include "hemi.glsl"
+#include "counters.glsl"
 
 uniform uint  u_res;          // hemisphere target edge, texels
 
@@ -334,6 +335,12 @@ void mbg_resolve_vis_coop(uint tid, uint stride, uint group_count) {
     uint n = u_res * u_res;
     uint span = stride * MBG_TEXELS_PER_THREAD;
 
+    mbg_count_init();
+    if (u_count != 0u && tid == 0u) {
+        g_tally[MBG_CT_CAMERA] = 1u;
+        g_tally[MBG_CT_TEXEL]  = n;
+    }
+
     mbg_order_groups(tid, stride, group_count);
 
     // A THREAD'S FOUR TEXELS ARE STRIDED, AND GIVING IT A 2x2 TILE INSTEAD DOES
@@ -354,24 +361,47 @@ void mbg_resolve_vis_coop(uint tid, uint stride, uint group_count) {
         float bd[MBG_TEXELS_PER_THREAD];
         float worst = 0.0;                 // this thread's loosest bound
 
+        // A SLOT THIS THREAD DOES NOT OWN MUST NOT HOLD A BOUND.
+        //
+        // `i` climbs with k, so a thread's slots are valid up to some nk and
+        // dead after it -- and at an 8x8 target they are mostly dead: n is 64
+        // and so is the stride, so i = k*64 + tid is in range for k = 0 alone
+        // and three slots in four are padding. That is the common case, not the
+        // edge one. The default schedule puts 40 of its 41 cameras at res 8.
+        //
+        // Padding used to be initialized to 1e18 like everything else, and
+        // `worst` is the MAX over the four. So worst stayed at infinity for the
+        // whole traversal, both box tests compared against infinity, and the
+        // distance bound -- the lever findings 22 and 24 are built on -- was
+        // inert on every camera that had padding. The cull still removed
+        // clusters below the tangent plane; nothing else did anything.
+        //
+        // Dead slots get a bound of ZERO instead, which is the identity for a
+        // max: they cannot loosen `worst`, and no box can be nearer than
+        // nothing. nk then keeps them out of the inner loop as well.
+        uint nk = 0u;
         for (uint k = 0u; k < MBG_TEXELS_PER_THREAD; ++k) {
             uint i = base + k * stride + tid;
-            d[k] = i < n ? mbg_to_world(mbg_px_to_dir(vec2(float(i % u_res),
-                                                           float(i / u_res)) + vec2(0.5), u_res))
-                         : vec3(0.0, 0.0, 1.0);
+            bool live = i < n;
+            d[k] = live ? mbg_to_world(mbg_px_to_dir(vec2(float(i % u_res),
+                                                          float(i / u_res)) + vec2(0.5), u_res))
+                        : vec3(0.0, 0.0, 1.0);
             len[k] = length(d[k]);
             best[k] = MBG_EMPTY;
             bd[k] = 1e18;
+            if (live) nk = k + 1u;
         }
-        worst = 1e18;
+        worst = max(max(bd[0], bd[1]), max(bd[2], bd[3]));
 
         for (uint gi = 0u; gi < group_count; ++gi) {
             uint g = mbg_group_at(gi);
             vec3 gq = max(max(groups[g].lo.xyz - g_P, vec3(0.0)),
                           g_P - groups[g].hi.xyz);
+            MBG_TALLY(MBG_CT_GRP_TEST, 1u)
             // The loosest bound any of this thread's texels holds: if the whole
             // group is beyond that, none of them can want it.
             if (dot(gq, gq) > worst * worst) continue;
+            MBG_TALLY(MBG_CT_GRP_ENTER, 1u)
 
             uint cfirst = uint(groups[g].lo.w);
             uint clast  = cfirst + uint(groups[g].hi.w);
@@ -380,10 +410,13 @@ void mbg_resolve_vis_coop(uint tid, uint stride, uint group_count) {
                 vec3 q = max(max(clusters[c].lo.xyz - g_P, vec3(0.0)),
                              g_P - clusters[c].hi.xyz);
                 float qd2 = dot(q, q);
+                MBG_TALLY(MBG_CT_CLU_TEST, 1u)
                 if (qd2 > worst * worst) continue;
+                MBG_TALLY(MBG_CT_CLU_ENTER, 1u)
 
                 uint first = uint(clusters[c].lo.w);
                 uint last  = first + uint(clusters[c].hi.w);
+                MBG_TALLY(MBG_CT_TRI_SETUP, last - first)
                 for (uint t = first; t < last; ++t) {
                     // One fetch, broadcast across the workgroup, reused by every
                     // texel this thread owns.
@@ -397,6 +430,7 @@ void mbg_resolve_vis_coop(uint tid, uint stride, uint group_count) {
                         // that contain the receiver and so score zero anyway.
                         if (u_anyhit != 0u && best[k] != MBG_EMPTY) continue;
                         if (qd2 > bd[k] * bd[k]) continue;     // predicate, not a branch
+                        MBG_TALLY(MBG_CT_TEX_TEST, 1u)
                         float tt;
                         if (!mbg_hit_dir(h, d[k], tt)) continue;
                         float dist = tt * len[k];
@@ -413,11 +447,19 @@ void mbg_resolve_vis_coop(uint tid, uint stride, uint group_count) {
             if (i < n) s_vis[i] = best[k];
         }
     }
+
+    mbg_count_flush();
 }
 
 // Fill s_vis for this thread's texels. Replaces clear + rasterize + barrier.
 void mbg_resolve_vis(uint tid, uint stride, uint group_count, uint tri_count) {
     uint n = u_res * u_res;
+
+    mbg_count_init();
+    if (u_count != 0u && tid == 0u) {
+        g_tally[MBG_CT_CAMERA] = 1u;
+        g_tally[MBG_CT_TEXEL]  = n;
+    }
 
     // A scene small enough not to be culled does not want the cluster
     // indirection either: one global read per texel to describe 32 triangles is
@@ -430,6 +472,8 @@ void mbg_resolve_vis(uint tid, uint stride, uint group_count, uint tri_count) {
             uint  best = MBG_EMPTY;
             float bestt = 1e30;
             for (uint t = 0u; t < tri_count; ++t) {
+                MBG_TALLY(MBG_CT_TRI_SETUP, 1u)
+                MBG_TALLY(MBG_CT_TEX_TEST, 1u)
                 float tt;
                 if (!mbg_tri_hit(t, d, tt)) continue;
                 if (u_anyhit != 0u) { best = t; break; }
@@ -437,6 +481,7 @@ void mbg_resolve_vis(uint tid, uint stride, uint group_count, uint tri_count) {
             }
             s_vis[i] = best;
         }
+        mbg_count_flush();
         return;
     }
 
@@ -460,7 +505,9 @@ void mbg_resolve_vis(uint tid, uint stride, uint group_count, uint tri_count) {
             uint g = mbg_group_at(gi);
             vec3 gq = max(max(groups[g].lo.xyz - g_P, vec3(0.0)),
                           g_P - groups[g].hi.xyz);
+            MBG_TALLY(MBG_CT_GRP_TEST, 1u)
             if (dot(gq, gq) > bestdist * bestdist) continue;
+            MBG_TALLY(MBG_CT_GRP_ENTER, 1u)
 
             uint cfirst = uint(groups[g].lo.w);
             uint clast  = cfirst + uint(groups[g].hi.w);
@@ -470,10 +517,14 @@ void mbg_resolve_vis(uint tid, uint stride, uint group_count, uint tri_count) {
                 // on any axis the receiver is already between lo and hi.
                 vec3 q = max(max(clusters[c].lo.xyz - g_P, vec3(0.0)),
                              g_P - clusters[c].hi.xyz);
+                MBG_TALLY(MBG_CT_CLU_TEST, 1u)
                 if (dot(q, q) > bestdist * bestdist) continue;
+                MBG_TALLY(MBG_CT_CLU_ENTER, 1u)
 
                 uint first = uint(clusters[c].lo.w);
                 uint last  = first + uint(clusters[c].hi.w);
+                MBG_TALLY(MBG_CT_TRI_SETUP, last - first)
+                MBG_TALLY(MBG_CT_TEX_TEST, last - first)
                 for (uint t = first; t < last; ++t) {
                     float tt;
                     if (!mbg_tri_hit(t, d, tt)) continue;
@@ -489,6 +540,8 @@ void mbg_resolve_vis(uint tid, uint stride, uint group_count, uint tri_count) {
         }
         s_vis[i] = best;
     }
+
+    mbg_count_flush();
 }
 
 // --- The direct term, analytically ------------------------------------------

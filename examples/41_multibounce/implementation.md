@@ -38,6 +38,7 @@ reload sees it.
 | `MBG_BOUNCES=n` | camera levels, 1–`kMaxLevels`. **3 is the cap** (solver.hpp); 1 = direct only |
 | `MBG_PATHS=n` | **single-sample continuation**: split this many ways at the primary hit, branch factor 1 below it, so the cost is `paths × bounces` instead of `K^bounces` (default 20, where the estimator has saturated; 40 is the split that costs exactly what the branching tree costs at 3 bounces and is what the equal-cost comparison uses, see findings 21 and 26). `0` selects the branching tile estimator; see finding 20 |
 | `MBG_RR=f` | Russian-roulette threshold on path throughput (default 0.15). Below it a path survives with probability `throughput/f` and is divided by it. 0 disables |
+| `MBG_COUNT=1` | tally what the traversal actually TOUCHED -- clusters entered, triangles fetched, texel-triangle tests -- and print it beside the sweep. The sweep line's own "triangle-rasters" is an unculled upper bound computed on the host and is wrong by 46x on Cornell; see finding 27. Off by default |
 | `MBG_IMPORTANCE=0\|1` | draw the continuation from the micro-buffer's radiance rather than from `cos × dΩ × albedo` alone (default 1) |
 | `MBG_SCALE=n` | GI grid = framebuffer / n (default 4). **1 = one camera per pixel**, the doc's correctness reference. Finer resolves creases and costs silhouettes — see finding 21 |
 | `MBG_BUDGET=n` | level-1 cameras per frame. The sweep is split into `ceil(pixels/budget)` chunks; the budget is clamped down if the camera tree would exceed 512 MB |
@@ -1808,6 +1809,48 @@ llvmpipe either way.
 The path count is the exception: it halves the camera count, which is exact and
 hardware independent, and the 1.64× measured here is only the confirmation that
 nothing else grew to fill the gap.
+
+### 27. The work column was fiction, and the instrument was one uniform away
+
+Every performance table in this document says to read the work column rather than
+the clock, and finding 22 is why: llvmpipe put two versions within 3x that an RTX
+3060 measured 124x apart. The work column was therefore the only evidence this
+container could produce about a traversal change.
+
+It was also wrong. The sweep line's "triangle-rasters" is
+
+```cpp
+solver.sweep_cameras() * double(scene.count())
+```
+
+computed on the host before anything runs. That is CAMERA-triangle pairs. It
+never multiplied by the texels a camera rasterizes, and it knows nothing about
+the cull, the distance bound, the traversal order or the any-hit early-out --
+four of this example's levers, none of which move it. On Cornell it reports
+2.15e7 for a sweep that actually fetches **9.92e8 triangles**, a factor of 46.
+
+`MBG_COUNT=1` tallies the real thing in the shader: cameras, group and cluster
+tests and entries, triangle fetches, texel-triangle hit tests, and the live texel
+count that gives the ratios an honest denominator. The counts are 64-bit (a sweep
+runs to 1e11 hit tests, and GLSL has no portable 64-bit atomic, so each slot is
+two words with a carry), accumulated in registers and pushed once per workgroup,
+and gated by a uniform so the shipped path does not carry them.
+
+Three things fell out of the first run that no timing had shown:
+
+**A fifth of the dispatched cameras are dead.** Cornell's default sweep schedules
+6.72e5 cameras and 5.34e5 of them are live; the rest are slots whose `pos.w` is
+zero -- a background pixel, or a path that escaped through the opening -- which
+write their zeros and return. They cost a dispatch, not a traversal, so this is
+not a fifth of the time; it is a fifth of the launches.
+
+**Per texel is the denominator that survives both traversal paths.** The
+per-texel path fetches a triangle for one texel and the cooperative one fetches
+it once for the four its thread carries, so a fetch count BELOW the test count is
+exactly the amortization coop exists for, and it is now visible as a ratio rather
+than asserted.
+
+**And the distance bound was not working at all.** That is finding 28.
 
 ## What this does not answer
 

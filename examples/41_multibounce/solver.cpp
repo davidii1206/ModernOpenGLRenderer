@@ -43,7 +43,41 @@ constexpr std::size_t kCamBytes = 32, kIrradBytes = 16, kDirectBytes = 32,
 
 } // namespace
 
+// --- Traversal work counters -------------------------------------------------
+//
+// Seven 64-bit counts as fourteen 32-bit words. Allocated once at init and
+// always bound, so a shader that declares the buffer never writes into an
+// unbound binding point even when counting is off.
+static constexpr uint32_t kCountSlots = 8;
+static constexpr uint32_t kCountWords = kCountSlots * 2;
+
+void Solver::count_reset() {
+    const uint32_t zero[kCountWords] = {};
+    counters_.data(zero, sizeof(zero));
+}
+
+Solver::Counts Solver::count_read() const {
+    uint32_t w[kCountWords] = {};
+    glGetNamedBufferSubData(counters_.handle(), 0, GLsizeiptr(sizeof(w)), w);
+    // hi * 2^32 + lo, in double: a double holds 53 bits exactly, and the largest
+    // count here is on the order of 1e10 texel-triangle pairs, which is 34.
+    auto u64 = [&](uint32_t slot) {
+        return double(w[slot * 2 + 1]) * 4294967296.0 + double(w[slot * 2]);
+    };
+    Counts c;
+    c.cameras   = u64(0);
+    c.grp_test  = u64(1);
+    c.grp_enter = u64(2);
+    c.clu_test  = u64(3);
+    c.clu_enter = u64(4);
+    c.tri_setup = u64(5);
+    c.tex_test  = u64(6);
+    c.texels    = u64(7);
+    return c;
+}
+
 bool Solver::init() {
+    count_reset();
     place_    = Pipeline::compute("shaders/place.comp");
     raster_   = Pipeline::compute("shaders/raster.comp");
     gather_   = Pipeline::compute("shaders/gather.comp");
@@ -239,6 +273,7 @@ void Solver::raster_level(uint32_t l, uint32_t count, const Scene& scene,
 
     raster_.use();
     scene.bind();
+    counters_.bind_base(kBindCounters);
     cams_[l].bind_base(kBindCams);
     quad_[l].bind();
     irrad_[l].bind_base(kBindIrrad);
@@ -263,6 +298,7 @@ void Solver::raster_level(uint32_t l, uint32_t count, const Scene& scene,
     raster_.set("u_coop",
                 (cfg.coop && scene.cluster_count() > 8u) ? 1u : 0u);
     raster_.set("u_cull", cfg.cull ? 1u : 0u);
+    raster_.set("u_count", cfg.count ? 1u : 0u);
     // The order only matters if there are cluster levels to reorder.
     raster_.set("u_order", (cfg.order && cfg.cull) ? 1u : 0u);
     raster_.set("u_res", li.res);
@@ -431,6 +467,7 @@ void Solver::direct_pixel(const GBuffer& gb, const gfx::Camera& cam, const Scene
     if (direct_quad_.res != res) direct_quad_.build(res);
     direct_px_.use();
     scene.bind();
+    counters_.bind_base(kBindCounters);
     direct_quad_.bind();
     gb.bind_textures();
     full_.bind_image(1, 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA32F);
@@ -449,6 +486,7 @@ void Solver::direct_pixel(const GBuffer& gb, const gfx::Camera& cam, const Scene
     direct_px_.set("u_tri_count", scene.count());
     direct_px_.set("u_cluster_count", scene.cluster_count());
     direct_px_.set("u_cull", cfg.cull ? 1u : 0u);
+    direct_px_.set("u_count", cfg.count ? 1u : 0u);
     direct_px_.set("u_emitters", cfg.nee ? scene.emitter_count() : 0u);
     cfg.sky.bind(direct_px_);
     direct_px_.set("u_lv_res", res);
