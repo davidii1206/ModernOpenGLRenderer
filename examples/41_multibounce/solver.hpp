@@ -146,6 +146,11 @@ struct SolveConfig {
     // "by what" -- exact there, and the distance bound then terminates the
     // search almost immediately. 0 ablates it. See raster.glsl.
     bool      anyhit = true;
+    // Reject a cluster no live direction passes through, before fetching its 64
+    // triangles. The distance bound asks whether a box is near enough; this asks
+    // whether it is in the way, which on a scene with clusters is the question
+    // that removes almost everything. 0 ablates it. See raster.glsl.
+    bool      angular = true;
     // Draw the continuation direction from the micro-buffer's own radiance --
     // cos * dOmega * albedo * (unshadowed direct irradiance at the hit) --
     // rather than from cos * dOmega * albedo alone. The extra factor is the only
@@ -314,7 +319,8 @@ public:
     void count_reset();
     struct Counts {
         double cameras = 0, grp_test = 0, grp_enter = 0, clu_test = 0,
-               clu_enter = 0, tri_setup = 0, tex_test = 0, texels = 0;
+               clu_enter = 0, tri_setup = 0, tex_test = 0, texels = 0,
+               clu_ang = 0, tex_ang = 0, clu_pair = 0, ang_viol = 0;
     };
     Counts count_read() const;
 

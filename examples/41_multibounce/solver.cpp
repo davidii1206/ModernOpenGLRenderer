@@ -48,7 +48,7 @@ constexpr std::size_t kCamBytes = 32, kIrradBytes = 16, kDirectBytes = 32,
 // Seven 64-bit counts as fourteen 32-bit words. Allocated once at init and
 // always bound, so a shader that declares the buffer never writes into an
 // unbound binding point even when counting is off.
-static constexpr uint32_t kCountSlots = 8;
+static constexpr uint32_t kCountSlots = 12;
 static constexpr uint32_t kCountWords = kCountSlots * 2;
 
 void Solver::count_reset() {
@@ -73,6 +73,10 @@ Solver::Counts Solver::count_read() const {
     c.tri_setup = u64(5);
     c.tex_test  = u64(6);
     c.texels    = u64(7);
+    c.clu_ang   = u64(8);
+    c.tex_ang   = u64(9);
+    c.clu_pair  = u64(10);
+    c.ang_viol  = u64(11);
     return c;
 }
 
@@ -299,6 +303,8 @@ void Solver::raster_level(uint32_t l, uint32_t count, const Scene& scene,
                 (cfg.coop && scene.cluster_count() > 8u) ? 1u : 0u);
     raster_.set("u_cull", cfg.cull ? 1u : 0u);
     raster_.set("u_count", cfg.count ? 1u : 0u);
+    // Only the cooperative path has the per-texel direction mask this needs.
+    raster_.set("u_angular", cfg.angular ? 1u : 0u);
     // The order only matters if there are cluster levels to reorder.
     raster_.set("u_order", (cfg.order && cfg.cull) ? 1u : 0u);
     raster_.set("u_res", li.res);

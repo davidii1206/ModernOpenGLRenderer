@@ -77,6 +77,8 @@
 //                           skip, in TEXELS of the grid's light view
 //   MBG_MASK_TEXELS_S=1     the same for the sun, tighter: its penumbra is narrow
 //   MBG_ORDER=1             visit the coarse groups nearest-first
+//   MBG_ANGULAR=1           skip a cluster no live texel direction passes
+//                           through, before fetching its triangles
 //   MBG_NEE=1               analytic direct term (doc section 3's separate pass)
 //   MBG_TENT=1              spread each texel's mass over the 4 nearest tiles
 //   MBG_DIRECT_PIXEL=1      rasterize a hemisphere per pixel for the image's
@@ -253,6 +255,7 @@ EnvOpts read_env() {
     if (const char* v = getenv("MBG_NOGUI"))    o.nogui = atoi(v) != 0;
     if (const char* v = getenv("MBG_COMPARE"))  o.compare = atoi(v) != 0;
     if (const char* v = getenv("MBG_COUNT"))    o.cfg.count = atoi(v) != 0;
+    if (const char* v = getenv("MBG_ANGULAR"))  o.cfg.angular = atoi(v) != 0;
     if (const char* v = getenv("MBG_TONEMAP"))  o.tonemap = atoi(v);
     if (const char* v = getenv("MBG_EXPOSURE")) o.exposure = float(atof(v));
     if (const char* v = getenv("MBG_PAUSE"))    o.paused = atoi(v) != 0;
@@ -329,6 +332,22 @@ static void report_counts(const mbg::Solver& solver, const mbg::Scene& scene,
                c.grp_test / ct, c.grp_enter / ct, c.clu_test / ct, c.clu_enter / ct);
     }
 
+    printf("[count] angular test conservativeness: %.0f violations (must be 0)\n",
+           c.ang_viol);
+    if (c.clu_enter > 0.0 && c.clu_pair > 0.0) {
+        // What an angular test WOULD reject, against a bounding sphere, which is
+        // conservative -- a real test could only reject more. See counters.glsl.
+        //
+        // The first number is what a per-THREAD angular cull could skip with the
+        // texel assignment as it stands: a cluster no direction this thread holds
+        // can reach. The second is what a per-TEXEL gate could skip, which is the
+        // ceiling for any angular scheme and the number that says whether the
+        // texel assignment is worth restructuring to get at.
+        printf("[count] angular headroom: %.1f%% of entered clusters reach no "
+               "direction this thread holds, %.1f%% of (cluster, texel) pairs "
+               "unreachable\n",
+               100.0 * c.clu_ang / c.clu_enter, 100.0 * c.tex_ang / c.clu_pair);
+    }
     printf("[count] per sweep: %.4g triangle fetches, %.4g hit tests  "
            "(the sweep line's \"triangle-rasters\" assumes %.4g)\n",
            c.tri_setup / n, c.tex_test / n,

@@ -42,7 +42,23 @@ uniform uint u_count;         // 1 = tally traversal work into MbgCount
 #define MBG_CT_TRI_SETUP 5u   // triangles FETCHED and set up -- the bandwidth number
 #define MBG_CT_TEX_TEST  6u   // texel-triangle pairs tested -- the ALU number
 #define MBG_CT_TEXEL     7u   // texels actually rasterized, the live denominator
-#define MBG_CT_SLOTS     8u
+// A PROBE, not a feature. The distance bound is the only thing pruning an
+// entered cluster, and distance is not direction: a cluster can be near and lie
+// nowhere near any direction this thread is asking about. An angular test is
+// the missing axis -- but any real one needs the texels a thread owns to be
+// angularly coherent, and they are strided across the whole target, which is
+// finding 24's negative result. So before restructuring anything, count what an
+// angular test WOULD reject. Both are measured against a bounding sphere, which
+// is conservative: a real test could only reject more.
+#define MBG_CT_CLU_ANG   8u   // entered clusters NO live texel's cone can reach
+#define MBG_CT_TEX_ANG   9u   // (cluster, live texel) pairs the cone rejects
+#define MBG_CT_CLU_PAIR 10u   // ... out of this many such pairs
+// A CONSERVATIVENESS ASSERTION, not a statistic. The angular test claims that a
+// direction missing a cluster's bounding sphere cannot hit any triangle in it.
+// This counts the times a hit was found anyway. It must be zero, and if it is
+// not, the test is rejecting geometry and the cull is wrong.
+#define MBG_CT_ANG_VIOL 11u
+#define MBG_CT_SLOTS    12u
 
 layout(std430, binding = 14) buffer MbgCount { uint counters[]; };
 

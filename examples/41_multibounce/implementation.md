@@ -38,6 +38,7 @@ reload sees it.
 | `MBG_BOUNCES=n` | camera levels, 1–`kMaxLevels`. **3 is the cap** (solver.hpp); 1 = direct only |
 | `MBG_PATHS=n` | **single-sample continuation**: split this many ways at the primary hit, branch factor 1 below it, so the cost is `paths × bounces` instead of `K^bounces` (default 20, where the estimator has saturated; 40 is the split that costs exactly what the branching tree costs at 3 bounces and is what the equal-cost comparison uses, see findings 21 and 26). `0` selects the branching tile estimator; see finding 20 |
 | `MBG_RR=f` | Russian-roulette threshold on path throughput (default 0.15). Below it a path survives with probability `throughput/f` and is divided by it. 0 disables |
+| `MBG_ANGULAR=1` | skip a cluster no live texel direction passes through, before fetching its 64 triangles. 18x to 110x fewer clusters entered; see finding 30. `0` ablates it exactly |
 | `MBG_COUNT=1` | tally what the traversal actually TOUCHED -- clusters entered, triangles fetched, texel-triangle tests -- and print it beside the sweep. The sweep line's own "triangle-rasters" is an unculled upper bound computed on the host and is wrong by 46x on Cornell; see finding 27. Off by default |
 | `MBG_IMPORTANCE=0\|1` | draw the continuation from the micro-buffer's radiance rather than from `cos × dΩ × albedo` alone (default 1) |
 | `MBG_SCALE=n` | GI grid = framebuffer / n (default 4). **1 = one camera per pixel**, the doc's correctness reference. Finer resolves creases and costs silhouettes — see finding 21 |
@@ -1945,6 +1946,91 @@ The practical consequences do not depend on the cause:
   continuation, the mask changes no pixel Cornell renders, and the drift is this
   effect. The renders moved because they were resampled, not because the transport
   did.
+
+### 30. The distance bound asks whether a box is near enough, and nothing asked whether it is in the way
+
+With finding 28's bound actually working, the counters said the remaining
+traversal was still walking hundreds of clusters per camera-thread: 364 on
+Cornell+bunny, 473 on Sponza. The bound cannot do better, because **distance is
+not direction**. A cluster can be near, in front, above the tangent plane, and
+lie nowhere near any direction the thread is asking about.
+
+And a texel is ONE direction. `mbg_px_to_dir` is evaluated at the texel centre
+and point sampled, and that single direction is exactly what `mbg_hit_dir` then
+intersects. So a cluster whose box that direction misses cannot contain its
+winner however near it is -- and 64 triangles get fetched to discover that.
+
+**Measured before it was built.** A probe computed the rejection an angular test
+would achieve without acting on it, which is the cheap half-hour that decides
+whether the expensive day is worth it:
+
+| entered clusters no direction can reach | (cluster, texel) pairs unreachable |
+|---|---|
+| Cornell+bunny **98.9%** | 99.2% |
+| Sponza **90.7%** | 93.6% |
+
+The gap between the two columns is small, and that mattered: the first design
+assumed an angular cull needed the thread's texels to be angularly coherent,
+which would mean restructuring the texel assignment against finding 24's measured
+negative. It does not. Testing each of the thread's ≤4 directions separately and
+skipping the cluster when all of them miss needs no restructure at all.
+
+| per camera-thread | cull off | cull on | |
+|---|---|---|---|
+| Cornell+bunny, clusters entered | 364.4 | **3.3** | **110x** |
+| ... triangles fetched per texel | 14278 | **123** | **116x** |
+| ... hit tests per texel | 24400 | **142** | **172x** |
+| Sponza, clusters entered | 473.3 | **25.5** | **18.6x** |
+| ... triangles fetched per texel | 18934 | **1021** | **18.5x** |
+| ... hit tests per texel | 29677 | **1096** | **27x** |
+
+Cornell is untouched and bit-identical: 32 triangles is one cluster, below the
+eight-cluster floor, so it takes the uncooperative path where this does not
+exist.
+
+#### A slab test, because the bounding sphere is wrong here
+
+The first version tested a bounding sphere with `|bc x d|^2 > r^2 |d|^2`. That
+cancels catastrophically exactly where it matters -- a ray running nearly through
+a distant cluster's centre makes the cross product a tiny difference of large
+products -- and the bunny's clusters are small enough (69k triangles in 1086 of
+them) for the error to approach the radius. The slab test against the box has no
+such term, is tighter than the sphere around the same box, and rejects strictly
+more. Every comparison is written so a NaN falls through to ACCEPT, because
+accepting costs 64 triangle tests and rejecting wrongly loses geometry.
+
+#### It is not exactly conservative, and the counter says so rather than the image
+
+`MBG_CT_ANG_VIOL` is an assertion, not a statistic: it computes the mask with the
+cull OFF and counts the times the hit test found a hit the mask had declared
+unreachable. It must be zero.
+
+It is not always zero. It reads **1** on Cornell+bunny at scale 16, **1** on
+Sponza, and **0** on Cornell+bunny at scale 8 -- one event in some 1.2e10 hit
+tests, and not one that scales with work.
+
+The cause is **not established**, and three plausible ones are ruled out by
+measurement rather than argument:
+
+- not the radius -- inflating the box by 1e-3 relative and 1e-4 absolute, a
+  thousandfold, changes the count not at all;
+- not the test formulation -- a bounding sphere and a slab test, which fail in
+  completely different ways, report the identical count;
+- not `mbg_hit_dir`'s crack tolerance -- setting `tol` to zero changes nothing.
+
+What it costs is bounded and small, because **a violation is a HIT, not a
+WINNER**. It only reaches the image if that hit was also the nearest one. On
+Sponza it was not, and the image is **bit-identical over 1.44M pixels**. On
+Cornell+bunny it was, and one GI cell changes: 33 pixels of 262144 move by
+**1/255**. That is an order of magnitude smaller, in both extent and amplitude,
+than this renderer's own run-to-run spread with the denoiser on (finding 29: 18/255
+across 21000 pixels), which is to say it is below the noise floor of the
+instrument that would measure it.
+
+So this ships on, with `MBG_ANGULAR=0` as the exact ablation and the assertion
+left in the shader, because the honest claim is "conservative except for one
+knife-edge in 1e10, cause unknown" and not "bit-identical". On hardware, with
+different float behaviour, the counter is the first thing to re-run.
 
 ## What this does not answer
 
