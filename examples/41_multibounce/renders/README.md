@@ -29,6 +29,43 @@ scene it is low by a factor of 46. See implementation.md finding 27.
 | `05_diff_gi_vs_reference.png` | the same for the full solve. The only warm region left is the emitter panel, which is the tone-curve gap of finding 10, not transport | — |
 | `06_daylight_3bounce.png` | `MBG_DAYLIGHT=1` — a sun and a sky dome through the box's open +z side, on top of the panel. The hard edge across the tall box is the ceiling's leading edge cutting the beam | nothing; the references are of a closed box |
 | `07_daylight_indirect_only_4xexposure.png` | `MBG_DAYLIGHT=1 MBG_INDIRECT_ONLY=1 MBG_EXPOSURE=4` — the same scene with the sun's direct term removed, so what is left is the sky's hemisphere integral plus three bounces | — |
+| `08_bunny_3bounce.png` | `MBG_MODEL=CornellBoxBunnyMirror.glb MBG_SKY=0.05` — the only render here that is **not** 32 triangles. 69483 of them in 1086 clusters, which is the one thing the other seven cannot test | nothing; there is no path-traced reference for this scene |
+
+## Why there is a bunny
+
+Every other image here is the 32-triangle Cornell box, and 32 triangles is a
+single cluster — below the eight-cluster floor, so it takes the uncooperative
+traversal and never runs the cluster levels at all. That made the whole render
+set structurally blind to the traversal: finding 28 (the distance bound switched
+off on 40 of every 41 cameras) and finding 30 (the angular cull) are both
+invisible in images 01–07, and would stay invisible however many of them were
+added. `08` is 69483 triangles in 1086 clusters and exercises both.
+
+What it measures, at the default configuration:
+
+| | |
+|---|---|
+| cameras | 5.14e5 live of 6.72e5 scheduled |
+| texels | 3.60e7 |
+| per camera-thread | 17 group tests → 8.8 entered, 481 cluster tests → **3.5 entered** |
+| per texel | **196 triangles fetched** of 69483 in the scene — 0.28% |
+| angular-cull violations | **0** (finding 30's assertion; it reads 1 at some other configurations) |
+
+Three and a half clusters entered out of 481 tested is findings 28 and 30
+together, and it is why this render takes 318 s on llvmpipe rather than the hours
+it would have taken a week ago.
+
+It is also the clearest demonstration that the sweep line's "triangle-rasters" is
+not a work figure. Here it claims 4.67e10 against a measured 7.06e9 — **6.6×
+too high**, where on Cornell the same formula is 46× too *low*. It is
+`cameras × scene.count()`: it misses the texel multiplier, which makes it low,
+and it ignores the cull, which makes it high, and which of the two wins is a
+property of the scene.
+
+**The tall box is black on purpose.** It carries a mirror material, and this
+renderer is Lambertian everywhere — `scene.hpp` resolves a material to one
+albedo and one emission — so a mirror's base colour is what it reflects, which
+is nothing. The bunny is the diffuse half of the same file and is the subject.
 
 Reproduce any of them with, e.g.:
 
@@ -39,6 +76,10 @@ MBG_NOGUI=1 MBG_GTCAM=1 MBG_SKY=0.05 MBG_SOLVE=1 MBG_BENCH=1 \
 
 MBG_NOGUI=1 MBG_GTCAM=1 MBG_DAYLIGHT=1 MBG_SOLVE=1 MBG_BENCH=1 \
   MBG_SHOT=06_daylight_3bounce.png ./41_multibounce
+
+MBG_NOGUI=1 MBG_GTCAM=1 MBG_MODEL=../../../data/CornellBoxBunnyMirror.glb \
+  MBG_SKY=0.05 MBG_SOLVE=1 MBG_BENCH=1 MBG_COUNT=1 \
+  MBG_SHOT=08_bunny_3bounce.png ./41_multibounce
 ```
 
 `MBG_NOGUI=1` matters: the ImGui overlay is otherwise in the screenshot.

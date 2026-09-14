@@ -1901,9 +1901,12 @@ the live bounds only skips boxes that no live texel could have wanted.
 
 Two things are worth keeping from how this was found. It is invisible to every
 timer, because it makes the traversal slower rather than wrong and llvmpipe
-cannot rank the traversal anyway. And it is invisible to Cornell, which is the
-scene every gate and every render in this repository uses -- the instrument found
-it in the first measurement taken on a scene with clusters in it.
+cannot rank the traversal anyway. And it was invisible to Cornell, which was the
+scene every gate and every render in this repository used -- the instrument found
+it in the first measurement taken on a scene with clusters in it. That gap is now
+closed on the render side: renders/08_bunny_3bounce.png is 69483 triangles in
+1086 clusters, so the image set exercises the cooperative traversal that 01-07
+structurally cannot reach.
 
 ### 29. The denoiser makes a multi-frame run irreproducible, and the renders were taken that way
 
