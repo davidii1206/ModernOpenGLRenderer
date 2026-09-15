@@ -2457,6 +2457,63 @@ allocation, so a declaration nothing reads costs exactly nothing and this was
 strictly invisible. It is not that the container ranked it wrongly. It could not
 see it.
 
+### 38. The hoist works and does not pay for itself, because shared memory is the currency
+
+`lv_tri_hit` recomputes, per texel, everything that depends only on the triangle
+and the view: the three vertices relative to `lv_P`, both half-space culls, the
+plane, and the three cross products inside `mbg_cone_contains`. About 48 of its
+~60 operations, done 64 times over at an 8x8 target. That is finding 26's hoist,
+which the hemisphere got and this traversal never did, and after finding 35 put
+the light view at 57% of the raster kernel it was the obvious next move.
+
+It was built: a cooperative prepass caching `e0/e1/e2`, `sgn`, `pn`, `pc` per
+view into shared memory, storing the identical values so the texel loop stays
+bit-for-bit what it was, with finding 32's slab test preserved through a
+per-cluster bitmask and an overflow fallback. 64 entries, four `vec4` each, 4 KB
+-- half of what finding 37 had just freed.
+
+| | Cornell | Cornell+bunny |
+|---|---|---|
+| before the cache existed | **978 ms** | **195 ms** |
+| cache declared, hoist OFF | 1875 ms | 551 ms |
+| cache declared, hoist ON | 1540 ms | 534 ms |
+
+**The hoist is worth 1.22x and its storage costs 1.92x.** Read the middle row
+again: that is the cost of *declaring* 4 KB, with the optimization disabled and
+not one instruction changed. The kernel is at an occupancy cliff, and 4 KB is
+enough to fall off it.
+
+So the change is reverted, and what it bought is the measurement. Finding 37 said
+8 KB of dead shared memory was worth 1.25-1.58x; this says the relationship is
+much steeper than linear near the current working point. **Shared memory is this
+kernel's scarce resource, and any optimization that spends it has to beat roughly
+2x per 4 KB before it is worth anything at all.** That rules out a whole family
+of designs -- per-view caches, precomputed tables, wider cooperative buffers --
+which on a CPU profile would all look free.
+
+The hoist itself is not wrong. It would pay if it needed no storage, which means
+amortizing within a thread rather than across the workgroup, and that needs more
+than one texel per thread. At an 8x8 target the light view has exactly 64 texels
+for 64 threads, so there is nothing to amortize -- the same geometry that made
+`MBG_LV_RES` useless in finding 35.
+
+#### And the obvious way to free more memory is not available
+
+`s_vis` and `s_cdf` are sized by `MBG_MAX_TEXELS` at 1024, which is 8 KB, while
+the default schedule of 16/8/8 never needs more than 256. Dropping the cap to 256
+frees 6 KB and measures 1.10x on Cornell and 1.02x on the bunny -- much less than
+the cliff above would suggest, because removing memory below the cliff does not
+buy another block.
+
+It is also unsafe, and the gates do not say so. Three of them drive
+`solve_points` with `cfg.res[0] = 32`, which is 1024 texels written into a
+256-entry shared array: **768 out-of-bounds writes per camera, and 36/36 still
+pass.** A green suite is not evidence of memory safety. The existing comment on
+`MBG_MAX_TEXELS` already gave the right answer -- "a production version would
+compile a variant per tier; this one keeps a single kernel" -- and a per-tier
+variant is what it would take, since the default schedule would then need only
+2 KB where it reserves 8.
+
 ## What this does not answer
 
 - **§8.1, the reuse radius experiment.** The gate the doc puts before everything
