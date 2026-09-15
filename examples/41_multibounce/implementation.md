@@ -2746,6 +2746,15 @@ above, it is the only shape that could pay.
   camera at P and integrate exactly, so plotting error against receiver distance
   is now a small amount of host code. Finding 4 is the same failure at tile
   granularity and suggests the answer will not be generous.
+
+  **Partly answered, in `camera-reuse.md`.** Run as a grid-density ladder rather
+  than a world-distance plot: `MBG_SCALE` 4 to 16 on Cornell. It is not
+  generous. Scale 6 is a 2.2x saving with a better RMSE, and past about 8 the
+  indirect term degrades into the correlated low-frequency blotching of finding
+  4 — which every aggregate in this document is blind to, because the composite
+  is dominated by the per-pixel direct term. That document also sizes the
+  geometric half of the problem (sharing visibility between the cameras that
+  remain) at about 1.3x, against 2.2x for the environment variable.
 - **Whether rasterization beats ray traversal.** The premise of the whole
   document. Answering it needs §5.2's LOD, §5.4's binning, and a scene where
   "every camera loops every triangle" is not a viable strategy — Cornell's 32
