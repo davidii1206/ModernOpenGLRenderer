@@ -2802,6 +2802,90 @@ scheduling structure, and that is the whole case against building one.
 The probe costs nothing when off — one workgroup-uniform branch, and the render
 is bit-identical with it compiled in. 36/36 gates.
 
+### 44. The instruments perturb the pass they measure, and the direct pass is where it shows
+
+The direct term is the image's sharpest feature and the one thing that cannot be
+interpolated (finding 11), so it is worth attacking on its own. Two things were
+built to find out where its time goes, and a third to act on the answer. All
+three are reverted, and the reason is the same one findings 38 and 42 recorded,
+arriving this time inside the measuring apparatus.
+
+#### What the diagnostics said
+
+Splitting `dp emitter LV` — which is 80% of the pass on Cornell and 97% on the
+bunny — into the frustum fit plus cull against the texel loop that walks the
+scene:
+
+| of the emitter light view | Cornell | Cornell+bunny |
+|---|---|---|
+| `lv_setup` + `lv_cull` | 11% | 10% |
+| the occlusion walk | **51%** | **84%** |
+| the analytic magnitude and the 64-thread reduction | ~37% | ~6% |
+
+And a counter on finding 25's mask, which nothing had measured: it skips
+**82.6%** of lit pixels on Cornell, **80.7%** on the bunny, 82.6% under daylight.
+The mask is close to its ceiling, and the ~19% that remain are genuine penumbra
+running about 410000 cycles each.
+
+#### What they cost
+
+`MBG_CT_SLOTS` went from 14 to 16 for the mask counter, and `MBG_PF_SLOTS` from
+13 to 15 for the sub-phases. Measured with both features **switched off**:
+
+| `Direct/px` | Cornell | Cornell+bunny |
+|---|---|---|
+| neither diagnostic | **21.7 ms** | **112.6 ms** |
+| + 2 perf slots | 26.4 ms | 141.9 ms |
+| + 2 tally slots as well | 44.9 ms | 238.1 ms |
+
+**Four extra array slots cost 2.06x.** `g_tally` is a local array indexed by a
+loop variable in `mbg_count_init` and `mbg_count_flush`, which finding 42 already
+identified as the thing that spills to local memory and changes codegen for the
+whole function — and its *size* sets the spilled footprint. The direct pass runs
+one workgroup per pixel, 262144 of them, so per-thread footprint is occupancy
+almost directly. Finding 27 said the counters "cost nothing when off" and finding
+31 measured the phase timers at ~5%. Both were measured on the raster kernel.
+Neither holds here.
+
+#### What that does to the numbers above
+
+The mask's 82.6% is a pure count and is unaffected. The phase split is a ratio
+taken while the instrument was distorting the kernel, so its **ordering is
+sound** — the walk dominates, by a lot — and its magnitudes are not to be quoted
+to two figures.
+
+#### And the thing they pointed at did not work either
+
+The walk is an any-hit query that breaks on its first blocker, and `lv_cull`
+compacts survivors in atomic-arrival order, so a blocked texel often finds its
+blocker last. Finding 24 got 1.33x on the hemisphere from nearest-first ordering.
+Here it is worth nothing: 246.0 ms against 249.6 on the sweep, 38.9 against 39.0
+on `Direct/px`, 202.4 against 204.5 on the bunny — twice, with the ordering
+switched on and off.
+
+The first version also cached the distances in `shared float s_cld[256]`, 1 KB,
+and that measured **1.8x on the direct pass with the ordering switched off** —
+the same law again, at a quarter of finding 38's size. Removing the cache and
+recomputing distances inside the rank loop fixed that and changed the ordering's
+own result not at all.
+
+Why it does nothing: the break only helps a texel that IS blocked, and the mask
+has already skipped the 82.6% of pixels that are entirely lit or entirely
+shadowed. What remains is penumbra, where roughly half the texels see the light
+and walk every surviving cluster to prove it. **Ordering cannot help a query
+whose answer is "nothing blocks"**, and after finding 25 that is most of what is
+left.
+
+#### The standing conclusion
+
+The direct pass is 21.9 ms of Cornell's frame and 113 ms of the bunny's, and
+inside it the walk is irreducible by the levers this example has: the mask is at
+its ceiling, the slab cull already rejects 88.9% of (cluster, texel) pairs,
+resolution is thread-bound, cluster size is at its optimum for this pass as well
+as for the sweep, and ordering does not help the case that dominates. Anything
+further has to make a lit texel cheap to prove lit, which is what a shadow map
+does and what this renderer has ruled out.
+
 ## What this does not answer
 
 - **§8.1, the reuse radius experiment.** The gate the doc puts before everything
