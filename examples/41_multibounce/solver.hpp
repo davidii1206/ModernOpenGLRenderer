@@ -170,6 +170,11 @@ struct SolveConfig {
     // conservativeness, because lv_tri_hit carries finding 19's half-space rule
     // and that reports a hit for rays which miss the triangle geometrically.
     bool      lv_angular = true;
+    // Record which clusters each level-1 camera entered, so the host can measure
+    // how much of a camera's traversal its grid neighbour repeats. Diagnostic
+    // only, and it wants the whole grid in ONE chunk (raise `budget` past it) so
+    // that a camera slot is a grid cell. See finding 43.
+    bool      overlap = false;
     // Draw the continuation direction from the micro-buffer's own radiance --
     // cos * dOmega * albedo * (unshadowed direct irradiance at the hit) --
     // rather than from cos * dOmega * albedo alone. The extra factor is the only
@@ -348,6 +353,17 @@ public:
     };
     Counts count_read() const;
 
+    // --- Neighbour overlap (SolveConfig::overlap) ---------------------------
+    //
+    // Jaccard and containment over the entered-cluster sets of adjacent grid
+    // cells. Meaningful only when the sweep ran in one chunk and the scene has
+    // more than a handful of clusters.
+    void overlap_reset();
+    struct Overlap {
+        double pairs = 0, jaccard = 0, contained = 0, mean_entered = 0, live = 0;
+    };
+    Overlap overlap_read(uint32_t gi_w, uint32_t gi_h) const;
+
     // --- In-shader phase cycles (SolveConfig::perf) --------------------------
     //
     // Cycles, not milliseconds, and only comparable WITHIN one dispatch: the
@@ -424,6 +440,8 @@ private:
     // Seven 64-bit counters as pairs of 32-bit words; see counters.glsl.
     mutable gl::Buffer counters_{gl::BufferType::shader, gl::BufferUsage::dynamic_draw};
     mutable gl::Buffer perf_{gl::BufferType::shader, gl::BufferUsage::dynamic_draw};
+    mutable gl::Buffer entered_{gl::BufferType::shader, gl::BufferUsage::dynamic_draw};
+    uint32_t entered_words_ = 0;
 
     gl::Texture gi_{gl::TextureType::tex_2d};      // GI grid, RGBA32F, (E, 1)
     gl::Texture gi_tmp_{gl::TextureType::tex_2d};  // ping-pong for the denoise

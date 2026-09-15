@@ -126,6 +126,67 @@ const Pipeline& Solver::raster_for(uint32_t res) const {
     return const_cast<Solver*>(this)->raster_for(res);
 }
 
+void Solver::overlap_reset() {
+    if (entered_words_ == 0 || info_[0].cameras == 0) return;
+    const std::vector<uint32_t> zero(std::size_t(info_[0].cameras) * entered_words_, 0u);
+    entered_.data(zero.data(), zero.size() * sizeof(uint32_t));
+}
+
+static inline uint32_t mbg_popcount(uint32_t v) {
+    v = v - ((v >> 1) & 0x55555555u);
+    v = (v & 0x33333333u) + ((v >> 2) & 0x33333333u);
+    return (((v + (v >> 4)) & 0x0F0F0F0Fu) * 0x01010101u) >> 24;
+}
+
+Solver::Overlap Solver::overlap_read(uint32_t gi_w, uint32_t gi_h) const {
+    Overlap o;
+    const std::size_t n = std::size_t(gi_w) * gi_h;
+    if (entered_words_ == 0 || n == 0 || n > info_[0].cameras) return o;
+    std::vector<uint32_t> m(n * entered_words_);
+    glGetNamedBufferSubData(entered_.handle(), 0,
+                            GLsizeiptr(m.size() * sizeof(uint32_t)), m.data());
+
+    auto count = [&](std::size_t i) {
+        uint32_t c = 0;
+        for (uint32_t w = 0; w < entered_words_; ++w)
+            c += mbg_popcount(m[i * entered_words_ + w]);
+        return c;
+    };
+    // Horizontally and vertically adjacent pairs where BOTH cells entered
+    // something. A cell that entered nothing is a background pixel or an escaped
+    // camera, and pairing with it would measure the schedule, not the geometry.
+    for (uint32_t y = 0; y < gi_h; ++y) {
+        for (uint32_t x = 0; x < gi_w; ++x) {
+            const std::size_t a = std::size_t(y) * gi_w + x;
+            const uint32_t ca = count(a);
+            if (ca == 0) continue;
+            o.live += 1.0;
+            o.mean_entered += double(ca);
+            for (int d = 0; d < 2; ++d) {
+                const uint32_t nx = x + (d == 0 ? 1u : 0u);
+                const uint32_t ny = y + (d == 0 ? 0u : 1u);
+                if (nx >= gi_w || ny >= gi_h) continue;
+                const std::size_t b = std::size_t(ny) * gi_w + nx;
+                if (count(b) == 0) continue;
+                uint32_t inter = 0, uni = 0;
+                for (uint32_t w = 0; w < entered_words_; ++w) {
+                    const uint32_t va = m[a * entered_words_ + w];
+                    const uint32_t vb = m[b * entered_words_ + w];
+                    inter += mbg_popcount(va & vb);
+                    uni   += mbg_popcount(va | vb);
+                }
+                if (uni == 0) continue;
+                o.pairs += 1.0;
+                o.jaccard += double(inter) / double(uni);
+                o.contained += double(inter) / double(ca);
+            }
+        }
+    }
+    if (o.pairs > 0.0) { o.jaccard /= o.pairs; o.contained /= o.pairs; }
+    if (o.live > 0.0) o.mean_entered /= o.live;
+    return o;
+}
+
 bool Solver::init() {
     count_reset();
     perf_reset();
@@ -330,6 +391,7 @@ void Solver::raster_level(uint32_t l, uint32_t count, const Scene& scene,
     scene.bind();
     counters_.bind_base(kBindCounters);
     perf_.bind_base(kBindPerf);
+    entered_.bind_base(kBindEntered);
     cams_[l].bind_base(kBindCams);
     quad_[l].bind();
     irrad_[l].bind_base(kBindIrrad);
@@ -359,6 +421,13 @@ void Solver::raster_level(uint32_t l, uint32_t count, const Scene& scene,
     // Only the cooperative path has the per-texel direction mask this needs.
     raster_.set("u_angular", cfg.angular ? 1u : 0u);
     raster_.set("u_lv_angular", cfg.lv_angular ? 1u : 0u);
+    // Sized here rather than in configure(), which never sees the scene.
+    if (cfg.overlap && l == 0) {
+        const uint32_t want = (scene.cluster_count() + 31u) / 32u;
+        if (want != entered_words_) { entered_words_ = want; overlap_reset(); }
+    }
+    raster_.set("u_overlap", (cfg.overlap && l == 0 && entered_words_) ? 1u : 0u);
+    raster_.set("u_entered_words", entered_words_);
     // The order only matters if there are cluster levels to reorder.
     raster_.set("u_order", (cfg.order && cfg.cull) ? 1u : 0u);
     raster_.set("u_res", li.res);

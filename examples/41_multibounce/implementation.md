@@ -2743,6 +2743,65 @@ stack -- no array, no shared memory, one more index per node. That is the next
 thing to try if the traverse phase is worth more attention; on the evidence
 above, it is the only shape that could pay.
 
+### 43. Two cameras that see the same room enter different thirds of it
+
+`camera-reuse.md` opens on the redundancy: Cornell+bunny fetches each triangle
+about 47000 times a sweep, and neighbouring cameras rebuild nearly the same
+cluster mask from scratch. Its section 4 sizes the recoverable part from
+parallax, which says two adjacent grid cells see everything beyond 5% of the
+visible extent identically — so the shareable fraction should be near total, and
+the difficulty should be in where to *put* a shared answer.
+
+`MBG_OVERLAP=1` writes a per-camera bitmask of the clusters a level-1 camera
+actually descended into, and compares adjacent grid cells on the host.
+
+| | clusters entered | Jaccard | contained |
+|---|---|---|---|
+| Cornell+bunny, 2172 clusters | 67.7 | 0.242 | **0.372** |
+| Sponza, 8196 clusters | 752.9 | 0.458 | **0.626** |
+
+Of a camera's entered clusters, its immediate neighbour enters **37%** in a
+closed room and 63% in an open scene. Not 95%.
+
+**It is not parallax.** Tripling the separation, scale 6 to scale 12, moves
+containment from 0.372 to 0.378. If geometry were the limit, three times the
+baseline would show.
+
+**It is only partly the jitter.** `MBG_JITTER=0` raises it to 0.458. Finding 14
+rotates each receiver's tangent frame by a hash of its position to decorrelate
+quadrature error, and that rotation also decorrelates *which clusters the
+traversal enters* — about nine points of coherence, spent on the thing that made
+the indirect term usable. Real, and not the bulk.
+
+**What it is: the entered set is not a stable geometric property of the
+receiver.** Findings 28, 30 and 34 prune a camera to 67.7 clusters of 2172 —
+three percent of the scene — and the pruning is bound-sensitive. Whichever of two
+neighbours finds a near hit first prunes harder, so two cameras looking at the
+same room descend into different thirds of it.
+
+So the redundancy is real at the FETCH level and has already been removed at the
+WORK level. Modelling a `G x G` shared traversal as
+`union ~ |A|(1 + (G-1)(1-c))`:
+
+| | G=2 | G=4 |
+|---|---|---|
+| Cornell+bunny | 1.23x | 1.39x |
+| Sponza | 1.46x | 1.89x |
+
+and that is a ceiling on the cluster walk alone, before meeting the fact that
+`mbg_tri_setup` subtracts `g_P` — the per-triangle setup cannot be shared between
+cameras at all, only the fetch, which is the half already in cache.
+
+`camera-reuse.md` had estimated 1.3x from parallax. The estimate survives and its
+reasoning does not, which is the useful part: the obstacle is not that a shared
+answer is hard to place, it is that **there is much less common work than the
+fetch counts suggest**. Section 3's grid coarsening returned 2.2x for an
+environment variable; this returns at most 1.4x in a closed scene for a new
+scheduling structure, and that is the whole case against building one.
+
+The probe costs nothing when off — one workgroup-uniform branch, and the render
+is bit-identical with it compiled in. 36/36 gates.
+
 ## What this does not answer
 
 - **§8.1, the reuse radius experiment.** The gate the doc puts before everything

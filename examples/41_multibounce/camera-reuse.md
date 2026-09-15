@@ -203,6 +203,13 @@ several megabytes, a new scheduling structure, and a live risk to the one thing
 findings 4 and 14 had to fix. **Section 3's grid coarsening is worth 2.2x for an
 environment variable.**
 
+That estimate survived measurement; the reasoning behind it did not. Section 5
+step 2 measures the neighbour overlap directly and finds 37-63% where this
+section's parallax argument implies ~95%. The number lands in the same place for
+a different reason, and the reason matters: it is not that the shared answer is
+hard to place, it is that **there is much less common work than the fetch counts
+suggest**, because the culls have already taken it out.
+
 ---
 
 ## 5. What to build, in order
@@ -215,11 +222,41 @@ environment variable.**
    slightly softer, and the composite moves by at most 75/255 on 1.4% of pixels
    — in the direction of the reference. 36/36 gates, and the non-integer grid
    (512/6 = 86, and 267x150 at 1600x900) behaves.
-2. **Measure the overlap before building anything geometric.** Add a counter for
-   how many of a camera's entered clusters were also entered by its grid
-   neighbour. Section 4 predicts the shareable fraction from geometry; this
-   measures it. Nothing in the repository has this number, and it is the ceiling
-   on every scheme in section 4.
+2. ~~**Measure the overlap before building anything geometric.**~~ **Done, and
+   it revises section 4.** `MBG_OVERLAP=1` records which clusters each level-1
+   camera entered and compares adjacent grid cells. Of a camera's entered
+   clusters, its immediate neighbour also enters **37%** on Cornell+bunny and
+   **63%** on Sponza — not the ~95% section 4's parallax argument implies.
+
+   | | clusters entered | Jaccard | contained |
+   |---|---|---|---|
+   | Cornell+bunny, 2172 clusters | 67.7 | 0.242 | **0.372** |
+   | Sponza, 8196 clusters | 752.9 | 0.458 | **0.626** |
+
+   **It is not parallax.** Tripling the neighbour separation (scale 6 to 12)
+   moves containment from 0.372 to 0.378. **It is only partly the jitter**:
+   `MBG_JITTER=0` raises it to 0.458, so finding 14's per-receiver rotation
+   costs about nine points of coherence — real, and not the bulk.
+
+   What it is: **the entered set is not a stable geometric property of the
+   receiver.** Findings 28, 30 and 34 prune each camera to a small
+   bound-sensitive set — 67.7 clusters of 2172, about 3% of the scene — and
+   whichever of two neighbours finds a near hit first prunes harder. Two cameras
+   that see the same room enter different thirds of it.
+
+   So the redundancy in section 1 is real at the FETCH level and has already
+   been removed at the WORK level, by the culls. Modelling a `G x G` shared
+   traversal as `union ~ |A|(1 + (G-1)(1-c))`:
+
+   | | G=2 | G=4 |
+   |---|---|---|
+   | Cornell+bunny | 1.23x | 1.39x |
+   | Sponza | 1.46x | 1.89x |
+
+   and that is a *ceiling* on the cluster walk alone. It does not survive
+   contact with the fact that `mbg_tri_setup` subtracts `g_P`, so the per-triangle
+   setup cannot be shared between cameras at all — only the fetch can, which is
+   the half that is already in cache.
 3. **Only if (2) contradicts section 4's estimate**, build the shared far field:
    one world-space octahedral map per receiver block, at least 2x finer linearly
    than the hemispheres it serves, built once per block; each receiver then looks

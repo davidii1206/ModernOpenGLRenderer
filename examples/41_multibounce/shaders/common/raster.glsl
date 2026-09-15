@@ -51,6 +51,13 @@ shared float s_cdf[MBG_MAX_TEXELS];
 shared float s_blk[64];
 
 vec3 g_P, g_T, g_B, g_N;      // the camera, set once per workgroup
+uint g_cam;                   // this workgroup's camera index, for the overlap probe
+
+// One bitmask per level-1 camera, one bit per cluster: what this camera actually
+// descended into. Written straight to global memory under u_overlap -- a shared
+// staging mask would be 1 KB that findings 38 and 42 say is not free, and this is
+// a diagnostic, not a path anything ships on.
+layout(std430, binding = 16) buffer MbgEnteredB { uint entered[]; };
 
 vec3 mbg_to_local(vec3 w) { return vec3(dot(w, g_T), dot(w, g_B), dot(w, g_N)); }
 vec3 mbg_to_world(vec3 l) { return g_T * l.x + g_B * l.y + g_N * l.z; }
@@ -503,6 +510,9 @@ void mbg_resolve_vis_coop(uint tid, uint stride, uint group_count) {
                 uint pmask = amask;
                 if (u_angular == 0u) amask = (1u << nk) - 1u;
                 MBG_TALLY(MBG_CT_CLU_ENTER, 1u)
+                if (u_overlap != 0u)
+                    atomicOr(entered[g_cam * u_entered_words + (c >> 5u)],
+                             1u << (c & 31u));
 
                 uint first = uint(clusters[c].lo.w);
                 uint last  = first + uint(clusters[c].hi.w);

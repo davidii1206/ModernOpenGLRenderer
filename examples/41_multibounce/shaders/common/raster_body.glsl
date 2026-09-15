@@ -100,6 +100,7 @@ void main() {
     // barrier: every invocation of a workgroup takes the same branch.
     if (cam >= u_cam_count) return;
 
+    g_cam = cam;
     mbg_perf_init(tid);
     if (u_perf != 0 && tid == 0u) s_perf[MBG_PF_CAMERA] = 1u;
     MBG_PF_T0(pf_setup);

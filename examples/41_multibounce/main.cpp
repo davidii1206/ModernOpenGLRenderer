@@ -104,6 +104,10 @@
 //                           shader clock, so a dispatch that reads 3 s can say
 //                           WHICH phase it spent it in. Cycles, comparable only
 //                           within a dispatch. Off by default
+//   MBG_OVERLAP=1           record which clusters each level-1 camera entered and
+//                           report how much of that its grid neighbour repeats.
+//                           Wants MBG_BUDGET past the grid so the sweep is one
+//                           chunk, and a scene with clusters. See finding 43
 //   MBG_COUNT=1             tally what the traversal actually touched (clusters
 //                           entered, triangles fetched, texel-triangle tests)
 //                           and print it beside the sweep. The honest version of
@@ -262,6 +266,7 @@ EnvOpts read_env() {
     if (const char* v = getenv("MBG_PERF"))     o.cfg.perf = atoi(v) != 0;
     if (const char* v = getenv("MBG_ANGULAR"))  o.cfg.angular = atoi(v) != 0;
     if (const char* v = getenv("MBG_LV_ANGULAR")) o.cfg.lv_angular = atoi(v) != 0;
+    if (const char* v = getenv("MBG_OVERLAP"))  o.cfg.overlap = atoi(v) != 0;
     if (const char* v = getenv("MBG_TONEMAP"))  o.tonemap = atoi(v);
     if (const char* v = getenv("MBG_EXPOSURE")) o.exposure = float(atof(v));
     if (const char* v = getenv("MBG_PAUSE"))    o.paused = atoi(v) != 0;
@@ -790,6 +795,7 @@ int main() {
             // a frame is an arbitrary slice of one.
             glFinish();
             if (run.count) solver.count_reset();
+            if (run.overlap) solver.overlap_reset();
             if (run.perf) solver.perf_reset();
             const double t0 = window.time();
             for (uint32_t s = 0; s < presolve; ++s)
@@ -803,6 +809,23 @@ int main() {
                    sweep_ms, chunks, solver.sweep_cameras(), solver.sweep_texels(),
                    solver.sweep_cameras() * double(scene.count()));
             if (run.count) report_counts(solver, scene, presolve);
+            if (run.overlap) {
+                const mbg::Solver::Overlap ov =
+                    solver.overlap_read(uint32_t(solver.gi_size().x),
+                                        uint32_t(solver.gi_size().y));
+                if (ov.pairs <= 0.0)
+                    printf("[overlap] nothing to compare -- needs a clustered scene "
+                           "and the whole grid in ONE chunk (MBG_BUDGET >= %u)\n",
+                           solver.gi_pixels());
+                else {
+                    printf("[overlap] %.0f adjacent live pairs of %.0f live cells, "
+                           "%.1f clusters entered each\n",
+                           ov.pairs, ov.live, ov.mean_entered);
+                    printf("[overlap]   Jaccard   %.3f  (shared / union)\n", ov.jaccard);
+                    printf("[overlap]   contained %.3f  (of my clusters, the fraction "
+                           "my neighbour also entered)\n", ov.contained);
+                }
+            }
             // Phases are NOT reported here. The raster kernel is finished, but
             // the per-pixel direct term runs in the frame loop below, so reading
             // now would show its four phases empty. The report goes at the end

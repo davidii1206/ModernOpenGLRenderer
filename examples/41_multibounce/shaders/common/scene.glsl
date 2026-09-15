@@ -51,6 +51,10 @@ struct MbgTriShade {
 // by direct_pixel.comp, which includes neither raster.glsl nor the other.
 uniform uint u_angular;
 uniform uint u_lv_angular;   // the same, for the light view's occlusion loop
+// 1 = record which clusters each level-1 camera entered, so the host can measure
+// how much of a camera's traversal its grid neighbour repeats. See finding 43.
+uniform uint u_overlap;
+uniform uint u_entered_words;
 
 // A secondary camera: a point on a surface plus the normal its hemisphere is
 // built around.
