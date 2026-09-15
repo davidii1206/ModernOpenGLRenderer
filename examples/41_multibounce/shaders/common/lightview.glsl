@@ -37,9 +37,12 @@
 #include "scene.glsl"
 #include "hemi.glsl"
 
-#define MBG_LV_MAX 1024
-shared uint s_lv[MBG_LV_MAX];       // everything: what is actually nearest
-shared uint s_lv_e[MBG_LV_MAX];     // the emitter alone: where it would reach
+// NO SHARED VISIBILITY BUFFER. Inverting this rasterizer (finding 22) gave each
+// texel to one thread, which keeps its winner in a register and needs no buffer
+// at all -- but the two 1024-entry arrays the old atomicMin form used were left
+// declared. 8 KB per workgroup, written by nothing and read by nothing, and on
+// hardware shared memory is what caps blocks per SM. llvmpipe has no occupancy
+// model, so it could not have shown this.
 
 vec3 lv_P, lv_R, lv_U, lv_F;        // receiver origin and view frame
 vec2 lv_lo, lv_span;                // the emitter's projected bounding box

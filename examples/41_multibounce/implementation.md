@@ -2421,6 +2421,42 @@ column keeps improving after the clock has turned around.
 order changed; the traversal still returns the nearest triangle, and 36/36 gates
 pass.
 
+### 37. Eight kilobytes of shared memory that nothing read
+
+Inverting the light view (finding 22) gave each texel to one thread, which keeps
+its winner in a register and needs no buffer at all. The two 1024-entry arrays
+the old atomicMin form had used were left declared:
+
+```glsl
+shared uint s_lv[MBG_LV_MAX];       // 4 KB
+shared uint s_lv_e[MBG_LV_MAX];     // 4 KB
+```
+
+Written by nothing, read by nothing, and present in every kernel that includes
+`lightview.glsl` -- which is both the secondary cameras and the per-pixel direct
+term. Deleting the two lines:
+
+| | before | after | |
+|---|---|---|---|
+| Cornell, sweep | 1015 ms | 978 ms | 1.04x |
+| Cornell+bunny, sweep | 243 ms | **195 ms** | **1.25x** |
+| Cornell+bunny, `Direct/px` | 226 ms | **143 ms** | **1.58x** |
+
+Bit-identical everywhere, and 36/36 gates, because removing storage nothing
+touches cannot change an answer.
+
+**On hardware, shared memory is not free when unused.** It is what caps blocks
+per SM, so 8 KB of it is occupancy the scheduler cannot give back, and the pass
+that suffers most is the one with the most workgroups in flight -- the direct
+term, one workgroup per pixel, 262144 of them, which gains 1.58x from a deletion.
+
+This is the sharpest example so far of finding 22's rule cutting the other way.
+Every measurement in findings 26 to 34 was taken on a software rasterizer, and
+llvmpipe has no occupancy model at all: shared memory there is just an
+allocation, so a declaration nothing reads costs exactly nothing and this was
+strictly invisible. It is not that the container ranked it wrongly. It could not
+see it.
+
 ## What this does not answer
 
 - **§8.1, the reuse radius experiment.** The gate the doc puts before everything

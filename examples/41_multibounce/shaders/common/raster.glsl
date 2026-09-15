@@ -46,10 +46,10 @@ shared vec4 s_red2[64];
 
 // The continuation distribution, for the single-sample path estimator: one
 // weight per texel, turned into an inclusive CDF in place. Only raster.comp's
-// spawn uses it, and only after the light views are finished, so it could alias
-// s_lv -- but 4 KB of shared memory is cheaper than the class of bug that comes
-// from two buffers sharing storage across a barrier, and the budget here is
-// about 18 KB against a 32 KB floor.
+// spawn uses it, and only after the light views are finished. It used to be
+// worth saying that it could alias the light view's own buffer and that 4 KB was
+// cheaper than the bug class that comes of sharing storage across a barrier --
+// but that buffer no longer exists (finding 37).
 shared float s_cdf[MBG_MAX_TEXELS];
 shared float s_blk[64];
 
