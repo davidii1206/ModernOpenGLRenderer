@@ -2,28 +2,30 @@
 
 All at the reference camera (`MBG_GTCAM=1`, 512×512, pixel-aligned against the
 two path-traced PNGs one directory up), default configuration unless noted:
-3 camera levels (the cap), GI grid 128×128, targets 16/8/8, the single-sample
+3 camera levels (the cap), GI grid 86×86, targets 16/8/8, the single-sample
 path estimator at 20 paths with roulette at 0.15, analytic direct term with an
 8×8 light view per pixel, jitter + 2 a-trous iterations, Reinhard.
 
-One complete sweep is **6.7e5 cameras / 4.6e7 texels**, split into 4 chunks. On
-llvmpipe (software GL, 4 CPU threads, shared container) that took **14 s**; that
-number is a property of this machine and not of the method, and the counts beside
-it are what to scale with.
+One complete sweep is **3.0e5 cameras / 2.1e7 texels**, split into 2 chunks, and
+takes **220 ms** on an RTX 3060 Laptop (driver 610.57.04).
 
 Those two are what the schedule ASKS for. What the sweep actually does, from
-`MBG_COUNT=1`, is **5.34e5 live cameras** (a fifth of the slots are background
-pixels or escaped paths, which write their zeros and return), **3.73e7 texels**,
-and **9.92e8 triangle fetches** — 26.6 of Cornell's 32 triangles per texel, the
+`MBG_COUNT=1`, is **2.39e5 live cameras** (a fifth of the slots are background
+pixels or escaped paths, which write their zeros and return), **1.66e7 texels**,
+and **4.43e8 triangle fetches** — 26.6 of Cornell's 32 triangles per texel, the
 rest cut by the any-hit early-out. The sweep line also prints a
 "triangle-rasters" figure: ignore it. It is `cameras × scene.count()` computed on
 the host, it never multiplies by the texels a camera rasterizes, and on this
 scene it is low by a factor of 46. See implementation.md finding 27.
 
+The grid is 86×86 rather than 128×128 because §8.1's reuse radius was finally
+measured; `camera-reuse.md` is that measurement and the reason the default moved
+from scale 4 to 6.
+
 | File | What | Compare against |
 |---|---|---|
 | `01_direct_1bounce.png` | `MBG_BOUNCES=1 MBG_SKY=0` — direct lighting only, no free parameters at all. RMSE 0.0430 | `../CornellBoxGroundTruthDirectLighting.png` |
-| `02_gi_3bounce.png` | `MBG_SKY=0.05` — the full solve. RMSE 0.0402 | `../CornellBoxOriginalGroundTruth.png` |
+| `02_gi_3bounce.png` | `MBG_SKY=0.05` — the full solve. RMSE 0.0374 | `../CornellBoxOriginalGroundTruth.png` |
 | `03_indirect_only_3bounce_4xexposure.png` | `MBG_INDIRECT_ONLY=1 MBG_EXPOSURE=4` — the bounce term with the direct term left out, exposed 4× so it is visible on its own | nothing; it is a diagnostic |
 | `04_diff_direct_vs_reference.png` | `MBG_VIEW=11`, 4× gain. Blue = agreement, warm = error | — |
 | `05_diff_gi_vs_reference.png` | the same for the full solve. The only warm region left is the emitter panel, which is the tone-curve gap of finding 10, not transport | — |

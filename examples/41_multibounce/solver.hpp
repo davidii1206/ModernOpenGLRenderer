@@ -55,13 +55,26 @@ struct SolveConfig {
     uint32_t bounces = 3;          // camera levels; 1 == direct only
     // GI grid = framebuffer / scale.
     //
-    // 4, and finding 21 is the record of trying to make it finer and putting it
-    // back. A finer grid does resolve the crease it was supposed to -- and it
-    // makes SILHOUETTES worse, because scale 4's softness was the only thing
-    // hiding the upsample's per-block structure along a diagonal edge. Trading a
-    // soft crease for a stepped silhouette is a bad trade, and it is one that no
-    // aggregate metric in this file reports.
-    uint32_t scale   = 4;
+    // 6, and the two directions fail differently. FINER is finding 21: it does
+    // resolve the crease it was supposed to, and it makes SILHOUETTES worse,
+    // because the coarse grid's softness was the only thing hiding the
+    // upsample's per-block structure along a diagonal edge. COARSER is §8.1's
+    // reuse radius, measured in camera-reuse.md: the silhouettes do not move at
+    // all -- they come from the per-pixel G-buffer, and a coarser grid gives the
+    // joint-bilateral upsample MORE to blur, not less -- but past about 8 the
+    // bounce term degrades into the correlated low-frequency blotching of
+    // finding 4.
+    //
+    // 6 is where those two meet. 2.2x the speed of 4 (473 ms to 215 ms on
+    // Cornell) with a BETTER RMSE, 0.0374 against 0.0402, and a bounce term that
+    // is only slightly softer where 8's has visibly coarsened. Nothing in the
+    // ladder past 6 is safe and nothing before it is faster, so this is not a
+    // knob with a range -- it is a measured point.
+    //
+    // Note that no aggregate in this repository could have chosen it: RMSE and
+    // roughness both keep improving out to scale 16, which is 13x faster and
+    // visibly wrong in the bounce. See camera-reuse.md §3.
+    uint32_t scale   = 6;
     uint32_t budget  = 4096;       // level-1 cameras per frame
 
     // The resolution ladder of section 6.2 / 4.1: near cameras get the

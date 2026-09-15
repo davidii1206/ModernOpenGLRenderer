@@ -207,11 +207,14 @@ environment variable.**
 
 ## 5. What to build, in order
 
-1. **Change the default to `MBG_SCALE=6`.** Measured above on both axes: 2.2x
-   on the solve, RMSE 0.0374 against 0.0402, and an indirect term that is the
-   only one in the ladder still free of coarse structure. Regenerate the renders
-   and verify with the silhouette crops and the indirect-only images — not RMSE,
-   which points the wrong way here.
+1. ~~**Change the default to `MBG_SCALE=6`.**~~ **Done.** 2.2x on the solve
+   (473 ms to 220 ms), RMSE 0.0374 against 0.0402, and the only density in the
+   ladder whose bounce term is still free of coarse structure. Verified before
+   the change on the axes that matter rather than on RMSE: finding 21's two
+   silhouette crops are unchanged, the bounce term at 4x exposure is only
+   slightly softer, and the composite moves by at most 75/255 on 1.4% of pixels
+   — in the direction of the reference. 36/36 gates, and the non-integer grid
+   (512/6 = 86, and 267x150 at 1600x900) behaves.
 2. **Measure the overlap before building anything geometric.** Add a counter for
    how many of a camera's entered clusters were also entered by its grid
    neighbour. Section 4 predicts the shareable fraction from geometry; this

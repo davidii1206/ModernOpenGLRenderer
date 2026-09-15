@@ -235,13 +235,17 @@ thing to scale.
 
 ### The default configuration
 
-`MBG_BOUNCES=3`, `MBG_SCALE=4` (GI 128×128), 20 paths, targets 16/8/8, analytic
+`MBG_BOUNCES=3`, `MBG_SCALE=6` (GI 86×86), 20 paths, targets 16/8/8, analytic
 direct with an 8×8 light view per pixel, jitter + denoise on, no environment.
 
 | | RMSE | roughness vs reference | cameras/sweep |
 |---|---|---|---|
-| 1 bounce vs the direct reference | **0.0431** | 0.91× | 1.6e4 + 262k direct |
-| 3 bounces vs the full-GI reference (sky 0.05) | **0.0403** | 0.66× | 6.7e5 + 262k direct |
+| 1 bounce vs the direct reference | **0.0430** | 0.91× | 7.4e3 + 262k direct |
+| 3 bounces vs the full-GI reference (sky 0.05) | **0.0374** | 0.63× | 3.0e5 + 262k direct |
+
+The grid was 128×128 until §8.1's reuse radius was measured; see
+`camera-reuse.md` for why scale 6 and not 4, and for why no aggregate in this
+file could have chosen it.
 
 At one bounce there is no recursion and the two estimators are the same code.
 

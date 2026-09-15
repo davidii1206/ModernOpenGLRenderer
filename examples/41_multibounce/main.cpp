@@ -89,7 +89,7 @@
 //   MBG_JITTER=1            rotate each receiver's tangent frame (decorrelate)
 //   MBG_FILTER=2            a-trous denoise iterations over the GI grid
 //   MBG_FILTER_R=2          taps per side for that filter
-//   MBG_SCALE=4             GI grid = framebuffer / scale; 1 == one camera/pixel
+//   MBG_SCALE=6             GI grid = framebuffer / scale; 1 == one camera/pixel
 //   MBG_BUDGET=4096         level-1 cameras per frame
 //   MBG_RES=16              level-1 target edge; MBG_RES2/3 for deeper levels
 //   MBG_BLOCK=8             spawn tile edge; 1 == a child per texel
