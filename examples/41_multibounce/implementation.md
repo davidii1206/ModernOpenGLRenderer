@@ -2886,6 +2886,70 @@ as for the sweep, and ordering does not help the case that dominates. Anything
 further has to make a lit texel cheap to prove lit, which is what a shadow map
 does and what this renderer has ruled out.
 
+### 45. A shared depth field cannot be coarser than the detail its consumers were resolving
+
+Finding 44 ended on a wall: a LIT texel must walk every surviving cluster to
+prove nothing blocks, and after finding 25's mask that is most of the direct
+pass. The structural answer is to stop testing triangles and march a depth field
+instead -- O(steps) rather than O(triangles) -- built once for a block of pixels
+and marched by each pixel with its own directions.
+
+That is materially different from example 40's finding 16, which persisted a
+hemisphere parametrization and reprojected it, so the tangent frame had to be
+shared and finding 14's per-receiver rotation went with it. **Marching corrects
+for the offset explicitly**, using the stored depth, so the directions stay
+per-pixel and only the geometry is borrowed. `camera-reuse.md` §4's sizing law
+does not bind it either, because that law assumes a lookup, and a lookup cannot
+correct parallax.
+
+So it was built as an approximation test: every pixel rasterizes its own copy of
+the depth field from its 4x4 block's centre, then marches it from its own
+position with its own texel grid and its own solid-angle weights. Nothing is
+amortized, so the only thing measured is whether the answer survives.
+
+| direct term only, vs the exact direct reference | texels per block | RMSE |
+|---|---|---|
+| exact, as shipped | **1024** (16 pixels x 64) | **0.0430** |
+| marched, field 16x16 | 256 | 0.0468 |
+| marched, field 32x32 | 1024 | 0.0462 |
+| marched, field 48x48 | 2304 | 0.0454 |
+
+**At 32x32 the shared field already costs exactly what the per-pixel views cost,
+and is still worse.** Nine times the texels, 256 to 2304, closes a third of the
+gap. At 16x16 the shadow edges are visibly blocky -- stair-steps along the box's
+top edge, the floor contact and the green wall, at the field's texel size -- and
+at 48x48 they are reduced and still there.
+
+#### Why the cost model cannot be fixed
+
+The equivalence in that table is the whole result. Sixteen pixels at 8x8 each
+spend 1024 texels on a block, and what they spend them on is the penumbra: the
+mask (finding 25) has already skipped the 82.6% of pixels that are entirely lit
+or entirely shadowed, so every pixel still running one is resolving a shadow
+edge. A shared representation has to resolve **the finest detail any of its
+consumers needs**, and that detail is the same shadow edge. It therefore cannot
+be coarser than what it replaces, and sharing buys nothing.
+
+This is finding 11 in another costume -- "that is Nyquist, not a filtering
+failure" -- and it is why finding 25 shares only where the answer is *certain*
+rather than where it is similar. A depth field is a similarity argument.
+
+#### What is not established
+
+The march is 24 fixed steps with a crude thickness window, and a depth field
+records only the first surface, so a thin panel and a solid block are
+indistinguishable. A better march -- more steps, two-layer depth, a real
+thickness -- would converge faster than this one does. What it would not change
+is the break-even, which is set by the resolution the penumbra demands rather
+than by the quality of the marching.
+
+The test also says nothing about the BOUNCE term, where the same idea is far more
+promising: finding 4's mass split exists precisely because the smooth remainder
+tolerates clustering that the direct term does not, and MOSAIC's premise
+(`Mosaic Lighting.md:234-242`, "the cache does not need penumbra accuracy") is
+about that half. A marched depth field for the indirect term is untested here and
+is not refuted by this.
+
 ## What this does not answer
 
 - **§8.1, the reuse radius experiment.** The gate the doc puts before everything
