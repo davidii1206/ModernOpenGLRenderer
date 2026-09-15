@@ -17,6 +17,7 @@
 #include <tiny_gltf.h>
 
 #include <algorithm>
+#include <functional>
 #include <cstring>
 #include <filesystem>
 #include <regex>
@@ -456,8 +457,6 @@ bool Model::load_gltf(const std::string& path) {
     // --- Extract node transforms and build mesh-to-transform mapping ---
     // glTF stores transforms (TRS) at nodes, not meshes. We need to iterate through
     // nodes and collect the transform for each mesh.
-    std::unordered_map<int, glm::mat4> mesh_to_transform;
-    
     auto node_transform_to_matrix = [](const tinygltf::Node& node) -> glm::mat4 {
         glm::mat4 m(1.0f);
         
@@ -491,15 +490,66 @@ bool Model::load_gltf(const std::string& path) {
         return m;
     };
     
-    // Process all nodes to build the mesh-to-transform map
-    for (const auto& node : mdl.nodes) {
-        if (node.mesh >= 0) {
-            glm::mat4 node_xform = node_transform_to_matrix(node);
-            mesh_to_transform[node.mesh] = node_xform;
-        }
+    // Walk the scene graph, not the flat node list.
+    //
+    // A node's transform is the product of its whole ancestor chain, and the
+    // earlier flat scan took each node's LOCAL transform alone. Bistro's
+    // RootNode carries scale 100, so the entire scene arrived 100x too small
+    // -- a diagonal of 1.42 instead of 142 -- which silently puts every
+    // absolute epsilon in a renderer out of scale rather than raising an error.
+    //
+    // The same scan also wrote mesh_to_transform[node.mesh] once per node, so
+    // a mesh referenced by N nodes kept only the last one. Bistro references
+    // 551 meshes from 2909 nodes: 4.21M triangles collapsed to 1.75M, with the
+    // surviving copy of each placed wherever its last instance happened to sit.
+    //
+    // So this produces INSTANCES: (mesh, world transform) pairs, one per
+    // referencing node, in scene order.
+    struct MeshInstance { int mesh; glm::mat4 xform; };
+    std::vector<MeshInstance> instances;
+    std::vector<bool> node_seen(mdl.nodes.size(), false);
+
+    std::function<void(int, const glm::mat4&)> visit = [&](int ni, const glm::mat4& parent) {
+        if (ni < 0 || size_t(ni) >= mdl.nodes.size()) return;
+        if (node_seen[size_t(ni)]) return;   // malformed graph with a cycle
+        node_seen[size_t(ni)] = true;
+        const tinygltf::Node& node = mdl.nodes[size_t(ni)];
+        const glm::mat4 world = parent * node_transform_to_matrix(node);
+        if (node.mesh >= 0) instances.push_back({node.mesh, world});
+        for (int c : node.children) visit(c, world);
+    };
+
+    const int scene_idx = (mdl.defaultScene >= 0 && size_t(mdl.defaultScene) < mdl.scenes.size())
+                          ? mdl.defaultScene : 0;
+    if (!mdl.scenes.empty())
+        for (int root : mdl.scenes[size_t(scene_idx)].nodes) visit(root, glm::mat4(1.0f));
+
+    // Nodes outside the default scene, and files with no scene at all, still
+    // get their geometry: walk whatever is left as its own root.
+    for (size_t ni = 0; ni < mdl.nodes.size(); ++ni)
+        if (!node_seen[ni]) visit(static_cast<int>(ni), glm::mat4(1.0f));
+
+    // A mesh no node references has nowhere to be placed; give it identity, so
+    // a file that stores geometry without a scene graph loads as it always did.
+    {
+        std::vector<bool> placed(mdl.meshes.size(), false);
+        for (const MeshInstance& in : instances)
+            if (size_t(in.mesh) < placed.size()) placed[size_t(in.mesh)] = true;
+        for (size_t mi = 0; mi < mdl.meshes.size(); ++mi)
+            if (!placed[mi]) instances.push_back({static_cast<int>(mi), glm::mat4(1.0f)});
     }
 
     // --- Load meshes ---
+    // Each glTF mesh primitive is built once, here; the instances above then
+    // decide how many times it appears in the public arrays and where.
+    struct PrimRecord {
+        std::shared_ptr<Mesh> mesh;
+        int         material;
+        std::string name;
+        glm::vec4   bsphere;
+    };
+    std::vector<std::vector<PrimRecord>> prims_by_mesh(mdl.meshes.size());
+
     gllib::logf(gllib::LogLevel::info, "loading %zu meshes ...", mdl.meshes.size());
     for (size_t mi = 0; mi < mdl.meshes.size(); ++mi) {
         const auto& gltf_mesh = mdl.meshes[mi];
@@ -618,23 +668,37 @@ bool Model::load_gltf(const std::string& path) {
 
             mesh->build();
 
-            meshes_.push_back(std::move(mesh));
-            mesh_material_map_.push_back(prim.material);
-            mesh_names_.push_back(gltf_mesh.name);
-            mesh_bounding_spheres_.push_back(glm::vec4(center, radius));
-            
-            // Look up the node transform for this mesh (if any)
-            auto it = mesh_to_transform.find(static_cast<int>(mi));
-            glm::mat4 transform = (it != mesh_to_transform.end()) ? it->second : glm::mat4(1.0f);
-            mesh_transforms_.push_back(transform);
+            prims_by_mesh[mi].push_back({std::shared_ptr<Mesh>(std::move(mesh)),
+                                         prim.material, gltf_mesh.name,
+                                         glm::vec4(center, radius)});
 
             size_t tri_count = indices.empty() ? vertex_count / 3 : indices.size() / 3;
             gllib::logf(gllib::LogLevel::debug, "  → mesh %zu: '%s' primitive %zu: %zu verts, %zu indices (%zu tris), material %d",
-                        meshes_.size() - 1, gltf_mesh.name.c_str(), pi,
+                        mi, gltf_mesh.name.c_str(), pi,
                         vertex_count, indices.size(), tri_count, prim.material);
         }
     }
 
+    // --- Expand instances into the public arrays ---
+    // One entry per (instance x primitive). The Mesh itself is shared, so 2909
+    // Bistro instances cost 551 meshes' worth of GPU buffers, not 2909.
+    for (const MeshInstance& in : instances) {
+        if (size_t(in.mesh) >= prims_by_mesh.size()) continue;
+        for (const PrimRecord& r : prims_by_mesh[size_t(in.mesh)]) {
+            meshes_.push_back(r.mesh);
+            mesh_material_map_.push_back(r.material);
+            mesh_names_.push_back(r.name);
+            mesh_bounding_spheres_.push_back(r.bsphere);
+            mesh_transforms_.push_back(in.xform);
+        }
+    }
+    gllib::logf(gllib::LogLevel::info, "  %zu mesh primitives -> %zu instances",
+                [&]{ size_t n = 0; for (auto& v : prims_by_mesh) n += v.size(); return n; }(),
+                meshes_.size());
+
+    // detect_lods() groups by mesh name, and instances of one mesh all share a
+    // name at the same LOD level -- which it already refuses to collapse -- so
+    // instancing does not manufacture LOD groups.
     detect_lods();
 
     // --- Parse skins (single-skin model assumed) ---

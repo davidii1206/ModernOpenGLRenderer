@@ -2950,6 +2950,129 @@ tolerates clustering that the direct term does not, and MOSAIC's premise
 about that half. A marched depth field for the indirect term is untested here and
 is not refuted by this.
 
+### 46. A scene 16x larger costs 1.27x the triangle work and 16x the group scan
+
+Every cost in this document up to here is a Cornell number or a Sponza one:
+32 triangles with 2 emitters, or 262 266 with none. Bistro
+(`zeux/niagara_bistro`, Amazon Lumberyard via NVIDIA's rtxdi-assets) is the
+first scene here with both a large triangle count and many emitters:
+**4 208 958 triangles, 76 248 of them emissive**, diagonal 161.87. It changes
+which term dominates, and the answer is not the one the rest of this document
+would predict.
+
+#### Getting the scene in at all: two loader bugs that produce a black image
+
+`gllib/gfx/model.cpp` built its mesh-to-transform map by scanning the flat node
+list and taking each node's OWN transform:
+
+- **Ancestor transforms were dropped.** Bistro's `RootNode` carries
+  `scale [100,100,100]`, so the scene arrived with diagonal **1.42 instead of
+  161.87** -- a 100x shrink that raises no error and instead silently puts every
+  absolute epsilon in the solver (`bias`, `plane_tol`, `lv_peps`) two orders of
+  magnitude out of scale.
+- **Only one node per mesh survived**, because the map was keyed by mesh and
+  written once per node. Bistro references 551 meshes from 2909 nodes:
+  **4.21M triangles collapsed to 1.75M**, each surviving copy placed wherever
+  its last instance happened to sit.
+
+Both are fixed by walking the scene graph from its roots, accumulating the
+parent chain, and emitting one entry per (instance x primitive). `meshes_`
+became `shared_ptr` so 2909 instances cost 551 meshes' worth of GPU buffers.
+Cornell (32 tris, diagonal 3.487), Cornell+bunny (69 483) and Sponza
+(262 266, diagonal 37.096) load byte-identically afterwards, and 36/36 gates
+pass -- the bug needed a nested graph with instancing to show itself, and this
+repo had no such scene until now.
+
+A third trap is in the materials rather than the loader, and `data/gen_bistro.py`
+documents it: 234 of Bistro's 254 materials are authored with
+`KHR_materials_pbrSpecularGlossiness` and carry **no `pbrMetallicRoughness`
+block at all**, so glTF's defaults apply and `metallicFactor` defaults to 1.0.
+Every one of those surfaces arrives fully metallic with no diffuse lobe, and a
+metal lit only by emitters with no sky is black. The real albedo lives in the
+specular-glossiness `diffuseFactor`, which gllib does not read and 8 of which
+are literally (0,0,0). The converter therefore ignores every non-emissive
+material property and gives all geometry one uniform 0.5 grey albedo, keeping
+only the geometry and the 21 emissive factors -- which is the entire reason to
+use this scene.
+
+#### The analytic direct pass does not scale in the emitter count
+
+`direct_pixel.comp:242` and `raster_body.glsl:239` are
+`for (uint e = 0u; e < u_emitters; ++e)`, and the body of that loop fits a light
+view to one emitter and rasterizes the scene through it. Cornell has 2 emitters.
+Bistro has **76 248**, so the loop is 38 000x longer and each iteration is a
+scene traversal. This is not a tuning problem and no cull fixes it: the pass is
+O(pixels x emitters) by construction.
+
+So on Bistro the emitters have to go back through the hemisphere raster
+(`MBG_NEE=0`, `u_emitters = 0`, the quadrature finds emissive triangles as
+ordinary geometry). Findings 25, 37, 44 and 45 all measured the analytic path;
+none of them describes what Bistro runs.
+
+#### Where the time goes, and it is not the triangles
+
+One sweep, 512x512, no sky, one bounce, emitters via the raster,
+`MBG_COUNT=1 MBG_SOLVE=1`:
+
+| | Sponza | Bistro | ratio |
+|---|---|---|---|
+| triangles | 262 266 | 4 208 958 | **16.05x** |
+| cameras live | 7396 of 7396 | 4758 of 7396 (64.3%) | |
+| texels rasterized | 1.893e6 | 1.218e6 | 0.64x |
+| triangles fetched per texel | 289.16 | 570.39 | 1.97x |
+| triangle fetches per sweep | 5.475e8 | 6.948e8 | **1.27x** |
+| group tests per camera-thread | 129.0 -> 25.6 entered | 2056.0 -> 47.7 entered | **15.94x** |
+| cluster tests per camera-thread | 1637.0 -> 36.1 | 3050.3 -> 71.3 | 1.86x |
+| ms per sweep | 1801.2 | 5625.9 | **3.12x** |
+
+The cluster hierarchy is doing its job and then some: **16x the geometry for
+1.27x the triangle fetches.** Per-texel fetches grew only 1.97x against a 16x
+scene, which is the angular cull and the distance bound working exactly as
+findings 30 and 33 claimed.
+
+The group test count is the problem, and it is not approximate:
+`4 208 958 / (kClusterSize 32 x kGroupSize 64) = 2056`, and the counter says
+2056.0. Sponza's is `262 266 / 2048 = 129`, and the counter says 129.0. **The
+group list is scanned in full, by every camera-thread, every camera.** There is
+no level above the groups, so that scan is exactly O(scene) -- the one term in
+this kernel that grows linearly with triangle count. At Sponza's 129 groups it
+is invisible. At Bistro's 2056 it is the majority of the frame.
+
+Fitting the two sweeps to `t = a*fetches + b*group_tests` (a two-point fit with
+two unknowns, so this is an estimate with its inputs shown, not a measurement)
+gives a = 2.61e-6 ms per triangle fetch and b = 6.09e-6 ms per group test,
+which splits the sweeps as:
+
+| | group scan | triangle work |
+|---|---|---|
+| Sponza | 372 ms (21%) | 1429 ms (79%) |
+| Bistro | **3812 ms (68%)** | 1814 ms (32%) |
+
+So a tier above the groups is worth about **3.1x on Bistro** and about 1.3x on
+Sponza. That is the first result in this document where a hierarchy pays, and
+finding 42 is the reason to expect trouble building it: the BVH was reverted
+twice because per-thread traversal state cost more than the traversal saved.
+The difference here is that a super-group tier needs no stack and no local array
+-- it is one more flat list of boxes, scanned before the group list, exactly the
+shape the group tier already is relative to clusters (finding 33).
+
+#### It is still not realtime, and by a margin no hierarchy closes
+
+Bistro direct lighting, 512x512, one chunk per frame: **2814 ms** (`Raster L1`,
+GPU TOTAL 2816 ms), 0.36 fps. Removing the group scan entirely -- better than
+any hierarchy achieves -- predicts 907 ms per frame from the fit above. Realtime
+at this resolution is 16 ms, so the gap is **176x as measured and ~57x with a
+perfect top-level cull**, before accounting for resolution: camera count is
+`(w/scale)*(h/scale)`, so 1600x900 at scale 6 is 40 050 cameras against 7396,
+another 5.4x.
+
+The floor is not traversal efficiency. It is that 7396 hemispheres x 256 texels
+each = 1.9e6 texels must each resolve a nearest hit among ~570 candidates, and
+at 2.61e-6 ms per fetch that is 1.8 s of pure fetch work that no culling removes
+because those 570 are the ones that survived culling. Getting Bistro to
+realtime needs fewer cameras or fewer texels per camera -- which is
+`camera-reuse.md` §6(a) and §8.1, not a better cull.
+
 ## What this does not answer
 
 - **§8.1, the reuse radius experiment.** The gate the doc puts before everything

@@ -88,7 +88,10 @@ private:
     bool load_gltf(const std::string& path);
     void detect_lods();
 
-    std::vector<std::unique_ptr<Mesh>> meshes_;
+    // shared_ptr, not unique_ptr: a glTF mesh referenced by several nodes
+    // becomes several entries here -- one per instance, each with its own
+    // transform -- and they all point at one set of GPU buffers.
+    std::vector<std::shared_ptr<Mesh>> meshes_;
     std::vector<int> mesh_material_map_;
     std::vector<std::string> mesh_names_;
     std::vector<glm::vec4> mesh_bounding_spheres_;
