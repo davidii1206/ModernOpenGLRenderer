@@ -2544,9 +2544,17 @@ documents), so the wrappers are the only place it is set.
 
 | | before | after | |
 |---|---|---|---|
-| Cornell, sweep | 978 ms | **474 ms** | **2.06x** |
-| Cornell, whole frame GPU | 267.1 ms | **140.7 ms** | 1.90x |
-| Cornell+bunny, sweep | 195 ms | **105 ms** | 1.86x |
+| Cornell, sweep | 915 ms | **474 ms** | **1.93x** |
+| Cornell+bunny, sweep | 194 ms | **105 ms** | 1.85x |
+
+**Both columns are warm numbers, and the first version of this table was not.**
+The first run of any build is slow -- 549 ms against a settled 474, about 15% --
+and after that the measurement is remarkably stable: 472.8, 474.1, 474.1, 474.3
+across four runs, under half a percent. The baseline originally quoted here was
+978 ms, which was a first run; warm it is 915, and the ratio is 1.93x rather than
+the 2.06x first claimed. Discard the first run after a build. A whole-frame
+figure was also quoted and has been removed: it compared against a measurement
+taken before findings 36 and 37, so it was attributing their gains here.
 
 36/36 gates, and the res-32 gates now get a correctly sized buffer -- finding
 38's latent 768-out-of-bounds-writes-per-camera is gone as a side effect.
@@ -2574,6 +2582,39 @@ Which is worth stating as a rule: **a render is only as trustworthy as the
 dispatch that produced it, and this renderer has a configuration where the
 dispatch is not trustworthy.** The counters are the cheap detector -- they fail
 loudly, in a way an image that still looks correct does not.
+
+### 40. The direct pass has nothing to tier, and the noise floor is a first run
+
+Finding 39's win came from sizing `s_vis` and `s_cdf` per level. The obvious
+follow-up was to do the same to `direct_pixel.comp`, and the obvious follow-up is
+wrong: that kernel does not include `raster.glsl` and has no worst-case buffer.
+It declares about **2.2 KB** in total -- `s_cl[256]` at 1 KB, `s_lvred[64]` at
+1 KB, and four scalars. There is no tier to split.
+
+The one candidate is `s_cl`, the cluster survivor list, which both kernels share.
+Shrinking it from 256 to 64 entries saves 768 bytes and measures:
+
+| | 256 | 64 |
+|---|---|---|
+| Cornell, sweep | 549 ms | 699 ms |
+| Cornell+bunny, sweep | 142 ms | 129 ms |
+| Cornell+bunny, `Direct/px` | 155 ms | 167 ms |
+| Sponza, sweep | 3626 ms | 3101 ms |
+
+Two scenes better, two worse, and the tell is Cornell: it has a single cluster,
+so `lv_cull` early-outs and `s_cl` is never touched at all. A row that cannot
+move moved by 27%. **That is the noise, not the change**, and it is larger than
+the 10% this GPU is usually assumed to have.
+
+It is also not random. The first run of a build is slow and every run after it
+agrees to within half a percent -- 549, then 472.8, 474.1, 474.1, 474.3. Shader
+cache and clock ramp, and it means a single before/after pair taken across a
+rebuild can manufacture a 15% effect out of nothing. It manufactured part of
+finding 39's, which is corrected above.
+
+So: no change here, and a measurement rule that should have been in place since
+finding 35. **Discard the first run after a build, and be suspicious of any
+result that moves a quantity the change cannot reach.**
 
 ## What this does not answer
 
