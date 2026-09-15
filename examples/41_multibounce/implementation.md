@@ -2677,6 +2677,68 @@ to tune:
   traverse and the light view's walk at once, and the only remaining item whose
   payoff grows with scene size rather than shrinking.
 
+### 42. The hierarchy, built twice, and why this kernel refuses to be given anything
+
+Finding 41 left two structural options and this is the one with the better case:
+a tree would cut both the 79.6% traverse and the light view's walk, and finding
+34 had already shown that box tests are what traverse is made of -- cutting
+cluster tests from 445 to 180, with **triangles fetched unchanged**, was 4.5%.
+
+It was built twice.
+
+**Stackless, by escape index.** Nodes depth first, one cluster per leaf, each
+storing the index one past its own subtree; a miss jumps there, a hit descends by
+one. No stack anywhere, which finding 38 said was the requirement rather than a
+preference. Measured on Cornell+bunny: **110 ms against the two fixed levels'
+102**, and 66.3 triangles fetched per texel against 62.6.
+
+It fetches MORE. Depth-first order never visits the nearer child first, so the
+distance bound tightens late and more boxes pass -- which is finding 24 exactly:
+the order is what makes the bound work, and stacklessness forfeits precisely
+that. A hierarchy without ordering is worse than a flat scan that has it.
+
+**Ordered, with a register stack.** Nearer child first, farther child pushed;
+children are the next node and that node's escape, so the layout gives both
+without storing a right index. Within its own build it works -- **133 ms against
+the ablation's 149** -- and it is still a loss, because the ablation is no longer
+102.
+
+| Cornell+bunny, sweep | |
+|---|---|
+| two fixed levels, no BVH code present | **102 ms** |
+| BVH code present, `MBG_BVH=0` | 150 ms |
+| BVH code present, `MBG_BVH=1` | 133 ms |
+
+Declaring the traversal costs 48 ms with it switched off. And the stack DEPTH is
+irrelevant -- 8, 16 and 24 all measure 150 off and 134-137 on -- while the
+escape-index version, which has no array, cost nothing when off. So it is not
+register count. A dynamically indexed local array is spilled to local memory and
+changes the code generated for the whole function, ablation branch included.
+
+#### The pattern, which is the actual finding
+
+Three optimizations now, all correct, all reverted, all for the same reason:
+
+| | mechanism worth | its storage cost |
+|---|---|---|
+| light view hoist (38) | 1.22x | 1.92x, for 4 KB of shared memory |
+| ordered BVH (42) | 1.12x | 1.47x, for one indexed local array |
+| `MBG_MAX_TEXELS` shrink (38) | -- | unsafe, and only 1.10x |
+
+**This kernel is at a pressure limit, and anything given to it costs more than a
+better algorithm saves.** Which is why the one large win on this machine went the
+other way: finding 39's tier split *removed* 6 KB and returned 1.93x, and
+finding 37 *deleted* 8 KB for 1.25-1.58x. The productive direction here is
+subtraction, and it has been all along -- findings 26, 28, 30, 32 and 34 all
+removed work without adding state, and every one of them landed.
+
+So a hierarchy is not impossible here, but it has to arrive without luggage. The
+one design that might is Hapala-style stackless traversal with parent links,
+which gets ordering from a state machine over parent/sibling rather than from a
+stack -- no array, no shared memory, one more index per node. That is the next
+thing to try if the traverse phase is worth more attention; on the evidence
+above, it is the only shape that could pay.
+
 ## What this does not answer
 
 - **§8.1, the reuse radius experiment.** The gate the doc puts before everything
