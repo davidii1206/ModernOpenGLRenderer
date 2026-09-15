@@ -2514,6 +2514,67 @@ compile a variant per tier; this one keeps a single kernel" -- and a per-tier
 variant is what it would take, since the default schedule would then need only
 2 KB where it reserves 8.
 
+### 39. One kernel per target size: 2.06x, and it was the thing the comment had been deferring
+
+Finding 38 established that shared memory is this kernel's scarce resource -- 4 KB
+of it cost 1.9x -- and that the obvious way to free some, shrinking
+`MBG_MAX_TEXELS` from 1024 to 256, is unsafe because three gates legitimately
+drive `solve_points` at res 32. The comment on that constant had already named
+the right answer and declined to take it: *"A production version would compile a
+variant per tier; this one keeps a single kernel."*
+
+`s_vis` and `s_cdf` are sized by `MBG_MAX_TEXELS`, so one kernel makes every
+level pay for the largest target any level might use. The default schedule is
+16/8/8: level 1 needs 256 texels and levels 2 and 3 need 64 -- and those two
+carry **40 of the 41 cameras** a primary hit spawns. They were reserving 8 KB to
+use 512 bytes.
+
+`raster.comp` is now a body include plus three wrappers that differ by one line:
+
+```glsl
+#define MBG_MAX_TEXELS 64        // raster_t64.comp   -- res <= 8,  512 B
+#define MBG_MAX_TEXELS 256       // raster_t256.comp  -- res <= 16, 2 KB
+#define MBG_MAX_TEXELS 1024      // raster.comp       -- res <= 32, 8 KB
+```
+
+and `raster_for(res)` picks the smallest that fits. The define cannot have a
+guarded default in the header, because gllib's include pre-pass emits `#define`
+lines regardless of the branch they sit in (the same limitation perf.glsl
+documents), so the wrappers are the only place it is set.
+
+| | before | after | |
+|---|---|---|---|
+| Cornell, sweep | 978 ms | **474 ms** | **2.06x** |
+| Cornell, whole frame GPU | 267.1 ms | **140.7 ms** | 1.90x |
+| Cornell+bunny, sweep | 195 ms | **105 ms** | 1.86x |
+
+36/36 gates, and the res-32 gates now get a correctly sized buffer -- finding
+38's latent 768-out-of-bounds-writes-per-camera is gone as a side effect.
+
+#### The bunny render changed, and the tiers are not why
+
+Cornell's renders are bit-identical across the change; the bunny's, at the full
+default, differed on **every pixel by up to 249**. Both images look correct, and
+the same binary reproduces its own output, so this needed explaining before it
+could be shipped.
+
+It is not the tiers. At a reduced configuration -- where the sweep is under a
+second -- the bunny is **bit-identical** across the change, which is the direct
+test that the variants compute the same thing.
+
+It is the long dispatch. Finding 35 recorded that the bunny at the full default
+loses its counters: a 20 s sweep reported "nothing tallied" while the same scene
+at reduced settings tallied correctly. That sweep is now **7.6 s**, and the
+counters come back -- 5.142e5 cameras, 92.15 triangles per texel, where the same
+command previously returned nothing. The driver was disturbing those dispatches,
+and the committed render was produced while it was. The regenerated one
+reproduces bit-exactly across runs.
+
+Which is worth stating as a rule: **a render is only as trustworthy as the
+dispatch that produced it, and this renderer has a configuration where the
+dispatch is not trustworthy.** The counters are the cheap detector -- they fail
+loudly, in a way an image that still looks correct does not.
+
 ## What this does not answer
 
 - **§8.1, the reuse radius experiment.** The gate the doc puts before everything

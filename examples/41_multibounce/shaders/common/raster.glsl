@@ -34,12 +34,9 @@ uniform uint  u_anyhit;
 #define MBG_ANG_ABS 1e-6
 
 
-// The largest target any level may use. The default schedule needs 256, but the
-// buffer is sized for the cap so MBG_RES can be raised without a recompile --
-// and a level-3 camera with an 8x8 target reserves the same 4 KB either way,
-// because the array is sized once for every level. A production version would
-// compile a variant per tier; this one keeps a single kernel.
-#define MBG_MAX_TEXELS 1024
+// The largest target THIS VARIANT may use. Defined by the wrapper that includes
+// raster_body.glsl, not here: the production version this comment used to defer
+// to -- "compile a variant per tier" -- is what shaders/raster*.comp now are.
 shared uint s_vis[MBG_MAX_TEXELS];
 shared vec4 s_red[64];
 shared vec4 s_red2[64];

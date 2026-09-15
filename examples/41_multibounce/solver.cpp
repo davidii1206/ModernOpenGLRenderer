@@ -113,22 +113,38 @@ Solver::Phases Solver::perf_read() const {
     return p;
 }
 
+// The smallest variant whose shared visibility buffer holds res*res texels.
+// Falls back to the largest, which is also what the gates use -- three of them
+// drive solve_points at res 32.
+Pipeline& Solver::raster_for(uint32_t res) {
+    const uint32_t need = res * res;
+    for (uint32_t i = 0; i < kRasterTiers; ++i)
+        if (need <= kTierTexels[i]) return raster_[i];
+    return raster_[kRasterTiers - 1];
+}
+const Pipeline& Solver::raster_for(uint32_t res) const {
+    return const_cast<Solver*>(this)->raster_for(res);
+}
+
 bool Solver::init() {
     count_reset();
     perf_reset();
     place_    = Pipeline::compute("shaders/place.comp");
-    raster_   = Pipeline::compute("shaders/raster.comp");
+    raster_[0] = Pipeline::compute("shaders/raster_t64.comp");
+    raster_[1] = Pipeline::compute("shaders/raster_t256.comp");
+    raster_[2] = Pipeline::compute("shaders/raster.comp");
     gather_   = Pipeline::compute("shaders/gather.comp");
     upsample_ = Pipeline::compute("shaders/upsample.comp");
     direct_px_ = Pipeline::compute("shaders/direct_pixel.comp");
     filter_ = Pipeline::compute("shaders/gi_filter.comp");
-    return place_.valid() && raster_.valid() && gather_.valid() && upsample_.valid() &&
+    return place_.valid() && raster_[0].valid() && raster_[1].valid() &&
+           raster_[2].valid() && gather_.valid() && upsample_.valid() &&
            direct_px_.valid() && filter_.valid();
 }
 
 bool Solver::poll() {
     bool changed = place_.poll();
-    changed |= raster_.poll();
+    for (auto& r : raster_) changed |= r.poll();
     changed |= gather_.poll();
     changed |= upsample_.poll();
     changed |= direct_px_.poll();
@@ -263,7 +279,7 @@ void Solver::dispatch_1d(uint32_t count) {
 
 void Solver::step(const GBuffer& gb, const gfx::Camera& cam, const Scene& scene,
                   const SolveConfig& cfg) {
-    if (!allocated_ || !place_.valid() || !raster_.valid() || !gather_.valid()) return;
+    if (!allocated_ || !place_.valid() || !raster_[0].valid() || !gather_.valid()) return;
     if (!cfg.running || gi_pixels() == 0) {
         t_place_.skip();
         for (uint32_t l = 0; l < kMaxLevels; ++l) t_raster_[l].skip();
@@ -309,6 +325,7 @@ void Solver::raster_level(uint32_t l, uint32_t count, const Scene& scene,
     // already at 1.0, and the packed key quantizes over this range.
     const float far = std::max(1e-4f, scene.bounds().diagonal() * 1.5f);
 
+    Pipeline& raster_ = raster_for(li.res);
     raster_.use();
     scene.bind();
     counters_.bind_base(kBindCounters);

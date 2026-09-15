@@ -3,6 +3,6 @@
 // before any code, and an include expands in the middle of one -- so it is
 // declared here, exactly as example 38's ray kernel declares it.
 #extension GL_ARB_shader_clock : enable
-// Up to a 32x32 target: 8 KB of shared visibility. The gates use it (three drive solve_points at res 32); no default schedule does.
-#define MBG_MAX_TEXELS 1024
+// Up to 8x8 -- the default schedule's levels 2 and 3, which carry 40 of its 41 cameras. 512 bytes.
+#define MBG_MAX_TEXELS 64
 #include "raster_body.glsl"

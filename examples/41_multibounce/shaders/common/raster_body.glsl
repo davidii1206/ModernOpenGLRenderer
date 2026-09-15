@@ -1,0 +1,735 @@
+#ifndef MBG_RASTER_BODY_GLSL
+#define MBG_RASTER_BODY_GLSL
+
+// ---------------------------------------------------------------------------
+// The secondary-camera kernel, as an include so it can be compiled at several
+// TARGET SIZES.
+//
+// s_vis and s_cdf are sized by MBG_MAX_TEXELS, and shared memory is this
+// kernel's scarce resource: finding 38 measured 4 KB of it costing 1.9x. One
+// kernel sized for the largest target any level might use therefore makes every
+// level pay for the largest -- 8 KB, when the default schedule's deepest two
+// levels need 512 bytes and carry 40 of its 41 cameras.
+//
+// So MBG_MAX_TEXELS is NOT defined here. Each wrapper in shaders/ sets it and
+// includes this file, and the solver picks the smallest wrapper that fits the
+// level it is about to dispatch. Adding a #ifndef default would not work:
+// gllib's include pre-pass emits #define lines regardless of the branch they
+// sit in (see perf.glsl), so a guarded default would collide with the
+// wrapper's.
+// ---------------------------------------------------------------------------
+
+layout(local_size_x = 64) in;
+
+// ---------------------------------------------------------------------------
+// One secondary camera per workgroup: rasterize the scene into a hemi-octahedral
+// visibility buffer in shared memory, integrate the emitted radiance it sees,
+// and spawn the next level's cameras.
+//
+// This is design doc sections 4.3, 4.4 and 5.3 with every acceleration removed.
+// There is no cluster DAG, no LOD, no culling and no work list: every camera
+// loops every triangle in the scene (section 5.4's vertex amortization has
+// nothing to amortize when the whole mesh is 32 triangles). What IS here is the
+// part that has to be right before any of that can be measured:
+//
+//   - the LDS visibility buffer with a packed atomicMin resolve (section 5.3);
+//   - clipping at the octahedral folds, without which large triangles project
+//     wrong (see hemi.glsl);
+//   - an integrated, not point-sampled, quadrature weight (section 4.4).
+//
+// THE SHARED-MEMORY TRICK IS THE WHOLE POINT OF ONE WORKGROUP PER CAMERA.
+// Section 5.3: a 32x32 target at 32 bits/texel is 4 KB, so the entire depth
+// buffer lives in shared memory and the depth resolve is a shared atomicMin --
+// an order of magnitude cheaper than a global one -- with a single write-out at
+// the end. Here there is not even a write-out: the integration and the spawn
+// both consume the buffer in place, so the visibility buffer never reaches
+// global memory at all. That is a real saving over what the doc describes: at
+// the default schedule the level-2 buffers would be 1.1 GB/frame of traffic.
+//
+// The cost of that choice is one workgroup per camera regardless of how few
+// triangles there are, so at Cornell's 32 triangles and 64 threads half the
+// workgroup idles through the raster loop. That is a property of the reference
+// configuration, not of the method -- see implementation.md's numbers.
+// ---------------------------------------------------------------------------
+
+#include "scene.glsl"
+#include "hemi.glsl"
+#include "raster.glsl"
+#include "emitter.glsl"
+#include "lightview.glsl"
+#include "sky.glsl"
+#include "perf.glsl"
+
+layout(std430, binding = 1) readonly  buffer MbgCams     { MbgCam cams[]; };
+layout(std430, binding = 3) writeonly buffer MbgIrrad    { vec4   irradiance[]; };
+layout(std430, binding = 4) writeonly buffer MbgChildCam { MbgCam child_cam[]; };
+layout(std430, binding = 5) writeonly buffer MbgChildW   { vec4   child_w[]; };
+// Gates only: a copy of the shared visibility buffer, so the compute rasterizer
+// can be diffed texel for texel against a CPU ray-cast oracle (doc section 8.2
+// milestone 3). Never bound during a frame -- the whole point of the LDS buffer
+// is that visibility does not reach global memory.
+layout(std430, binding = 7) writeonly buffer MbgVisOut  { uint   vis_out[]; };
+layout(std430, binding = 8) readonly  buffer MbgEmit    { uint   emitters[]; };
+layout(std430, binding = 9) writeonly buffer MbgDirect  { vec4   direct_out[]; };
+
+uniform uint  u_cam_count;
+uniform uint  u_tri_count;
+uniform uint  u_block;        // tile mode: spawn block edge, in texels
+uniform uint  u_children;     // children this camera spawns; 0 = terminal level
+uniform uint  u_paths;        // 0 = branching tiles; else single-sample continuation
+uniform uint  u_level;        // this level's index, for the random streams
+uniform float u_rr;           // Russian-roulette throughput threshold; 0 = off
+uniform uint  u_importance;   // 1 = weight the continuation by the hit's radiance
+uniform uint  u_cluster_count;
+uniform uint  u_group_count;
+uniform uint  u_coop;
+uniform float u_bias;         // camera offset along its own normal, world units
+uniform float u_emissive;     // emissive scale
+uniform uint  u_two_sided;    // force every triangle to emit from both faces
+uniform uint  u_dump;         // 1 = dump visibility keys, 2 = dump per-texel direct
+uniform uint  u_emitters;     // analytic emitter count; 0 = take direct from the raster
+uniform uint  u_tent;         // 1 = tent-weighted spawn tiles, 0 = hard tiles
+uniform uint  u_lv_res;       // light-view edge for this level's direct term
+uniform uint  u_jitter;       // 1 = rotate each receiver's tangent frame
+
+void main() {
+    uint cam = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+
+    // Uniform across the workgroup, so the early-outs below never split a
+    // barrier: every invocation of a workgroup takes the same branch.
+    if (cam >= u_cam_count) return;
+
+    mbg_perf_init(tid);
+    if (u_perf != 0 && tid == 0u) s_perf[MBG_PF_CAMERA] = 1u;
+    MBG_PF_T0(pf_setup);
+
+    // In tile mode the child count is fixed by the target and the tile edge; in
+    // path mode the host sets it directly (the split factor at the primary hit,
+    // one everywhere below it). Either way u_children is the authority on how
+    // many slots this camera owns.
+    uint bpr    = u_block > 0u ? u_res / u_block : 0u;
+    uint nblock = u_children;
+
+    MbgCam c = cams[cam];
+    if (c.pos.w == 0.0) {
+        // Inactive slot (a background pixel, or a block that saw nothing). Its
+        // outputs still have to be written: indices are fixed by the schedule,
+        // so a skipped slot would be read as last chunk's data.
+        if (tid == 0u) {
+            irradiance[cam] = vec4(0.0);
+            direct_out[cam * 2u + 0u] = vec4(0.0);
+            direct_out[cam * 2u + 1u] = vec4(0.0);
+        }
+        if (u_dump != 0u) {
+            uint texels0 = u_res * u_res;
+            for (uint i = tid; i < texels0; i += 64u) vis_out[cam * texels0 + i] = MBG_EMPTY;
+        }
+        for (uint b = tid; b < nblock; b += 64u) {
+            child_w[(cam * nblock + b) * 3u + 0u] = vec4(0.0);
+            child_w[(cam * nblock + b) * 3u + 1u] = vec4(0.0);
+            child_w[(cam * nblock + b) * 3u + 2u] = vec4(0.0);
+            child_cam[cam * nblock + b].pos = vec4(0.0);
+            child_cam[cam * nblock + b].nrm = vec4(0.0);
+        }
+        MBG_PF_END(MBG_PF_SETUP, pf_setup);
+        mbg_perf_flush(tid);
+        return;
+    }
+
+    mbg_set_receiver(c.pos.xyz, c.nrm.xyz, u_bias, u_jitter != 0u);
+
+    uint texels = u_res * u_res;
+
+    MBG_PF_END(MBG_PF_SETUP, pf_setup);
+
+    MBG_PF_T0(pf_trav);
+    mbg_cull(tid, 64u, u_cluster_count);
+    if (u_coop != 0u) mbg_resolve_vis_coop(tid, 64u, u_group_count);
+    else              mbg_resolve_vis(tid, 64u, u_group_count, u_tri_count);
+    barrier();
+    memoryBarrierShared();
+    MBG_PF_END(MBG_PF_TRAVERSE, pf_trav);
+
+    MBG_PF_T0(pf_quad);
+
+    if (u_dump == 1u)
+        for (uint i = tid; i < texels; i += 64u) vis_out[cam * texels + i] = s_vis[i];
+
+    // Dump mode 2 writes the per-texel unshadowed direct irradiance that feeds
+    // M_dir, so a gate can integrate it against the analytic answer. This is the
+    // one quantity in the reconstruction that no other gate reaches: it is
+    // evaluated at a HIT POINT rather than at a camera, and a camera-based gate
+    // cannot tell whether the hit point it was handed was the right one.
+    if (u_dump == 2u) {
+        for (uint i = tid; i < texels; i += 64u) {
+            uint key = s_vis[i];
+            float v = 0.0;
+            if (key != MBG_EMPTY && u_emitters != 0u) {
+                MbgTri ht = mbg_tri(key);
+                vec3 hdir = mbg_to_world(quad[i].xyz);
+                float hden = dot(ht.n.xyz, hdir);
+                if (abs(hden) > 1e-12) {
+                    vec3 hp = g_P + hdir * (dot(ht.n.xyz, ht.p0.xyz - g_P) / hden);
+                    vec3 hn = hden < 0.0 ? ht.n.xyz : -ht.n.xyz;
+                    vec3 e = mbg_sun_unshadowed(hn);
+                    for (uint em = 0u; em < u_emitters; ++em)
+                        e += mbg_emitter_unshadowed(hp, hn, mbg_tri(emitters[em]),
+                                                    u_two_sided != 0u, 2.0 * u_bias,
+                                                    u_emissive);
+                    v = dot(e, vec3(1.0 / 3.0));
+                }
+            }
+            vis_out[cam * texels + i] = floatBitsToUint(v);
+        }
+    }
+
+    // --- Integrate the directly emitted radiance -----------------------------
+    //
+    // L_out at a hit texel is L_e + albedo * E / PI. Only the L_e half is known
+    // here; the albedo half needs this texel's own gather, which is what the
+    // spawned child camera below is for, and gather.comp adds it once that
+    // camera has run. A terminal level has no children and stops at L_e, which
+    // is section 6.1's "bounce 3 terminates with direct lighting only".
+    vec3 acc = vec3(0.0);
+    for (uint i = tid; i < texels; i += 64u) {
+        uint key = s_vis[i];
+        vec4 q = quad[i];
+        // NOTHING IN THIS DIRECTION IS THE SKY. The visibility buffer already
+        // answered the only question a sky needs answered; all that is left is
+        // to ask the dome what colour it is (common/sky.glsl).
+        if (key == MBG_EMPTY) { acc += mbg_sky_dome(mbg_to_world(q.xyz)) * q.w; continue; }
+        MbgTri tr = mbg_tri(key);
+        // emission.w marks a triangle whose direct term is added analytically
+        // below; taking it from the quadrature as well would double it.
+        if (u_emitters != 0u && tr.emission.w != 0.0) continue;
+        bool front = dot(tr.n.xyz, mbg_to_world(q.xyz)) < 0.0;
+        if (front || tr.n.w != 0.0 || u_two_sided != 0u)
+            acc += tr.emission.xyz * u_emissive * q.w;
+    }
+
+    // The direct term: exact magnitude, visibility taken off the two buffers.
+    // The emitter loop is uniform across the workgroup, so the reduction inside
+    // it may carry barriers; every thread ends up with the same `direct`, and
+    // only thread 0 folds it into the sum being reduced.
+    //
+    // Both the shadowed and the unshadowed total are carried: their ratio is the
+    // scalar this camera's PARENT needs to shade a whole tile of directions from
+    // one gather -- see the mass accumulation below.
+    //
+    // THE EMITTERS AND THE SUN GET SEPARATE RATIOS, AND THAT IS NOT TIDINESS.
+    // One blended fraction was fine while every light in the scene was a panel:
+    // an area light's visible fraction is a wide, smooth penumbra, so one sample
+    // of it stands in for a whole tile of directions, which is what finding 4's
+    // split was built on. A sun breaks that assumption -- a 1.2-degree disc is
+    // visible or it is not, with a penumbra a couple of centimetres wide -- and
+    // an energy-weighted blend of the two carries the sun's near-binary answer
+    // into the panel's smooth one, because the sun has the larger irradiance and
+    // therefore the larger weight. The panel's contribution to the ceiling, the
+    // largest and smoothest term in the room, then inherited the sun's variance
+    // and the a-trous denoise turned that into streaks (implementation.md,
+    // finding 17). Kept apart, each fraction multiplies only the mass whose
+    // visibility it actually describes.
+    vec3  direct_e = vec3(0.0), direct_s = vec3(0.0);
+    float unsh_e = 0.0, unsh_s = 0.0;
+    MBG_PF_END(MBG_PF_QUAD, pf_quad);
+
+    MBG_PF_T0(pf_emit);
+    for (uint e = 0u; e < u_emitters; ++e) {
+        uint ti = emitters[e];
+        vec3 mag = mbg_emitter_unshadowed(g_P, g_N, mbg_tri(ti), u_two_sided != 0u,
+                                          2.0 * u_bias, u_emissive);
+        bool lit = dot(mag, vec3(1.0)) > 0.0;
+        // A frustum fitted to the emitter, not the hemisphere. At an 8x8 target
+        // this camera's hemisphere puts HALF A TEXEL on Cornell's panel, so its
+        // visible fraction would be the sub-texel yes/no -- and a yes/no at the
+        // second bounce, flipping as a tile's representative moves, is the
+        // horizontal banding that the indirect term used to show. The fitted
+        // view spends its texels on the light instead. See lightview.glsl.
+        bool fitted = lit && lv_setup(g_P, g_N, mbg_tri(ti), 2.0 * u_bias);
+
+        // One texel per thread, the winner kept in a register: no clear, no
+        // shared buffer, no atomics, no barrier around the visibility itself.
+        // Same depth sort with the loops nested the other way -- lv_mass_texel
+        // in common/lightview.glsl, and implementation.md finding 22.
+        // Cull once for this emitter's frustum. `fitted` is workgroup uniform,
+        // so the barriers inside lv_cull cannot split.
+        if (fitted) lv_cull(tid, 64u, u_cluster_count);
+        s_red2[tid] = vec4(fitted ? lv_mass_texel(u_lv_res, g_N, ti, u_cluster_count,
+                                                  tid, 64u)
+                                  : vec2(0.0), 0.0, 0.0);
+        barrier();
+        for (uint r = 32u; r > 0u; r >>= 1u) {
+            if (tid < r) s_red2[tid] += s_red2[tid + r];
+            barrier();
+        }
+        if (lit) {
+            vec2 m = s_red2[0].xy;
+            // No bounded frustum (an emitter spanning most of the sky) or no
+            // mass in it: unoccluded is the right answer for a receiver that
+            // close to a light that big.
+            float vis = (fitted && m.y > 1e-12) ? clamp(m.x / m.y, 0.0, 1.0) : 1.0;
+            direct_e += mag * vis;
+            unsh_e += dot(mag, vec3(1.0));
+        }
+        barrier();
+    }
+    // --- The sun --------------------------------------------------------------
+    //
+    // The same two halves as an emitter -- exact magnitude, rasterized
+    // visibility -- with the frustum aimed at the disc instead of fitted to a
+    // triangle, and with no emitter pass to divide by (common/sky.glsl explains
+    // why a light at infinity needs only one rasterization). The test below is
+    // workgroup uniform: it depends on the receiver's normal and on uniforms,
+    // both identical in every invocation, so the barriers inside cannot split.
+    MBG_PF_END(MBG_PF_EMITTER, pf_emit);
+
+    MBG_PF_T0(pf_sun);
+    vec3 sun_mag = mbg_sun_unshadowed(g_N);
+    if (dot(sun_mag, vec3(1.0)) > 0.0) {
+        lv_setup_dir(g_P, g_N, u_sun_dir, u_sun_tan_r, lv_near_for(u_inv_far),
+                     2.0 * u_bias);
+        // The sun's cone is the one sampling grid in this renderer that is not
+        // decorrelated for free -- see lv_spin. The salt keeps it independent of
+        // the hemisphere's own rotation, which is driven by the same position.
+        if (u_jitter != 0u) lv_spin(mbg_jitter_angle(c.pos.xyz, 0x9E3779B9u));
+        lv_cull(tid, 64u, u_cluster_count);
+        s_red2[tid] = vec4(lv_mass_disc_texel(u_lv_res, g_N, u_sun_cos_r,
+                                              u_cluster_count, tid, 64u),
+                           0.0, 0.0);
+        barrier();
+        for (uint r = 32u; r > 0u; r >>= 1u) {
+            if (tid < r) s_red2[tid] += s_red2[tid + r];
+            barrier();
+        }
+        vec2 m = s_red2[0].xy;
+        direct_s = sun_mag * (m.y > 1e-12 ? clamp(m.x / m.y, 0.0, 1.0) : 1.0);
+        unsh_s = dot(sun_mag, vec3(1.0));
+        barrier();
+    }
+
+    MBG_PF_END(MBG_PF_SUN, pf_sun);
+
+    MBG_PF_T0(pf_reduce);
+    vec3 direct = direct_e + direct_s;
+    if (tid == 0u) acc += direct;
+
+    // Only `acc` is per-thread and needs reducing. `direct` and `unshadowed`
+    // came out of a reduction already and are identical in every thread, so
+    // thread 0 writes its own copy -- summing them again over 64 threads would
+    // report 64x the direct term, which the gather then subtracts from the
+    // child's total and clamps to zero, silently deleting every bounce below it.
+    // That is what the series gate caught when this was written the other way.
+    s_red[tid] = vec4(acc, 0.0);
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (tid < s) s_red[tid] += s_red[tid + s];
+        barrier();
+    }
+    if (tid == 0u) {
+        irradiance[cam] = vec4(s_red[0].xyz, 1.0);
+        // Two records per camera:
+        //   [0]  (total direct irradiance, EMITTER visible fraction)
+        //   [1]  (the sun's share of it,   SUN visible fraction)
+        // The emitter fraction is still energy weighted across every emitter, so
+        // one number answers "how much of the panel light does this neighbourhood
+        // receive" even with several lights of different colours -- they all have
+        // the same soft-penumbra character. The sun does not, which is why it is
+        // the one light with a record of its own.
+        float vis_e = unsh_e > 1e-12 ? dot(direct_e, vec3(1.0)) / unsh_e : 0.0;
+        float vis_s = unsh_s > 1e-12 ? dot(direct_s, vec3(1.0)) / unsh_s : 0.0;
+        direct_out[cam * 2u + 0u] = vec4(direct, vis_e);
+        direct_out[cam * 2u + 1u] = vec4(direct_s, vis_s);
+    }
+
+    // The emitter and sun light views ran after mbg_resolve_vis* already
+    // flushed, so their probe tallies need a flush of their own. It zeroes as it
+    // goes, so nothing is counted twice.
+    mbg_count_flush();
+
+    MBG_PF_END(MBG_PF_REDUCE, pf_reduce);
+
+    if (u_children == 0u) { mbg_perf_flush(tid); return; }
+
+    MBG_PF_T0(pf_spawn);
+
+    // --- Spawn the next level, A: single-sample continuation -----------------
+    //
+    // THE BRANCHING RECURSION IS EXPONENTIAL AND THIS ONE IS NOT. Below, the
+    // tile estimator spawns K children per camera, so a depth-D solve costs
+    // K^D cameras: at the default schedule, 16 at level 2 and 64 at level 3,
+    // and a fourth bounce would cost 256. Every lever section 6.2 offers --
+    // resolution falloff, coarser tiles -- shrinks the BASE of that exponent
+    // and leaves the exponent alone.
+    //
+    // A path estimator has branch factor 1. Split once, here at the primary
+    // hit, into u_children paths; from then on each path picks exactly ONE
+    // continuation direction per bounce, so the cost is paths x depth and a
+    // fifth bounce costs the same as the second. That is the whole point, and
+    // everything else in this block exists to make one sample per bounce good
+    // enough to be worth keeping.
+    //
+    // Three things do that:
+    //
+    //   IMPORTANCE SAMPLING. The direction a path continues through is drawn
+    //   from the micro-buffer this camera just rasterized, with weight
+    //   cos * dOmega * albedo * (unshadowed direct irradiance at the hit). The
+    //   first three factors are the integrand's own known part; the fourth is
+    //   the best available proxy for the unknown part, and it is FREE -- the
+    //   tile estimator already evaluates it at every texel, for M_dir. So the
+    //   distribution costs one prefix sum over data we compute either way, and
+    //   it puts the one sample we keep where the light is.
+    //
+    //   STRATIFICATION. u_children samples are drawn one per equal stratum of
+    //   the CDF, offset by a hash of the receiver's position. Stratified, so
+    //   the samples cannot clump; hashed per receiver, so the residual error
+    //   decorrelates between neighbours instead of banding -- the same reason
+    //   the hemisphere's own frame is rotated (finding 14).
+    //
+    //   RUSSIAN ROULETTE on the accumulated throughput, below.
+    //
+    // AND THE CLUSTERING ERROR GOES AWAY ENTIRELY. The tile estimator carries a
+    // whole tile's mass and scales it by the visibility measured at ONE
+    // representative texel, which is why a hard-edged light needed a mass of
+    // its own (finding 18) and why even then its variance survived. Here the
+    // child sits exactly at the hit point whose mass it carries, so
+    // M_emit * vis and M_sun * vis are not approximations at all -- the tile
+    // and its representative are the same texel by construction.
+    if (u_paths != 0u) {
+        // 1. The unshadowed direct irradiance at every covered texel's hit
+        //    point, parked in s_cdf, and its mean over covered texels. This is
+        //    the same quantity the tile estimator computes for M_dir, so the
+        //    importance function is paid for out of work already being done.
+        float dsum = 0.0, dcnt = 0.0;
+        for (uint i = tid; i < texels; i += 64u) {
+            s_cdf[i] = 0.0;
+            uint key = s_vis[i];
+            if (key == MBG_EMPTY || u_importance == 0u) continue;
+            MbgTri ht = mbg_tri(key);
+            vec3 hdir = mbg_to_world(quad[i].xyz);
+            float hden = dot(ht.n.xyz, hdir);
+            if (abs(hden) <= 1e-12) continue;
+            vec3 hp = g_P + hdir * (dot(ht.n.xyz, ht.p0.xyz - g_P) / hden);
+            vec3 hn = hden < 0.0 ? ht.n.xyz : -ht.n.xyz;
+            vec3 d = mbg_sun_unshadowed(hn);
+            for (uint em = 0u; em < u_emitters; ++em)
+                d += mbg_emitter_unshadowed(hp, hn, mbg_tri(emitters[em]),
+                                            u_two_sided != 0u, 2.0 * u_bias, u_emissive);
+            s_cdf[i] = dot(d, vec3(1.0 / 3.0));
+            dsum += s_cdf[i];
+            dcnt += 1.0;
+        }
+        s_red2[tid] = vec4(dsum, dcnt, 0.0, 0.0);
+        barrier();
+        for (uint r = 32u; r > 0u; r >>= 1u) {
+            if (tid < r) s_red2[tid] += s_red2[tid + r];
+            barrier();
+        }
+        // The mean is a FLOOR under the importance function, not a scale on it:
+        // a texel the lights do not reach still carries multi-bounce and sky
+        // energy, and a distribution that gave it probability zero would be a
+        // biased estimator, not a clever one. Adding the mean keeps every
+        // covered texel reachable while still favouring the lit ones by
+        // roughly their own contrast. With no analytic lights at all the mean
+        // is zero and the fallback is plain cosine-albedo sampling.
+        // u_importance == 0 leaves every texel's direct term at zero, so the
+        // fallback below takes over and the distribution is cos * dOmega *
+        // albedo alone -- the BRDF-and-geometry part with the radiance guess
+        // removed. That is the ablation implementation.md finding 20 measures
+        // against, and it is the distribution a path tracer without a light
+        // estimate would use.
+        float dbar = s_red2[0].y > 0.0 ? s_red2[0].x / s_red2[0].y : 0.0;
+        if (!(dbar > 0.0)) dbar = 1.0;
+        barrier();
+
+        for (uint i = tid; i < texels; i += 64u) {
+            uint key = s_vis[i];
+            float f = 0.0;
+            if (key != MBG_EMPTY) {
+                vec3 alb = mbg_tri(key).albedo.xyz;
+                f = quad[i].w * dot(alb, vec3(1.0 / 3.0)) * (s_cdf[i] + dbar);
+            }
+            s_cdf[i] = f;
+        }
+        barrier();
+
+        // 2. The CDF, and one stratified sample per path.
+        float total = mbg_scan_cdf(tid, texels);
+        float xi = mbg_rand(c.pos.xyz, 0x517CC1B7u + u_level);
+
+        for (uint b = tid; b < u_children; b += 64u) {
+            uint slot = cam * u_children + b;
+            vec3 m_ind = vec3(0.0), m_emit = vec3(0.0), m_sun = vec3(0.0);
+            vec3 hit = vec3(0.0), hn = vec3(0.0);
+            float alive = 0.0, thr = 0.0;
+
+            // total <= 0 means nothing reflective is visible -- an aperture
+            // filling the hemisphere. There is no continuation to make.
+            if (total > 0.0) {
+                float u = (float(b) + xi) / float(u_children) * total;
+                uint i = mbg_sample_cdf(u, texels);
+                float f = s_cdf[i] - (i > 0u ? s_cdf[i - 1u] : 0.0);
+                uint key = s_vis[i];
+                if (f > 0.0 && key != MBG_EMPTY) {
+                    MbgTri ht = mbg_tri(key);
+                    vec3 hdir = mbg_to_world(quad[i].xyz);
+                    float hden = dot(ht.n.xyz, hdir);
+                    if (abs(hden) > 1e-12) {
+                        hit = g_P + hdir * (dot(ht.n.xyz, ht.p0.xyz - g_P) / hden);
+                        // Face the child's hemisphere back toward this camera,
+                        // exactly as the tile estimator does.
+                        hn = hden < 0.0 ? ht.n.xyz : -ht.n.xyz;
+                        alive = 1.0;
+
+                        // The Monte Carlo weight. quad[i].w is cos * dOmega for
+                        // this texel and f/total is the probability it was drawn
+                        // with, so albedo * w / (N * p) is an unbiased estimate
+                        // of the whole reflected integral from one direction.
+                        // At u_children == 1 and a perfectly cosine-proportional
+                        // f this reduces to the albedo alone, which is the
+                        // throughput a path tracer carries.
+                        float mc = quad[i].w * total / (float(u_children) * f);
+                        m_ind = ht.albedo.xyz * mc;
+
+                        vec3 d_sun = mbg_sun_unshadowed(hn);
+                        vec3 d_emit = vec3(0.0);
+                        for (uint em = 0u; em < u_emitters; ++em)
+                            d_emit += mbg_emitter_unshadowed(hit, hn, mbg_tri(emitters[em]),
+                                                             u_two_sided != 0u,
+                                                             2.0 * u_bias, u_emissive);
+                        m_emit = m_ind * d_emit;
+                        m_sun  = m_ind * d_sun;
+
+                        // RUSSIAN ROULETTE.
+                        //
+                        // c.nrm.w is this camera's own throughput, 1 at the
+                        // primary hit; the child's is the parent's times the
+                        // factor the gather will apply to its irradiance, which
+                        // is m_ind / PI.
+                        //
+                        // TIMES u_children, AND THAT FACTOR IS NOT A FUDGE. The
+                        // mass already carries the 1/N of the split, because N
+                        // paths share one integral -- but the split is
+                        // STRATIFICATION, not attenuation. A path that is one of
+                        // 64 does not carry a 64th of the light; it carries an
+                        // unbiased estimate of all of it, and the 64th is the
+                        // averaging that happens when its siblings are summed.
+                        // Leaving the 1/N in made every path's throughput read
+                        // albedo/64, which is below any sane threshold, so the
+                        // roulette fired on every path at the first bounce and
+                        // the estimate survived only because the 1/q division is
+                        // correct. The `paths` gate's "roulette dormant above
+                        // threshold" assertion is there to catch exactly this:
+                        // at a depth where roulette must do nothing, it has to
+                        // reproduce the unrouletted answer BIT FOR BIT.
+                        //
+                        // With that factor the product down a path is the
+                        // running product of what each bounce reflects, so the
+                        // test below is "has this path's remaining contribution
+                        // fallen below the point where it is worth another
+                        // bounce" -- the intuition that a deep bounce does not
+                        // matter, made into something that terminates paths
+                        // WITHOUT biasing the answer.
+                        //
+                        // Survivors are divided by their survival probability,
+                        // so the estimator's expectation is unchanged; what
+                        // changes is the expected path length, which becomes
+                        // finite and scene-dependent instead of fixed at the
+                        // bounce count. Below the threshold q falls with the
+                        // throughput, so a dark path dies quickly and a bright
+                        // one runs long, which is the whole trade.
+                        thr = c.nrm.w * dot(m_ind, vec3(1.0 / 3.0)) *
+                              float(u_children) * 0.31830988618379;
+                        if (u_rr > 0.0 && thr < u_rr) {
+                            float q = clamp(thr / u_rr, 0.05, 1.0);
+                            if (mbg_rand(hit, 0xB5297A4Du + u_level * 977u + b) >= q) {
+                                alive = 0.0;
+                                m_ind = vec3(0.0); m_emit = vec3(0.0); m_sun = vec3(0.0);
+                            } else {
+                                float inv = 1.0 / q;
+                                m_ind *= inv; m_emit *= inv; m_sun *= inv;
+                                thr *= inv;
+                            }
+                        }
+                    }
+                }
+            }
+
+            child_w[slot * 3u + 0u] = vec4(m_ind, alive);
+            child_w[slot * 3u + 1u] = vec4(m_emit, 0.0);
+            child_w[slot * 3u + 2u] = vec4(m_sun, 0.0);
+            child_cam[slot].pos = vec4(hit, alive);
+            // The throughput rides in nrm.w so the next level can roll its own
+            // roulette without a buffer of its own.
+            child_cam[slot].nrm = vec4(hn, alive != 0.0 ? thr : 0.0);
+        }
+        // `u_paths` is a uniform, so this return is workgroup uniform and the
+        // barrier inside the flush is legal. It is also the DEFAULT path out of
+        // this kernel -- levels 1 and 2 both leave here -- so forgetting it
+        // costs the spawn phase and those levels' camera count entirely.
+        MBG_PF_END(MBG_PF_SPAWN, pf_spawn);
+        mbg_perf_flush(tid);
+        return;
+    }
+
+    // --- Spawn the next level, B: branching tiles ----------------------------
+    //
+    // One child camera per u_block x u_block tile of this camera's target, placed
+    // at the tile's most central covered texel and carrying that whole tile's
+    // albedo-weighted quadrature mass. This is doc section 6.2's two cheapest
+    // levers at once: resolution falloff (the child's own target is smaller) and
+    // clustering at depth (one gather answers for a tile of directions). Both
+    // trade the same thing -- the child's irradiance is reused across directions
+    // whose hit points differ -- and the error is attenuated by one albedo
+    // multiply before it reaches the eye. MBG_BLOCK=1 disables the clustering and
+    // spawns per texel, which is the unabridged N^3 recursion.
+    for (uint b = tid; b < nblock; b += 64u) {
+        uint tix = b % bpr;
+        uint tiy = b / bpr;
+        uint bx = tix * u_block;
+        uint by = tiy * u_block;
+        vec2 ctr = vec2(float(bx), float(by)) + vec2(float(u_block) * 0.5);
+
+        // TENT WEIGHTS, NOT A HARD TILE.
+        //
+        // Assigning each texel's albedo mass to the one tile it falls in makes
+        // the reused irradiance piecewise constant over the hemisphere, and the
+        // tile a direction belongs to does not change as the receiver moves --
+        // but the SURFACE its representative lands on does. The result is that
+        // E_child jumps from one value to another along a line in screen space:
+        // the hard-edged patches and polygonal streaks that dominated the first
+        // version of this example (implementation.md, finding 4).
+        //
+        // Spreading each texel across the four nearest tiles with a tent kernel
+        // costs nothing extra -- the same children, the same rasterization, a
+        // wider scan of a buffer already in shared memory -- and makes the
+        // reconstruction C0 in the receiver. The reuse error itself is unchanged;
+        // what goes away is its discontinuity, which is the part the eye finds.
+        //
+        // The tents form a partition of unity, so no energy is created or lost:
+        // each texel's mass is split, never duplicated. At the square's edge the
+        // outermost tile's tent is extended to a plateau instead of falling off
+        // into tiles that do not exist, which is the same clamp a bilinear
+        // sampler does at a border.
+        float span = float(u_block);
+        int reach = u_tent != 0u ? int(u_block) : 0;
+        int lo_x = int(bx) - reach;
+        int hi_x = int(bx + u_block) + reach - 1;
+        int lo_y = int(by) - reach;
+        int hi_y = int(by + u_block) + reach - 1;
+        lo_x = max(lo_x, 0); lo_y = max(lo_y, 0);
+        hi_x = min(hi_x, int(u_res) - 1); hi_y = min(hi_y, int(u_res) - 1);
+
+        // TWO MASSES, NOT ONE.
+        //
+        // The tile answers for a whole cone of directions with one child camera's
+        // irradiance, and the error that makes is not evenly spread: it is
+        // concentrated wherever the irradiance the tile is standing in for varies
+        // FAST. In a Cornell box that is almost entirely the direct term -- the
+        // bright pool the panel throws on the floor falls off as cos/d^2 across a
+        // few texels, and one sample of it smeared over a tile is the panel-
+        // shaped blob that this example had in its first version
+        // (implementation.md, finding 4).
+        //
+        // So the tile's mass is split by how fast the thing it multiplies varies:
+        //
+        //   M_dir  multiplies the child's VISIBLE FRACTION, and carries the
+        //          unshadowed direct irradiance evaluated AT EVERY TEXEL'S OWN
+        //          HIT POINT -- exactly, by Lambert's formula, no quadrature
+        //   M_ind  multiplies the child's irradiance MINUS its direct term: the
+        //          smooth remainder, which is what clustering was always safe for
+        //
+        // What still gets clustered is the visible fraction (a shadow boundary at
+        // the second bounce is still resolved per tile) and the indirect
+        // remainder. What no longer does is the geometric falloff, which was the
+        // part carrying the artifact.
+        //
+        // At u_block == 1 the two masses reconstruct the unsplit estimator
+        // exactly: one texel per tile means the hit point IS the representative,
+        // so M_dir * vis + M_ind * (E - direct) = w * albedo * E.
+        vec3  wsum  = vec3(0.0);     // M_ind
+        vec3  wdir  = vec3(0.0);     // M_emit
+        vec3  wsun  = vec3(0.0);     // M_sun
+        float bestd = 1e30;
+        uint  besti = MBG_EMPTY;
+        for (int yy = lo_y; yy <= hi_y; ++yy) {
+            float dy = (float(yy) + 0.5 - ctr.y) / span;
+            // Plateau at the border: an edge tile also owns everything outside it.
+            if ((tiy == 0u && dy < 0.0) || (tiy + 1u == bpr && dy > 0.0)) dy = 0.0;
+            float wy = u_tent != 0u ? max(0.0, 1.0 - abs(dy)) : 1.0;
+            if (wy <= 0.0) continue;
+            for (int xx = lo_x; xx <= hi_x; ++xx) {
+                float dx = (float(xx) + 0.5 - ctr.x) / span;
+                if ((tix == 0u && dx < 0.0) || (tix + 1u == bpr && dx > 0.0)) dx = 0.0;
+                float wx = u_tent != 0u ? max(0.0, 1.0 - abs(dx)) : 1.0;
+                if (wx <= 0.0) continue;
+
+                uint idx = uint(yy) * u_res + uint(xx);
+                uint key = s_vis[idx];
+                if (key == MBG_EMPTY) continue;
+                MbgTri ht = mbg_tri(key);
+                vec3 mass = (wx * wy) * quad[idx].w * ht.albedo.xyz;
+                wsum += mass;
+
+                // This texel's own hit point, and the unshadowed direct
+                // irradiance there. The hit is recomputed from the triangle's
+                // plane rather than from the quantized depth key: it costs a
+                // divide and it is exact.
+                vec3 hdir = mbg_to_world(quad[idx].xyz);
+                float hden = dot(ht.n.xyz, hdir);
+                if (abs(hden) > 1e-12) {
+                    vec3 hp = g_P + hdir * (dot(ht.n.xyz, ht.p0.xyz - g_P) / hden);
+                    vec3 hn = hden < 0.0 ? ht.n.xyz : -ht.n.xyz;
+                    // One mass per visibility character: the emitters' smooth
+                    // penumbra and the sun's hard one are reconstructed by
+                    // different scalars at the gather, so they cannot be summed
+                    // here. The sun is analytic whether or not the emitter list
+                    // is in use, so it has a mass even at MBG_NEE=0.
+                    wsun += mass * mbg_sun_unshadowed(hn);
+                    vec3 e_dir = vec3(0.0);
+                    for (uint em = 0u; em < u_emitters; ++em)
+                        e_dir += mbg_emitter_unshadowed(hp, hn, mbg_tri(emitters[em]),
+                                                        u_two_sided != 0u, 2.0 * u_bias,
+                                                        u_emissive);
+                    wdir += mass * e_dir;
+                }
+
+                // The representative is still chosen from this tile's own texels
+                // only: the camera has to sit somewhere, and somewhere inside the
+                // tile it answers for is the least wrong choice.
+                if (xx < int(bx) || xx >= int(bx + u_block) ||
+                    yy < int(by) || yy >= int(by + u_block)) continue;
+                vec2 d = vec2(float(xx), float(yy)) + vec2(0.5) - ctr;
+                float dd = dot(d, d);
+                if (dd < bestd) { bestd = dd; besti = idx; }
+            }
+        }
+
+        uint slot = cam * nblock + b;
+        vec3 hit = vec3(0.0), hn = vec3(0.0);
+        float alive = 0.0;
+        if (besti != MBG_EMPTY) {
+            MbgTri tr = mbg_tri(s_vis[besti]);
+            vec3 dir = mbg_to_world(quad[besti].xyz);
+            float denom = dot(tr.n.xyz, dir);
+            if (abs(denom) > 1e-12) {
+                hit = g_P + dir * (dot(tr.n.xyz, tr.p0.xyz - g_P) / denom);
+                // Face the child's hemisphere back toward this camera. A
+                // single-sided triangle seen from behind would otherwise gather
+                // into the wall.
+                hn = denom < 0.0 ? tr.n.xyz : -tr.n.xyz;
+                alive = 1.0;
+            }
+        }
+        child_w[slot * 3u + 0u] = vec4(alive != 0.0 ? wsum : vec3(0.0), alive);
+        child_w[slot * 3u + 1u] = vec4(alive != 0.0 ? wdir : vec3(0.0), 0.0);
+        child_w[slot * 3u + 2u] = vec4(alive != 0.0 ? wsun : vec3(0.0), 0.0);
+        child_cam[slot].pos = vec4(hit, alive);
+        child_cam[slot].nrm = vec4(hn, alive);
+    }
+
+    MBG_PF_END(MBG_PF_SPAWN, pf_spawn);
+    mbg_perf_flush(tid);
+}
+
+#endif

@@ -386,7 +386,18 @@ private:
                     bool write_image);
     void upload_points(const std::vector<glm::vec4>& pos, const std::vector<glm::vec4>& nrm);
 
-    Pipeline place_, raster_, gather_, upsample_, direct_px_, filter_;
+    Pipeline place_, gather_, upsample_, direct_px_, filter_;
+    // ONE KERNEL PER TARGET SIZE. s_vis and s_cdf are sized by MBG_MAX_TEXELS,
+    // and finding 38 measured 4 KB of shared memory costing 1.9x on this kernel,
+    // so a single variant sized for the largest target makes every level pay for
+    // the largest. The default schedule's levels 2 and 3 use an 8x8 target and
+    // carry 40 of its 41 cameras; they need 512 bytes and were reserving 8 KB.
+    // Ascending capacity; raster_for() picks the smallest that fits.
+    static constexpr uint32_t kRasterTiers = 3;
+    static constexpr uint32_t kTierTexels[kRasterTiers] = {64, 256, 1024};
+    std::array<Pipeline, kRasterTiers> raster_;
+    const Pipeline& raster_for(uint32_t res) const;
+    Pipeline& raster_for(uint32_t res);
 
     // Per level: cameras, irradiance, the direct term with its visible fraction,
     // and the per-tile masses that spawned them (two vec4s per child: the
