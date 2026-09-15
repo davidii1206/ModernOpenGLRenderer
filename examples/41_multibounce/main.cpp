@@ -83,7 +83,7 @@
 //   MBG_TENT=1              spread each texel's mass over the 4 nearest tiles
 //   MBG_DIRECT_PIXEL=1      rasterize a hemisphere per pixel for the image's
 //                           direct term, not one per GI-grid camera
-//   MBG_DIRECT_RES=16       edge of the per-pixel pass's light view
+//   MBG_DIRECT_RES=8        edge of the per-pixel pass's light view
 //   MBG_LV_RES=8            edge of the secondary cameras' light view
 //   MBG_INDIRECT_ONLY=1     composite the bounce term alone, for inspecting it
 //   MBG_JITTER=1            rotate each receiver's tangent frame (decorrelate)

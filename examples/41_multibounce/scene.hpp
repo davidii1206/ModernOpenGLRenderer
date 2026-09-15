@@ -148,10 +148,23 @@ public:
     // Clusters per group. Two levels of 64 cover 4096 clusters -- 262k
     // triangles -- in sqrt(n) tests instead of n, which is the whole point.
     static constexpr uint32_t kGroupSize = 64;
-    // Triangles per cluster. 64 matches the workgroup, so one cull step feeds
-    // one thread-per-triangle pass, and it is small enough that a cluster's box
-    // is tight even where the mesh is not.
-    static constexpr uint32_t kClusterSize = 64;
+    // Triangles per cluster. 64 matched the workgroup, which was the argument
+    // while a cull step fed a thread-per-triangle pass -- but the traversal was
+    // inverted (findings 22, 23) and nothing has been thread-per-triangle since.
+    // What decides it now is the trade between a tighter box and more boxes to
+    // test, and on an RTX 3060 that trade has an interior optimum:
+    //
+    //   Cornell+bunny 69k    64: 327 ms, 132.4 tri/texel
+    //                        32: 243 ms,  62.6            <- 1.34x
+    //                        16: 286 ms,  40.5            slower despite less work
+    //   Sponza 262k          64: 9025 ms, 1020.8 tri/texel
+    //                        32: 7293 ms,  542.1          <- 1.24x
+    //
+    // 16 fetches a third of the triangles 64 does and is still slower than 32:
+    // past that point the extra box tests cost more than the triangles they
+    // save. Cornell is unaffected either way -- 32 triangles is one cluster at
+    // any of these sizes -- and is bit-identical.
+    static constexpr uint32_t kClusterSize = 32;
 
     static constexpr uint32_t kMaxTris = 0xFFFFFFFEu;   // MBG_EMPTY is the sentinel
 

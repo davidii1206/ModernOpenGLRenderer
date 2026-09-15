@@ -22,8 +22,8 @@ scene it is low by a factor of 46. See implementation.md finding 27.
 
 | File | What | Compare against |
 |---|---|---|
-| `01_direct_1bounce.png` | `MBG_BOUNCES=1 MBG_SKY=0` — direct lighting only, no free parameters at all. RMSE 0.0431 | `../CornellBoxGroundTruthDirectLighting.png` |
-| `02_gi_3bounce.png` | `MBG_SKY=0.05` — the full solve. RMSE 0.0403 | `../CornellBoxOriginalGroundTruth.png` |
+| `01_direct_1bounce.png` | `MBG_BOUNCES=1 MBG_SKY=0` — direct lighting only, no free parameters at all. RMSE 0.0430 | `../CornellBoxGroundTruthDirectLighting.png` |
+| `02_gi_3bounce.png` | `MBG_SKY=0.05` — the full solve. RMSE 0.0402 | `../CornellBoxOriginalGroundTruth.png` |
 | `03_indirect_only_3bounce_4xexposure.png` | `MBG_INDIRECT_ONLY=1 MBG_EXPOSURE=4` — the bounce term with the direct term left out, exposed 4× so it is visible on its own | nothing; it is a diagnostic |
 | `04_diff_direct_vs_reference.png` | `MBG_VIEW=11`, 4× gain. Blue = agreement, warm = error | — |
 | `05_diff_gi_vs_reference.png` | the same for the full solve. The only warm region left is the emitter panel, which is the tone-curve gap of finding 10, not transport | — |
@@ -88,13 +88,18 @@ exits after one frame; without `MBG_BENCH` the app holds the solve and runs its
 interactive loop forever, screenshot or not. `01` and `04` compare against the
 direct reference, which is `MBG_REF=0`.
 
-**`MBG_BENCH=1`, not 3, and that is not cosmetic.** With the denoiser on, a run
-of more than one frame does not reproduce: four runs of the identical binary at
-`MBG_BENCH=3` gave four distinct images, differing by up to 18/255 on about
-twenty thousand pixels. One frame is bit-exact across runs, and so is any number
-of frames with `MBG_FILTER=0`. These images were regenerated at `MBG_BENCH=1` so
-that they reproduce; see implementation.md finding 29 for what is and is not
-established about why.
+**`MBG_BENCH=1` is kept, and the reason has now been narrowed to llvmpipe.**
+Finding 29 recorded that with the denoiser on, a run of more than one frame did
+not reproduce -- four runs of one binary at `MBG_BENCH=3` gave four distinct
+images. That was measured in a software-GL container and does NOT happen on
+hardware: three runs at `MBG_BENCH=3` on an RTX 3060 are bit-identical. The
+one-frame form is kept because it reproduces everywhere.
+
+**These images are generated on an RTX 3060 (driver 610.57.04), not on
+llvmpipe.** The same binary on the two produces images differing by up to 31/255
+across 191420 of the 262144 pixels, so a render made on one will not compare
+byte-for-byte against the other. They reproduce bit-exactly on the hardware
+named here, which is the machine this example is developed on.
 
 The daylight images carry no `MBG_EXPOSURE`: the `MBG_DAYLIGHT` preset is scaled
 so that the **three-bounce** solve lands in the tone curve's usable range at

@@ -2324,6 +2324,103 @@ pass on tolerance, and every bit-identical claim in findings 26 through 34 would
 stop being reproducible. That is a real trade and it should be made against a
 real number, on hardware, not against this machine's guess.
 
+### 35. What the hardware said, and which of the container's conclusions survived
+
+Findings 26 through 34 were measured in a software-GL container, under finding
+22's standing rule that llvmpipe cannot rank two versions of a loop. The exact
+counts -- clusters entered, triangles fetched, texel-triangle tests -- are
+machine independent and all of them hold. The *shares* did not, and two of them
+were wrong in ways that mattered.
+
+Measured on an RTX 3060 Laptop, driver 610.57.04, Cornell at the default:
+
+| raster kernel phase | llvmpipe | **RTX 3060** |
+|---|---|---|
+| emitter light view | 14.9% | **57.0%** |
+| traverse | 33.1% | 24.2% |
+| spawn | 10.3% | 12.0% |
+| setup | 7.4% | 2.1% |
+| quadrature | 6.6% | 1.4% |
+| **reduce+write** | **17.7%** | **2.9%** |
+| sun LV, inactive (the bracket floor) | 4.4% | 0.3% |
+
+**`reduce+write` is 2.9%, not 17.7%.** Finding 34 declined to optimise it on the
+grounds that six barriers per camera are CPU thread synchronization on llvmpipe
+and the row was probably inflated. That was right, and the cost of being wrong
+would have been real: the fix is `subgroupAdd`, whose summation order is
+implementation defined, and it would have traded every bit-identical claim in
+findings 26-34 for three percent.
+
+**The light view is much larger than the container suggested** -- 57% of the
+raster kernel, and `dp emitter LV` is 77% of the per-pixel direct pass on Cornell
+and 97% on the bunny. Finding 32 aimed at the right thing for the wrong reason.
+
+The bracket floor also collapses, 4.4% to 0.3%, which is the instrument
+confirming its own overhead is a container artefact.
+
+A full Cornell sweep is **1.0 s** on this GPU against 14.8 s on llvmpipe.
+
+#### Finding 29 is llvmpipe's, not this renderer's
+
+That finding recorded that a multi-frame run with the denoiser on does not
+reproduce, and explicitly left the cause unestablished: the filter is a pure
+function, its input is held, every barrier is present. Three runs at
+`MBG_BENCH=3` on hardware are **bit-identical**. The renderer is deterministic;
+the container was not. The one-frame form is kept because it reproduces on both.
+
+The renders are now generated on this GPU. The same binary on the two machines
+produces images differing by up to **31/255 across 191420 of 262144 pixels**, so
+they could not have been reproducible on both. RMSE is 0.0430 at one bounce and
+0.0402 at three -- which are this document's original figures, so llvmpipe was
+the outlier on accuracy as well as on timing.
+
+#### Two knobs, one of which was already taken
+
+`MBG_LV_RES` 8 to 4 saves 4.7% and nothing else: the light view's 64 texels are
+exactly the 64 threads of the workgroup, so lowering the resolution idles threads
+rather than removing work. Resolution is the wrong knob there, and the phase
+share alone would have suggested otherwise.
+
+`MBG_DIRECT_RES` has the opposite geometry -- 16 would be 256 texels over 64
+threads, four apiece, all of it real work -- and 16 to 8 is indeed 3.3x. But the
+default has been 8 since before any of this, and `main.cpp` merely documented it
+as 16. The stale line is fixed; the speedup was already banked.
+
+#### And a limit worth knowing before trusting a counter run
+
+A sweep whose individual dispatches run for seconds loses its counters: the bunny
+at the full default (20 s sweep) reports "nothing tallied", while the same scene
+at reduced settings tallies correctly. Driver preemption on a multi-second
+compute dispatch. Measure counts on bounded configurations.
+
+### 36. 64 triangles per cluster was a rule from a rasterizer that no longer exists
+
+`kClusterSize` was 64 because that matched the workgroup, so one cull step fed
+one thread-per-triangle pass. Findings 22 and 23 inverted the traversal and
+nothing has been thread-per-triangle since; the constant was never revisited.
+
+What decides it now is a trade with an interior optimum -- a tighter box against
+more boxes to test -- and finding 35 makes the trade worth measuring, because
+traverse is 80.7% of the raster kernel on a scene with clusters in it.
+
+| | 64 | **32** | 16 |
+|---|---|---|---|
+| Cornell+bunny 69k, sweep | 327 ms | **243 ms** | 286 ms |
+| ... triangles fetched per texel | 132.4 | **62.6** | 40.5 |
+| Sponza 262k, sweep | 9025 ms | **7293 ms** | — |
+| ... triangles fetched per texel | 1020.8 | **542.1** | — |
+
+**16 fetches a third of the triangles that 64 does and is still slower than 32.**
+Past that point the extra box tests cost more than the triangles they save, which
+is the whole shape of the trade and is invisible in any single number: the work
+column keeps improving after the clock has turned around.
+
+1.34x on the bunny, 1.24x on Sponza, and Cornell is unaffected and bit-identical
+-- 32 triangles is one cluster at any of these sizes. The bunny image moves by
+**5/255 on one pixel of 262144**, a tie broken the other way because the visit
+order changed; the traversal still returns the nearest triangle, and 36/36 gates
+pass.
+
 ## What this does not answer
 
 - **§8.1, the reuse radius experiment.** The gate the doc puts before everything
