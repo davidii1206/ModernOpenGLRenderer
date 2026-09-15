@@ -2547,14 +2547,16 @@ documents), so the wrappers are the only place it is set.
 | Cornell, sweep | 915 ms | **474 ms** | **1.93x** |
 | Cornell+bunny, sweep | 194 ms | **105 ms** | 1.85x |
 
-**Both columns are warm numbers, and the first version of this table was not.**
-The first run of any build is slow -- 549 ms against a settled 474, about 15% --
-and after that the measurement is remarkably stable: 472.8, 474.1, 474.1, 474.3
-across four runs, under half a percent. The baseline originally quoted here was
-978 ms, which was a first run; warm it is 915, and the ratio is 1.93x rather than
-the 2.06x first claimed. Discard the first run after a build. A whole-frame
-figure was also quoted and has been removed: it compared against a measurement
-taken before findings 36 and 37, so it was attributing their gains here.
+**Both columns are settled numbers, and the first version of this table was not.**
+Repeated runs agree to under half a percent -- 472.8, 474.1, 474.1, 474.3 -- but
+the first reading of each sequence came in high, 549 and 991 against settled 474
+and 915. The baseline originally quoted here was one of those high readings, so
+the ratio is **1.93x** and not the 2.06x first claimed. (The high readings were
+most likely the machine's owner opening the app while a measurement was running,
+not a property of the renderer; either way a single unrepeated timing is not a
+baseline.) A whole-frame figure was also quoted and has been removed: it compared
+against a measurement taken before findings 36 and 37, so it credited their gains
+to the tiers.
 
 36/36 gates, and the res-32 gates now get a correctly sized buffer -- finding
 38's latent 768-out-of-bounds-writes-per-camera is gone as a side effect.
@@ -2606,15 +2608,74 @@ so `lv_cull` early-outs and `s_cl` is never touched at all. A row that cannot
 move moved by 27%. **That is the noise, not the change**, and it is larger than
 the 10% this GPU is usually assumed to have.
 
-It is also not random. The first run of a build is slow and every run after it
-agrees to within half a percent -- 549, then 472.8, 474.1, 474.1, 474.3. Shader
-cache and clock ramp, and it means a single before/after pair taken across a
-rebuild can manufacture a 15% effect out of nothing. It manufactured part of
-finding 39's, which is corrected above.
+Repeated runs agree to within half a percent -- 472.8, 474.1, 474.1, 474.3 --
+but the first reading of a sequence has twice come in 15% high. On this machine
+that was the owner opening the app mid-measurement rather than anything in the
+renderer, which is its own lesson: **the measurement runs on somebody's desktop,
+and the desktop is part of the apparatus.** An unrepeated timing is not a
+baseline, and one such reading became part of finding 39's ratio before it was
+corrected.
 
-So: no change here, and a measurement rule that should have been in place since
-finding 35. **Discard the first run after a build, and be suspicious of any
-result that moves a quantity the change cannot reach.**
+So: no change here, and a rule that should have been in place since finding 35.
+**Repeat a timing before believing it, and be suspicious of any result that moves
+a quantity the change cannot reach.**
+
+### 41. Four things that did not work, and what that leaves
+
+Finding 39's tier split came out of finding 38's negative result, so the negative
+results are worth keeping. Measured on hardware, all rejected:
+
+- **Tiering `direct_pixel.comp`.** It does not include `raster.glsl` and has no
+  worst-case buffer -- about 2.2 KB in total. Nothing to split.
+- **Shrinking `s_cl` from 256 to 64** (768 bytes, in both kernels). Two scenes
+  better, two worse; and Cornell, which has one cluster and never touches
+  `s_cl`, moved 27%. Noise.
+- **Dropping `lv_cull` at per-pixel granularity**, on the theory that scanning
+  every cluster per pixel could cost more than it saves. It saves **5.75x**
+  (146 ms against 842). It also costs almost nothing to run: 2171 clusters over
+  64 threads is 34 iterations per thread, under 1% of the pass.
+- **A smaller `kClusterSize` for the direct pass**, which walks 48 triangles per
+  texel and might prefer tighter boxes than the solve does. 16 is worse at both:
+  `Direct/px` 198 ms against 32's 145, sweep 113 ms against 107. There is no
+  tension; 32 is right for both.
+
+#### What the split actually says, per scene
+
+| | Cornell | Cornell+bunny |
+|---|---|---|
+| traverse | 24.0% | **79.6%** |
+| emitter light view | **59.1%** | 19.7% |
+| `dp emitter LV`, share of the direct pass | 77.0% | **97.0%** |
+
+Cornell's 59% is Cornell: 32 triangles in one cluster, so its light view walks
+all of them with nothing to cull and no hierarchy to help. It is not a general
+result, and reading it as one is the mistake finding 32 already recorded.
+
+On a scene with clusters the solve is traverse-bound and the direct pass is
+almost entirely light view -- 124367 cycles per pixel, against 6.57e10 for the
+pass as a whole, which is nine times the entire solve at this configuration.
+
+#### Why the incremental levers are finished
+
+The light view is **thread bound at one texel per thread**: an 8x8 target is 64
+texels and the workgroup is 64 threads, so a workgroup's light-view time is one
+texel's scene walk. Lowering the resolution idles threads instead of removing
+work, which is why `MBG_LV_RES` (finding 35) and `MBG_DIRECT_RES` both went
+nowhere. The walk is already culled to ~1.5 clusters of 32 triangles by findings
+30 and 32, and the cull is already worth 5.75x.
+
+What is left is structural, and both options are real work rather than a constant
+to tune:
+
+- **Share the light view across a block of pixels.** `lv_setup` and `lv_cull`
+  run per pixel per emitter, and neighbouring pixels see almost the same
+  surviving clusters. One workgroup per 2x2 or 4x4 block would amortize them --
+  though the cull is under 1% of the pass, so the win has to come from sharing
+  the *walk*, which means accepting one visibility answer across the block. That
+  is finding 25's mask taken further, and finding 11 is the warning against it.
+- **A hierarchy over clusters.** The one thing that would cut both the 79.6%
+  traverse and the light view's walk at once, and the only remaining item whose
+  payoff grows with scene size rather than shrinking.
 
 ## What this does not answer
 
