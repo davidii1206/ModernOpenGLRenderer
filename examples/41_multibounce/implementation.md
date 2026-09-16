@@ -3216,6 +3216,75 @@ scenes never execute, and a change measured only on Bistro is measured on a path
 the gates never check. The interval bound needed all three, and gate 10 is
 therefore run on Cornell+bunny (2172 clusters, cooperative) as well as on Cornell.
 
+### 49. A far shell costs more than the whole hemisphere, which is why ray splitting is not optional
+
+With gate 10's interval in place, the question the cascade design rests on can be
+asked directly: how does traversal cost distribute across distance? Bistro,
+4 208 958 triangles, 512², one bounce, res 8 (64 directions — the cascade-0
+configuration), `MBG_COUNT=1 MBG_SOLVE=1`.
+
+**Prefix shells `[0, R)`**, R stepping by 4× to match the `l = 4` interval scaling:
+
+| R | ms per sweep | triangles fetched per texel |
+|---|---|---|
+| 0.5 | **65.6** | 274.96 |
+| 2 | 111.6 | 337.63 |
+| 8 | 307.7 | 446.78 |
+| 32 | 620.2 | 507.79 |
+| 128 | 681.2 | 521.38 |
+| ∞ | 697.3 | 521.38 |
+
+The bound works, and it is worth more than the fetch count suggests: `[0, 0.5)`
+fetches 53% of the triangles the unbounded trace does and costs **9.4%** of the
+time. A tight bound keeps the traversal inside a small spatial region where the
+geometry is cache-resident; a far one walks the scene. That is the same
+latency-bound reading finding 47 arrived at from the other direction.
+
+#### And then the result that decides the architecture
+
+**Far shells `[R, ∞)`:**
+
+| R | ms per sweep | triangles fetched per texel |
+|---|---|---|
+| 0 | 697.7 | 521.38 |
+| 8 | **1053.3** | 700.98 |
+| 32 | **2177.5** | 997.74 |
+| 128 | **2394.5** | 1039.17 |
+
+A far shell does not merely fail to save the near work. It costs **3.4× the
+entire unbounded hemisphere.**
+
+The reason is that `u_r0` rejects near hits, and the distance bound is fed by
+exactly those hits. Normally the first near surface collapses `worst` and kills
+most of the box tests that follow; with `r0 = 128` nothing inside 128 units is
+allowed to tighten anything, so the traversal walks almost the whole scene with
+an effectively infinite bound. The counter says it plainly: 1039 triangles per
+texel against the unbounded trace's 521.
+
+**So building a cascade ladder by tracing each shell separately is not
+expensive, it is catastrophic.** Five cascades traced as five shells would cost
+several seconds against 0.7 s for one unbounded trace of the same directions —
+and the outer cascades, which are supposed to be the cheap ones, are the
+expensive ones.
+
+Ray splitting (`world-space-radiance-cascades.md` §2.5–2.6) is therefore not an
+optimisation of the cascade construction. It **is** the cascade construction:
+trace each probe direction once to the far end, read the hit distance, and bin it
+into whichever interval it lands in. One traversal, every cascade, and the near
+hits keep doing the pruning they are good at.
+
+This also corrects an estimate made before the measurement: a per-cascade cost
+model priced the ladder at 1.6× today's frame by assuming a shell costs its share
+of a hemisphere. It costs more than the whole one. The error was in the
+optimistic direction and the measurement is the only reason it was caught.
+
+#### The number the design is costed against
+
+One unbounded res-8 trace from 7396 probes — every cascade, via splitting — is
+**697 ms per sweep**, against today's 5623 ms for a single res-16 hemisphere that
+produces one bounce of one shell. **8.1×**, and the near field where contact
+detail and leak risk live is the cheap end of it: `[0, 0.5)` is 65.6 ms.
+
 ## What this does not answer
 
 - **§8.1, the reuse radius experiment.** The gate the doc puts before everything

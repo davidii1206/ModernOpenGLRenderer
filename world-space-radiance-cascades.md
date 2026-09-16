@@ -405,6 +405,14 @@ Everything here is derived from §0's measured table rather than from a fit.
 
 **Ray count.** `#c0 probes × 64`, for all cascades, at any output resolution.
 
+**Ray splitting is now measured to be mandatory, not merely elegant** (finding
+49). A far shell `[R, ∞)` costs *more* than the whole unbounded hemisphere —
+2394 ms at R = 128 against 697 ms unbounded — because `u_r0` rejects exactly the
+near hits the distance bound is fed by, so the traversal walks the scene with an
+effectively infinite bound (1039 triangles per texel against 521). Tracing five
+cascades as five shells would cost seconds, with the outer cascades the expensive
+ones. Trace once to the far end and bin by hit distance.
+
 **Measured anchor.** 7396 probes × 64 directions = 4.73e5 traversals = **670.6 ms
 per sweep** on Bistro, 4.2M triangles, an RTX 3060 Laptop. Against today's default
 of 5623 ms for a single unbounded res-16 hemisphere per receiver, that is **8.4×**
