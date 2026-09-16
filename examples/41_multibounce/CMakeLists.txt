@@ -5,6 +5,7 @@ add_executable(41_multibounce
     solver.cpp
     screen.cpp
     validate.cpp
+    coverage.cpp
 )
 target_link_libraries(41_multibounce PRIVATE gllib)
 target_compile_features(41_multibounce PRIVATE cxx_std_20)

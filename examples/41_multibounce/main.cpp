@@ -123,6 +123,7 @@
 #include "screen.hpp"
 #include "solver.hpp"
 #include "validate.hpp"
+#include "coverage.hpp"
 
 #include <gl/gl.hpp>
 #include <gfx/gfx.hpp>
@@ -784,6 +785,16 @@ int main() {
         {
             ScopedPass p(t_gbuf);
             geometry.render(gbuf, *model, view_proj);
+        }
+
+        // Gate 11: the direction-assignment coverage test. It needs a real
+        // G-buffer -- the clutter and the silhouettes are the whole point -- so
+        // it runs here rather than beside the analytic gates, on the first frame
+        // that has one, and exits.
+        if (getenv("MBG_COVERAGE")) {
+            const bool cov_ok = run_coverage(gbuf, glm::inverse(view_proj),
+                                             cam.position(), scene.bounds().diagonal());
+            return cov_ok ? 0 : 1;
         }
 
         // 2. One chunk of the recursive solve.

@@ -3285,6 +3285,84 @@ One unbounded res-8 trace from 7396 probes — every cascade, via splitting — 
 produces one bounce of one shell. **8.1×**, and the near field where contact
 detail and leak risk live is the cheap end of it: `[0, 0.5)` is 65.6 ms.
 
+### 50. The deterministic direction assignment does not tile, and the reason is not the scheme
+
+`world-space-radiance-cascades.md` §2.4 is the one genuinely novel part of the
+design and the doc names it the thing to validate first: every c0 probe gets a
+fixed budget of `D0` rays, each assigned a sub-bin at cascade `n` from base-4
+digits of the probe's own cell offset along the two tangent axes of its normal
+class, and the children of a cascade-`n` probe are then supposed to cover all of
+its `D0 · 4^n` bins with no randomness. Finding 49 removed its fallback, so this
+became the single point of failure for the architecture.
+
+It is combinatorics, not rendering. A c0 probe sends the same digit tuple to all
+`D0` of its directions, so the covered fraction of a parent's bins is just how
+many DISTINCT tangent-plane digit tuples its descendants occupy. `coverage.cpp`
+measures that from a real G-buffer — no tracing, no intervals, no merge.
+
+**Result, at every cell size tried, with and without LOD, on both scenes:**
+
+| | cascade 1 | cascade 2 | cascade 3 | cascade 4 |
+|---|---|---|---|---|
+| Cornell, best (`d0` 0.064) | 76.0% | 66.3% | 53.0% | 41.5% |
+| Bistro, best (`d0` 0.5) | 70.6% | 50.6% | 28.2% | 16.4% |
+
+The gate wanted **95%**. The best cascade-1 number on the most favourable
+geometry that exists — six flat axis-aligned planes — is 76%.
+
+#### The scheme is not what is failing
+
+Coverage tracks the probe-count bound almost exactly. At Cornell's default
+settings, 2994 c0 probes over 944 cascade-1 parents caps coverage at
+`2994/(944·4) = 79.3%`; measured 79.00%. Cascade 2: bound 58.7%, measured 58.44%.
+Cascade 3: 30.6% against 30.46%. Cascade 4: 18.3% against 18.16%.
+
+**The digit assignment is essentially collision-free. There simply are not enough
+c0 probes to fill the bins.** In the continuum the scheme is exact — a 2-manifold
+sampled at cell size `s` has `A/s²` cells and `A/(4^n s²)` cascade-`n` parents, so
+descendants per parent is exactly `4^n` and coverage is 100%. Everything measured
+above is discretisation: perspective, grazing angles, silhouettes, the class
+split, LOD's power-of-two quantisation, and the normal-axis collapse the digit
+scheme performs by construction.
+
+And the two failure directions are in tension, which is what makes it structural
+rather than a tuning problem. Cells much smaller than a screen block: every block
+becomes its own probe and adjacent blocks land in non-adjacent cells, so nobody
+shares a parent — Cornell at `d0` 0.002 gives 16002 probes, 16002 cascade-1
+parents, and **exactly 25%** coverage, one child each. Cells much larger: probes
+collapse together, coverage per parent rises, and the probe count falls off a
+cliff — Bistro at `d0` 2.0 has 49 probes left. The optimum between them is the
+70-76% above.
+
+#### What it does not establish
+
+This gate measures coverage, not image error, and the doc's own fallback for
+partial coverage is to renormalise the merge over the filled bins and fall back to
+the parent's value. 70% coverage with renormalisation may be perfectly
+acceptable, or may produce the structured error §8 warns about. **A combinatorial
+test cannot tell, and the 95% bar was a proxy chosen before any of this was
+measured.** Only a merged image against the oracle answers it.
+
+#### What it costs if the novelty is abandoned
+
+The assignment existed so that ONE trace could serve every cascade. Without it,
+each cascade traces its own probes — and critically that is *not* finding 49's
+catastrophe, because each such trace is unbounded and keeps its distance bound.
+Using finding 47's measured per-texel costs at each resolution:
+
+| cascade | probes | res | texels | ms |
+|---|---|---|---|---|
+| 0 | 7396 | 8 | 4.73e5 | 697 |
+| 1 | 1849 | 16 | 4.73e5 | 1406 |
+| 2 | 462 | 32 | 4.73e5 | 1074 |
+| 3 | 116 | 64 | — | **not buildable** |
+
+`3177 ms` for three cascades against today's 5623 — **1.77×** — and the ladder
+stops at cascade 2, because cascade 3 needs a res-64 target whose 16 KB of
+`s_vis` finding 38 forbids. So the honest position is that the architecture's
+8.1× depends entirely on §2.4, and without §2.4 it is a modest win with a hard
+angular cap.
+
 ## What this does not answer
 
 - **§8.1, the reuse radius experiment.** The gate the doc puts before everything
