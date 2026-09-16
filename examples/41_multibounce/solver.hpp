@@ -254,6 +254,11 @@ struct SolveConfig {
     bool      tent = true;
 
     float     bias = 1e-3f;        // camera offset along its own normal, world units
+    // The radiance interval this solve resolves, in world units. [0, 1e18) is the
+    // unbounded hemisphere and is bit-identical to having no bound at all; a
+    // cascade sets a shell. See world-space-radiance-cascades.md section 2.6.
+    float     r0 = 0.0f;
+    float     r1 = 1e18f;
     // The environment: what an uncovered texel sees, and the one light in the
     // scene that has no geometry. All zero by default, so every measurement in
     // implementation.md and every gate reads exactly what it did before this

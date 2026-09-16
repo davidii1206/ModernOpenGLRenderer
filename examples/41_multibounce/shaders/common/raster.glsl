@@ -30,6 +30,18 @@ uniform uint  u_order;        // 1 = visit groups nearest-first
 // See mbg_resolve_vis_coop: it turns the closest-hit search into an any-hit one,
 // which the existing distance bound then terminates almost immediately.
 uniform uint  u_anyhit;
+// THE RADIANCE INTERVAL. A camera resolves the nearest hit in [u_r0, u_r1) and
+// reports nothing outside it, which is what lets one hemisphere be decomposed
+// into the radial shells a cascade is made of (world-space-radiance-cascades.md
+// section 2.6). Half-open by construction: the accept below is `dist < bd[k]`
+// and bd[k] starts at u_r1, so a hit exactly at the far edge belongs to the next
+// shell up and is counted once.
+//
+// Initialising the bound to u_r1 rather than 1e18 also makes `worst` finite from
+// the first iteration, so both box tests can reject before the traversal has
+// found anything. Defaults 0 and 1e18 reproduce the unbounded traversal exactly.
+uniform float u_r0;
+uniform float u_r1;
 #define MBG_ANG_EPS 1e-5
 #define MBG_ANG_ABS 1e-6
 
@@ -432,7 +444,7 @@ void mbg_resolve_vis_coop(uint tid, uint stride, uint group_count, uint super_co
                         : vec3(0.0, 0.0, 1.0);
             len[k] = length(d[k]);
             best[k] = MBG_EMPTY;
-            bd[k] = live ? 1e18 : 0.0;
+            bd[k] = live ? u_r1 : 0.0;
             // Reciprocal direction for the slab test below, once per texel
             // rather than once per texel per cluster. A zero component gives an
             // infinity here, which is exactly what the slab test wants: the ray
@@ -567,6 +579,7 @@ void mbg_resolve_vis_coop(uint tid, uint stride, uint group_count, uint super_co
                             if (u_count != 0u && (pmask & (1u << k)) == 0u)
                                 ++g_tally[MBG_CT_ANG_VIOL];
                             float dist = tt * len[k];
+                            if (dist < u_r0) continue;
                             if (u_anyhit != 0u) { bd[k] = 0.0; best[k] = t; continue; }
                             if (dist < bd[k]) { bd[k] = dist; best[k] = t; }
                         }
@@ -603,15 +616,23 @@ void mbg_resolve_vis(uint tid, uint stride, uint group_count, uint super_count, 
         for (uint i = tid; i < n; i += stride) {
             vec3  d = mbg_to_world(mbg_px_to_dir(vec2(float(i % u_res),
                                                       float(i / u_res)) + vec2(0.5), u_res));
+            // The interval is in WORLD units and mbg_tri_hit returns the ray
+            // parameter along an unnormalized direction, so the two are only
+            // comparable through |d|. This path used to keep the parameter
+            // alone, which is why it needs a length here and the culled paths
+            // already had one.
+            float len_d = length(d);
             uint  best = MBG_EMPTY;
-            float bestt = 1e30;
+            float bestdist = u_r1;
             for (uint t = 0u; t < tri_count; ++t) {
                 MBG_TALLY(MBG_CT_TRI_SETUP, 1u)
                 MBG_TALLY(MBG_CT_TEX_TEST, 1u)
                 float tt;
                 if (!mbg_tri_hit(t, d, tt)) continue;
+                float dist = tt * len_d;
+                if (dist < u_r0) continue;
                 if (u_anyhit != 0u) { best = t; break; }
-                if (tt < bestt) { bestt = tt; best = t; }
+                if (dist < bestdist) { bestdist = dist; best = t; }
             }
             s_vis[i] = best;
         }
@@ -629,7 +650,7 @@ void mbg_resolve_vis(uint tid, uint stride, uint group_count, uint super_count, 
         // A real distance, not the ray parameter, so it can be compared against
         // a cluster's. 1e18 rather than 1e30 because it gets squared below and
         // 1e30 squared is not a float.
-        float bestdist = 1e18;
+        float bestdist = u_r1;
 
         // Two levels, coarse first. Every texel of this camera shares an origin
         // and so rediscovers the same scene; testing 65 group boxes before 4098
@@ -669,10 +690,11 @@ void mbg_resolve_vis(uint tid, uint stride, uint group_count, uint super_count, 
                     for (uint t = first; t < last; ++t) {
                         float tt;
                         if (!mbg_tri_hit(t, d, tt)) continue;
+                        float dist = tt * len_d;
+                        if (dist < u_r0) continue;
                         // Any-hit: the bound goes to zero, so every remaining box
                         // fails its test and the two loops above unwind themselves.
                         if (u_anyhit != 0u) { best = t; bestdist = 0.0; break; }
-                        float dist = tt * len_d;
                         if (dist < bestdist) { bestdist = dist; best = t; }
                     }
                     if (u_anyhit != 0u && best != MBG_EMPTY) break;

@@ -3154,6 +3154,68 @@ within 3× on llvmpipe that an RTX 3060 ranked 124× apart, and here a 8.5× cha
 in counted work produced no change in time at all. **Neither column is evidence
 on its own.**
 
+### 48. Radiance intervals, and the third traversal path nobody was counting
+
+A cascade is one hemisphere cut into radial shells, so the first thing to
+establish is that the cut is exact: resolving `[0, R)` and `[R, inf)` separately
+has to reproduce resolving `[0, inf)` once, texel for texel, with no hit counted
+twice and none lost at the seam. `u_r0` and `u_r1` are that interval, and gate 10
+(`shell`) is that assertion.
+
+The bound is also free in the other direction: `bd[k]` starting at `u_r1` instead
+of `1e18` makes `worst` finite from the first iteration, so both box tests can
+reject before the traversal has found anything. Defaults `0` and `1e18` reproduce
+the unbounded traversal exactly — Cornell 126.6 ms and Cornell+bunny 1765 ms
+against 126.7 and 1779 before it, both inside the noise band.
+
+#### Two assertions, because they fail differently
+
+**Partition** — the near shell holds exactly those texels whose overall nearest
+hit is nearer than `R`. Predictable from the unsplit trace alone, and it catches
+a bound that is off by one side of the interval.
+
+**Merge** — `near`, or `far` where `near` is empty, equals the unsplit winner.
+The far shell on its own is *not* predictable, because a second surface can sit
+behind the first; this is the identity the cascade merge operator actually needs.
+
+Hit distances come from `ray_tri` on the host rather than from a new shader
+output, because finding 44 measured instruments perturbing the pass they measure
+by 2.06× — and the winning triangle index recovers the distance exactly.
+
+Result: **0 partition and 0 merge disagreements over 196 608 texel-tests across
+12 cuts**, on Cornell and on Cornell+bunny, with 14 and 7 texels respectively
+landing within 1e-5 of the cut (the host and the shader compute `t` with
+different arithmetic, so a hit within an ulp of `R` can fall either side; counted
+and reported, never silently forgiven). 38/38 gates.
+
+#### What it cost to get there, which is the part worth keeping
+
+The first run reported **0 merge disagreements and 78 653 partition
+disagreements**, and the near shell's non-empty count was *identical to the full
+trace's* at every `R` — 13 381 every time. The bound was doing nothing at all.
+
+It was not the uniform. `glGetUniformLocation` found `u_r0` and `u_r1` at 25 and
+26, and the host was sending `r1 = 0` on exactly the call that should have
+produced an empty shell. Forcing `bd[k] = 0.0` as a literal in the cooperative
+path changed nothing either, which is what finally located it:
+
+**`mbg_resolve_vis` has an early-out brute-force loop before the one this
+document describes**, taken when `s_cli_all != 0u` — a scene small enough that the
+cull disabled itself. It walks `tri_count` directly, keeps `bestt` (the ray
+PARAMETER, not a world distance), and `return`s. There are three traversal paths
+in this file, not two, and the unculled one had no bound because nothing had ever
+needed to give it one.
+
+Which is the finding, and it generalises past this change: **Cornell takes a
+different code path from Sponza and Bistro.** `u_coop` is
+`cfg.coop && cluster_count > 8`, and the cull disables itself below eight
+clusters, so Cornell — 32 triangles, one cluster — runs neither the cooperative
+traversal nor the culled scalar one. Every gate in this example runs on Cornell.
+A traversal change verified only by the gates is verified on the path the timing
+scenes never execute, and a change measured only on Bistro is measured on a path
+the gates never check. The interval bound needed all three, and gate 10 is
+therefore run on Cornell+bunny (2172 clusters, cooperative) as well as on Cornell.
+
 ## What this does not answer
 
 - **§8.1, the reuse radius experiment.** The gate the doc puts before everything

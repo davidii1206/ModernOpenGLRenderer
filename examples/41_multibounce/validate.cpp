@@ -854,6 +854,124 @@ bool run_gates(const std::string& names, Solver& solver, const SolveConfig& base
         }
     }
 
+    // --- 10. Radiance intervals partition a hemisphere exactly ---------------
+    //
+    // A cascade is one hemisphere cut into radial shells, so before anything is
+    // built on top of that the cut itself has to be exact: resolving [0, R) and
+    // [R, inf) separately must reproduce resolving [0, inf) once, texel for
+    // texel, with no hit counted twice and none lost at the seam.
+    //
+    // Two different assertions, because they fail differently:
+    //
+    //   PARTITION -- the near shell holds exactly those texels whose overall
+    //   nearest hit is nearer than R. This is predictable from the unsplit trace
+    //   alone and catches a bound that is off by one side of the interval.
+    //
+    //   MERGE -- near, or far where near is empty, equals the unsplit winner.
+    //   The far shell on its own is NOT predictable (a second surface can sit
+    //   behind the first), so this is the identity that actually has to hold for
+    //   world-space-radiance-cascades.md section 2.6's merge operator.
+    //
+    // Distances come from ray_tri on the host rather than from a new shader
+    // output, because finding 44 measured instruments perturbing the pass they
+    // measure by 2.06x -- and the winning triangle index is enough to recover
+    // the distance exactly.
+    if (wants(names, "shell")) {
+        SolveConfig cfg = base;
+        cfg.bounces = 1;
+        cfg.res[0] = 16;
+
+        std::mt19937 rng(9876u);
+        std::uniform_real_distribution<float> u01(0.0f, 1.0f);
+        std::vector<glm::vec4> pos, nrm;
+        const uint32_t kCams = 64;
+        for (uint32_t i = 0; i < kCams; ++i) {
+            const Tri& t = tris[rng() % tris.size()];
+            float a = u01(rng), b = u01(rng);
+            if (a + b > 1.0f) { a = 1.0f - a; b = 1.0f - b; }
+            pos.push_back(glm::vec4(t.p[0] + a * (t.p[1] - t.p[0]) + b * (t.p[2] - t.p[0]), 1.0f));
+            nrm.push_back(glm::vec4(t.n, 0.0f));
+        }
+
+        Quadrature q;
+        q.build(cfg.res[0]);
+        const uint32_t texels = cfg.res[0] * cfg.res[0];
+        const uint32_t kEmpty = 0xFFFFFFFFu;
+
+        SolveConfig full = cfg;
+        full.r0 = 0.0f;
+        full.r1 = 1e18f;
+        const std::vector<uint32_t> vis_full =
+            solver.raster_visibility(scene, full, pos, nrm);
+
+        // The distance the shader would have measured, recovered on the host.
+        std::vector<float> dist(std::size_t(kCams) * texels, -1.0f);
+        float dmin = 1e30f, dmax = 0.0f;
+        for (uint32_t c = 0; c < kCams; ++c) {
+            glm::vec3 N = glm::normalize(glm::vec3(nrm[c])), T, B;
+            onb(N, T, B);
+            const glm::vec3 P = glm::vec3(pos[c]) + N * cfg.bias;
+            for (uint32_t i = 0; i < texels; ++i) {
+                const uint32_t key = vis_full[c * texels + i];
+                if (key == kEmpty) continue;
+                const glm::vec3 dl = glm::vec3(q.texels[i]);
+                const glm::vec3 d = T * dl.x + B * dl.y + N * dl.z;
+                float t = 0.0f;
+                if (!ray_tri(P, d, tris[key], t)) continue;
+                dist[c * texels + i] = t;
+                dmin = std::min(dmin, t);
+                dmax = std::max(dmax, t);
+            }
+        }
+
+        // R values that matter: inside the range, outside it on both sides, and
+        // EXACTLY on a hit -- the tie case, where half-open has to put the hit in
+        // the far shell and count it once.
+        std::vector<float> Rs = {0.0f, 1e18f, dmin * 0.5f, dmax * 2.0f,
+                                 0.25f * (dmin + dmax), 0.5f * (dmin + dmax)};
+        for (uint32_t c = 0; c < kCams && Rs.size() < 12; c += 17)
+            for (uint32_t i = 0; i < texels && Rs.size() < 12; i += 97)
+                if (dist[c * texels + i] > 0.0f) Rs.push_back(dist[c * texels + i]);
+
+        std::size_t part_bad = 0, merge_bad = 0, seam = 0, total = 0;
+        const bool shell_verbose = getenv("MBG_GATE_VERBOSE") != nullptr;
+        for (float R : Rs) {
+            std::size_t pb0 = part_bad, mb0 = merge_bad;
+            SolveConfig near_c = cfg; near_c.r0 = 0.0f; near_c.r1 = R;
+            SolveConfig far_c  = cfg; far_c.r0  = R;    far_c.r1  = 1e18f;
+            const std::vector<uint32_t> vn = solver.raster_visibility(scene, near_c, pos, nrm);
+            const std::vector<uint32_t> vf = solver.raster_visibility(scene, far_c,  pos, nrm);
+            for (std::size_t i = 0; i < vis_full.size(); ++i) {
+                const uint32_t f = vis_full[i];
+                const float dt = dist[i];
+                ++total;
+                // A hit within an ulp of the cut can land either side: the host
+                // and the shader compute t with different arithmetic. Counted
+                // and reported, never silently forgiven.
+                if (dt > 0.0f && std::abs(dt - R) <= 1e-5f * std::max(dt, R)) { ++seam; continue; }
+                const uint32_t want_near = (dt > 0.0f && dt < R) ? f : kEmpty;
+                if (vn[i] != want_near) ++part_bad;
+                const uint32_t merged = vn[i] != kEmpty ? vn[i] : vf[i];
+                if (merged != f) ++merge_bad;
+            }
+            if (shell_verbose || part_bad != pb0 || merge_bad != mb0) {
+                std::size_t nef = 0, nen = 0, nff = 0;
+                for (std::size_t i = 0; i < vis_full.size(); ++i) {
+                    nef += vis_full[i] != kEmpty;
+                    nen += vn[i] != kEmpty;
+                    nff += vf[i] != kEmpty;
+                }
+                printf("[GATE] 10 shell   R %-12.6g partition %-8zu merge %-6zu "
+                       "nonempty full %zu near %zu far %zu\n",
+                       double(R), part_bad - pb0, merge_bad - mb0, nef, nen, nff);
+            }
+        }
+        r.check(10, "shell", "partition disagreements", double(part_bad), 0.0, 0.0, true);
+        r.check(10, "shell", "merge disagreements", double(merge_bad), 0.0, 0.0, true);
+        printf("[GATE] 10 shell   %zu cut(s) over %zu texel-tests, %zu at the seam "
+               "(hit distance within 1e-5 of R)\n", Rs.size(), total, seam);
+    }
+
     printf("[GATE] %d passed, %d failed\n", r.passed, r.failed);
     return r.failed == 0;
 }

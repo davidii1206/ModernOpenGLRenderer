@@ -458,6 +458,11 @@ void Solver::raster_level(uint32_t l, uint32_t count, const Scene& scene,
     raster_.set("u_anyhit", anyhit ? 1u : 0u);
     raster_.set("u_importance", cfg.importance ? 1u : 0u);
     raster_.set("u_bias", cfg.bias);
+    raster_.set("u_r0", cfg.r0);
+    // No "0 means unbounded" sentinel: r1 == 0 is an EMPTY shell and must stay
+    // one, or the shell gate's R = 0 cut silently becomes a full trace. The
+    // unbounded default is the explicit 1e18 in SolveConfig.
+    raster_.set("u_r1", cfg.r1);
     raster_.set("u_inv_far", 1.0f / far);
     cfg.sky.bind(raster_);
     raster_.set("u_emissive", cfg.emissive);

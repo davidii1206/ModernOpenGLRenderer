@@ -228,6 +228,8 @@ EnvOpts read_env() {
     if (const char* v = getenv("MBG_BLOCK2"))   u32(v, o.cfg.block[1]);
     if (const char* v = getenv("MBG_BLOCK3"))   u32(v, o.cfg.block[2]);
     if (const char* v = getenv("MBG_BIAS"))     o.cfg.bias = float(atof(v));
+    if (const char* v = getenv("MBG_R0"))       o.cfg.r0 = float(atof(v));
+    if (const char* v = getenv("MBG_R1"))       o.cfg.r1 = float(atof(v));
     // The preset first, so the individual knobs below can override any part of it.
     if (const char* v = getenv("MBG_DAYLIGHT")) { if (atoi(v) != 0) o.cfg.sky = SkyLight::daylight(); }
     if (const char* v = getenv("MBG_SKY"))      o.cfg.sky.ambient = parse_vec3(v, o.cfg.sky.ambient);
