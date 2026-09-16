@@ -565,7 +565,12 @@ int main() {
         return 1;
     }
     Scene scene;
-    if (!scene.build(tris)) return 1;
+    // MBG_SUPER is groups per super-group; 0 collapses the third level to a
+    // single box over everything, which is the two-level traversal this example
+    // had before finding 46 -- the A/B baseline, built by the same code.
+    uint32_t super_size = Scene::kSuperSize;
+    if (const char* v = getenv("MBG_SUPER")) super_size = uint32_t(std::max(0, atoi(v)));
+    if (!scene.build(tris, super_size)) return 1;
 
     const Bounds& sb = scene.bounds();
     gllib::logf(gllib::LogLevel::info,

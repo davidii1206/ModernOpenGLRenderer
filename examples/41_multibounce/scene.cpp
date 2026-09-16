@@ -146,7 +146,7 @@ double total_area(const std::vector<Tri>& tris) {
 
 // --- Scene ------------------------------------------------------------------
 
-bool Scene::build(const std::vector<Tri>& tris) {
+bool Scene::build(const std::vector<Tri>& tris, uint32_t super_size) {
     if (tris.size() > kMaxTris) {
         gllib::logf(gllib::LogLevel::error,
                     "%zu triangles exceeds the %u the visibility key allows",
@@ -186,6 +186,28 @@ bool Scene::build(const std::vector<Tri>& tris) {
     }
     group_count_ = uint32_t(groups.size());
     groups_.data(groups.data(), groups.size() * sizeof(GpuCluster));
+
+    // The third level, over runs of groups. Same shape as the two below it,
+    // because the thing that was missing was a level and not a different kind of
+    // structure: without it the group list is scanned in full by every
+    // camera-thread, which is O(scene) and 68% of Bistro's sweep (finding 46).
+    //
+    // super_size 0 means ONE super-group over everything, which is the old
+    // traversal plus a single box test -- the A/B baseline, built from the same
+    // code so the comparison cannot drift.
+    const std::size_t sstep = super_size ? std::size_t(super_size) : groups.size();
+    std::vector<GpuCluster> supers;
+    for (std::size_t base = 0; base < groups.size(); base += std::max<std::size_t>(1, sstep)) {
+        const std::size_t n = std::min(std::max<std::size_t>(1, sstep), groups.size() - base);
+        glm::vec3 lo(1e30f), hi(-1e30f);
+        for (std::size_t i = 0; i < n; ++i) {
+            lo = glm::min(lo, glm::vec3(groups[base + i].lo));
+            hi = glm::max(hi, glm::vec3(groups[base + i].hi));
+        }
+        supers.push_back({glm::vec4(lo, float(base)), glm::vec4(hi, float(n))});
+    }
+    super_count_ = uint32_t(supers.size());
+    supers_.data(supers.data(), supers.size() * sizeof(GpuCluster));
 
     std::vector<GpuTriGeom> gpu(tris.size());
     std::vector<GpuTriShade> shade(tris.size());

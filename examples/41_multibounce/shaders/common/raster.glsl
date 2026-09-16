@@ -137,10 +137,20 @@ shared float s_gdist[MBG_MAX_GROUPS];
 shared uint  s_gord[MBG_MAX_GROUPS];
 shared uint  s_gsorted;                  // 0 = walk them in index order
 
-void mbg_order_groups(uint tid, uint stride, uint group_count) {
+void mbg_order_groups(uint tid, uint stride, uint group_count, uint super_count) {
     // Nothing to order; or more groups than the array holds, which is only
     // reachable with culling off, where there is no bound to tighten anyway.
-    if (u_order == 0u || group_count <= 2u || group_count > MBG_MAX_GROUPS) {
+    //
+    // AND NOT ONCE THERE IS MORE THAN ONE SUPER-GROUP. This permutes the GLOBAL
+    // group list, and that stays a permutation of what the traversal walks only
+    // while one super-group spans every group. Above that the walk is a sequence
+    // of contiguous ranges, and a global permutation would carry groups across
+    // their boundaries. Nothing is lost: ordering needs 3..128 groups to engage
+    // at all, which at kSuperSize 64 is at most two super-groups, so the one
+    // scene it was ever active on -- Cornell+bunny, 34 groups -- still has
+    // exactly one and is unaffected.
+    if (u_order == 0u || super_count > 1u ||
+        group_count <= 2u || group_count > MBG_MAX_GROUPS) {
         if (tid == 0u) s_gsorted = 0u;
         barrier();
         return;
@@ -364,7 +374,7 @@ uint mbg_box_mask(vec3 lo, vec3 hi, uint nk, vec3 inv[MBG_TEXELS_PER_THREAD]) {
 // point a child camera is placed on -- and it is not exact with MBG_NEE off,
 // where the quadrature is how emitters are found in the first place. The host
 // sets u_anyhit only when both conditions hold.
-void mbg_resolve_vis_coop(uint tid, uint stride, uint group_count) {
+void mbg_resolve_vis_coop(uint tid, uint stride, uint group_count, uint super_count) {
     uint n = u_res * u_res;
     uint span = stride * MBG_TEXELS_PER_THREAD;
 
@@ -374,7 +384,7 @@ void mbg_resolve_vis_coop(uint tid, uint stride, uint group_count) {
         g_tally[MBG_CT_TEXEL]  = n;
     }
 
-    mbg_order_groups(tid, stride, group_count);
+    mbg_order_groups(tid, stride, group_count, super_count);
 
     // A THREAD'S FOUR TEXELS ARE STRIDED, AND GIVING IT A 2x2 TILE INSTEAD DOES
     // NOT HELP -- which is worth recording, because the argument for it is good.
@@ -433,117 +443,136 @@ void mbg_resolve_vis_coop(uint tid, uint stride, uint group_count) {
         }
         worst = max(max(bd[0], bd[1]), max(bd[2], bd[3]));
 
-        for (uint gi = 0u; gi < group_count; ++gi) {
-            uint g = mbg_group_at(gi);
-            vec3 gq = max(max(groups[g].lo.xyz - g_P, vec3(0.0)),
-                          g_P - groups[g].hi.xyz);
-            MBG_TALLY(MBG_CT_GRP_TEST, 1u)
-            // The loosest bound any of this thread's texels holds: if the whole
-            // group is beyond that, none of them can want it.
-            if (dot(gq, gq) > worst * worst) continue;
-            // AND THE SAME DIRECTION TEST, ONE LEVEL UP. Without this the group
-            // level is distance-only, so it admits a group whenever anything in
-            // it is near -- and then every one of its 64 clusters is tested
-            // individually. Measured before this line existed: 8.8 of 17 groups
-            // entered and 481 cluster tests to enter 3.5 of them.
+        // THE THIRD LEVEL. Above the groups there was nothing, so every
+        // camera-thread scanned the WHOLE group list, every camera -- 2056 boxes
+        // on Bistro, which is exactly 4208958/(32*64), and the one term in this
+        // kernel that is O(scene). Finding 46's fit put that scan at 68% of
+        // Bistro's sweep against 21% of Sponza's.
+        //
+        // Same two tests as the level below, one level up, for the same reason
+        // the group level itself exists.
+        for (uint si = 0u; si < super_count; ++si) {
+            vec3 sq = max(max(supers[si].lo.xyz - g_P, vec3(0.0)),
+                          g_P - supers[si].hi.xyz);
+            if (dot(sq, sq) > worst * worst) continue;
             if (u_angular != 0u &&
-                mbg_box_mask(groups[g].lo.xyz, groups[g].hi.xyz, nk, inv) == 0u)
+                mbg_box_mask(supers[si].lo.xyz, supers[si].hi.xyz, nk, inv) == 0u)
                 continue;
-            MBG_TALLY(MBG_CT_GRP_ENTER, 1u)
 
-            uint cfirst = uint(groups[g].lo.w);
-            uint clast  = cfirst + uint(groups[g].hi.w);
-            for (uint c = cfirst; c < clast; ++c) {
-                if (!mbg_cl_live(c)) continue;
-                vec3 q = max(max(clusters[c].lo.xyz - g_P, vec3(0.0)),
-                             g_P - clusters[c].hi.xyz);
-                float qd2 = dot(q, q);
-                MBG_TALLY(MBG_CT_CLU_TEST, 1u)
-                if (qd2 > worst * worst) continue;
-                // IS IT IN THE WAY, NOT JUST NEAR ENOUGH.
-                //
-                // The distance bound is the only thing pruning an entered
-                // cluster, and distance is not direction. A texel is ONE
-                // direction -- mbg_px_to_dir at the texel centre, point sampled,
-                // which is exactly what mbg_hit_dir then intersects -- so a
-                // cluster whose bounding sphere that direction misses cannot
-                // contain its winner, however near it is. Measured before it was
-                // built: 98.9% of entered clusters on Cornell+bunny and 90.7% on
-                // Sponza are reachable by NO direction the thread holds.
-                //
-                // Conservative by construction: the sphere contains the AABB and
-                // the AABB contains every triangle of the cluster, so a ray that
-                // misses the sphere misses all 64 of them. The mask then keeps
-                // the survivors out of each other's way -- a cluster one texel
-                // wants no longer costs the other three their hit tests.
-                //
-                // No normalize and no sqrt: |bc x d|^2 > r^2 |d|^2 is the same
-                // rejection as comparing the perpendicular distance against r,
-                // by Lagrange's identity, and d is already unnormalized.
-                uint amask = (1u << nk) - 1u;
-                if (u_angular != 0u || u_count != 0u) {
-                    // A SLAB TEST, NOT A BOUNDING SPHERE.
-                    //
-                    // The sphere was tried first and is wrong: |bc x d| cancels
-                    // catastrophically when the ray runs nearly through a distant
-                    // cluster's centre -- large products, tiny difference -- which
-                    // is precisely where the ray DOES hit. Against a cluster
-                    // small enough (the bunny puts 69k triangles in 1086 of them)
-                    // the error reaches the radius itself, and the conservativeness
-                    // counter caught it: one hit in a cluster the test had
-                    // declared unreachable, surviving a 1000x radius inflation
-                    // because inflation is not the failure.
-                    //
-                    // The slab test has no such term. It is also TIGHTER -- the
-                    // box, not the sphere around it -- so it rejects strictly
-                    // more. `lo`/`hi` are nudged out by MBG_ANG_EPS to cover
-                    // mbg_hit_dir's own edge tolerance, which lets a ray count as
-                    // hitting a triangle it passes marginally outside.
-                    //
-                    // Every comparison is written so that a NaN falls through to
-                    // ACCEPT: `tn > tf` is false on NaN, and accepting costs 64
-                    // triangle tests while rejecting wrongly loses geometry.
-                    amask = mbg_box_mask(clusters[c].lo.xyz, clusters[c].hi.xyz,
-                                        nk, inv);
-                    if (u_angular != 0u && amask == 0u) continue;
-                }
-                uint pmask = amask;
-                if (u_angular == 0u) amask = (1u << nk) - 1u;
-                MBG_TALLY(MBG_CT_CLU_ENTER, 1u)
-                if (u_overlap != 0u)
-                    atomicOr(entered[g_cam * u_entered_words + (c >> 5u)],
-                             1u << (c & 31u));
+            uint gfirst = uint(supers[si].lo.w);
+            uint glast  = gfirst + uint(supers[si].hi.w);
+            for (uint gi = gfirst; gi < glast; ++gi) {
+                uint g = mbg_group_at(gi);
+                vec3 gq = max(max(groups[g].lo.xyz - g_P, vec3(0.0)),
+                              g_P - groups[g].hi.xyz);
+                MBG_TALLY(MBG_CT_GRP_TEST, 1u)
+                // The loosest bound any of this thread's texels holds: if the whole
+                // group is beyond that, none of them can want it.
+                if (dot(gq, gq) > worst * worst) continue;
+                // AND THE SAME DIRECTION TEST, ONE LEVEL UP. Without this the group
+                // level is distance-only, so it admits a group whenever anything in
+                // it is near -- and then every one of its 64 clusters is tested
+                // individually. Measured before this line existed: 8.8 of 17 groups
+                // entered and 481 cluster tests to enter 3.5 of them.
+                if (u_angular != 0u &&
+                    mbg_box_mask(groups[g].lo.xyz, groups[g].hi.xyz, nk, inv) == 0u)
+                    continue;
+                MBG_TALLY(MBG_CT_GRP_ENTER, 1u)
 
-                uint first = uint(clusters[c].lo.w);
-                uint last  = first + uint(clusters[c].hi.w);
-                MBG_TALLY(MBG_CT_TRI_SETUP, last - first)
-                for (uint t = first; t < last; ++t) {
-                    // One fetch, broadcast across the workgroup, reused by every
-                    // texel this thread owns.
-                    // One fetch and ONE setup, reused by every texel this
-                    // thread owns -- see mbg_tri_setup.
-                    MbgTriSetup h = mbg_tri_setup(geom[t]);
-                    for (uint k = 0u; k < nk; ++k) {
-                        if ((amask & (1u << k)) == 0u) continue;
-                        // A texel that already has its answer under any-hit is
-                        // done; its bound is zero, so the box tests above have
-                        // stopped bringing it work, and this catches the boxes
-                        // that contain the receiver and so score zero anyway.
-                        if (u_anyhit != 0u && best[k] != MBG_EMPTY) continue;
-                        if (qd2 > bd[k] * bd[k]) continue;     // predicate, not a branch
-                        MBG_TALLY(MBG_CT_TEX_TEST, 1u)
-                        float tt;
-                        if (!mbg_hit_dir(h, d[k], tt)) continue;
-                        // The angular test said this direction cannot reach this
-                        // cluster, and here is a hit in it. Must never fire.
-                        if (u_count != 0u && (pmask & (1u << k)) == 0u)
-                            ++g_tally[MBG_CT_ANG_VIOL];
-                        float dist = tt * len[k];
-                        if (u_anyhit != 0u) { bd[k] = 0.0; best[k] = t; continue; }
-                        if (dist < bd[k]) { bd[k] = dist; best[k] = t; }
+                uint cfirst = uint(groups[g].lo.w);
+                uint clast  = cfirst + uint(groups[g].hi.w);
+                for (uint c = cfirst; c < clast; ++c) {
+                    if (!mbg_cl_live(c)) continue;
+                    vec3 q = max(max(clusters[c].lo.xyz - g_P, vec3(0.0)),
+                                 g_P - clusters[c].hi.xyz);
+                    float qd2 = dot(q, q);
+                    MBG_TALLY(MBG_CT_CLU_TEST, 1u)
+                    if (qd2 > worst * worst) continue;
+                    // IS IT IN THE WAY, NOT JUST NEAR ENOUGH.
+                    //
+                    // The distance bound is the only thing pruning an entered
+                    // cluster, and distance is not direction. A texel is ONE
+                    // direction -- mbg_px_to_dir at the texel centre, point sampled,
+                    // which is exactly what mbg_hit_dir then intersects -- so a
+                    // cluster whose bounding sphere that direction misses cannot
+                    // contain its winner, however near it is. Measured before it was
+                    // built: 98.9% of entered clusters on Cornell+bunny and 90.7% on
+                    // Sponza are reachable by NO direction the thread holds.
+                    //
+                    // Conservative by construction: the sphere contains the AABB and
+                    // the AABB contains every triangle of the cluster, so a ray that
+                    // misses the sphere misses all 64 of them. The mask then keeps
+                    // the survivors out of each other's way -- a cluster one texel
+                    // wants no longer costs the other three their hit tests.
+                    //
+                    // No normalize and no sqrt: |bc x d|^2 > r^2 |d|^2 is the same
+                    // rejection as comparing the perpendicular distance against r,
+                    // by Lagrange's identity, and d is already unnormalized.
+                    uint amask = (1u << nk) - 1u;
+                    if (u_angular != 0u || u_count != 0u) {
+                        // A SLAB TEST, NOT A BOUNDING SPHERE.
+                        //
+                        // The sphere was tried first and is wrong: |bc x d| cancels
+                        // catastrophically when the ray runs nearly through a distant
+                        // cluster's centre -- large products, tiny difference -- which
+                        // is precisely where the ray DOES hit. Against a cluster
+                        // small enough (the bunny puts 69k triangles in 1086 of them)
+                        // the error reaches the radius itself, and the conservativeness
+                        // counter caught it: one hit in a cluster the test had
+                        // declared unreachable, surviving a 1000x radius inflation
+                        // because inflation is not the failure.
+                        //
+                        // The slab test has no such term. It is also TIGHTER -- the
+                        // box, not the sphere around it -- so it rejects strictly
+                        // more. `lo`/`hi` are nudged out by MBG_ANG_EPS to cover
+                        // mbg_hit_dir's own edge tolerance, which lets a ray count as
+                        // hitting a triangle it passes marginally outside.
+                        //
+                        // Every comparison is written so that a NaN falls through to
+                        // ACCEPT: `tn > tf` is false on NaN, and accepting costs 64
+                        // triangle tests while rejecting wrongly loses geometry.
+                        amask = mbg_box_mask(clusters[c].lo.xyz, clusters[c].hi.xyz,
+                                            nk, inv);
+                        if (u_angular != 0u && amask == 0u) continue;
                     }
+                    uint pmask = amask;
+                    if (u_angular == 0u) amask = (1u << nk) - 1u;
+                    MBG_TALLY(MBG_CT_CLU_ENTER, 1u)
+                    if (u_overlap != 0u)
+                        atomicOr(entered[g_cam * u_entered_words + (c >> 5u)],
+                                 1u << (c & 31u));
+
+                    uint first = uint(clusters[c].lo.w);
+                    uint last  = first + uint(clusters[c].hi.w);
+                    MBG_TALLY(MBG_CT_TRI_SETUP, last - first)
+                    for (uint t = first; t < last; ++t) {
+                        // One fetch, broadcast across the workgroup, reused by every
+                        // texel this thread owns.
+                        // One fetch and ONE setup, reused by every texel this
+                        // thread owns -- see mbg_tri_setup.
+                        MbgTriSetup h = mbg_tri_setup(geom[t]);
+                        for (uint k = 0u; k < nk; ++k) {
+                            if ((amask & (1u << k)) == 0u) continue;
+                            // A texel that already has its answer under any-hit is
+                            // done; its bound is zero, so the box tests above have
+                            // stopped bringing it work, and this catches the boxes
+                            // that contain the receiver and so score zero anyway.
+                            if (u_anyhit != 0u && best[k] != MBG_EMPTY) continue;
+                            if (qd2 > bd[k] * bd[k]) continue;     // predicate, not a branch
+                            MBG_TALLY(MBG_CT_TEX_TEST, 1u)
+                            float tt;
+                            if (!mbg_hit_dir(h, d[k], tt)) continue;
+                            // The angular test said this direction cannot reach this
+                            // cluster, and here is a hit in it. Must never fire.
+                            if (u_count != 0u && (pmask & (1u << k)) == 0u)
+                                ++g_tally[MBG_CT_ANG_VIOL];
+                            float dist = tt * len[k];
+                            if (u_anyhit != 0u) { bd[k] = 0.0; best[k] = t; continue; }
+                            if (dist < bd[k]) { bd[k] = dist; best[k] = t; }
+                        }
+                    }
+                    worst = max(max(bd[0], bd[1]), max(bd[2], bd[3]));
                 }
-                worst = max(max(bd[0], bd[1]), max(bd[2], bd[3]));
             }
         }
 
@@ -557,7 +586,7 @@ void mbg_resolve_vis_coop(uint tid, uint stride, uint group_count) {
 }
 
 // Fill s_vis for this thread's texels. Replaces clear + rasterize + barrier.
-void mbg_resolve_vis(uint tid, uint stride, uint group_count, uint tri_count) {
+void mbg_resolve_vis(uint tid, uint stride, uint group_count, uint super_count, uint tri_count) {
     uint n = u_res * u_res;
 
     mbg_count_init();
@@ -590,7 +619,7 @@ void mbg_resolve_vis(uint tid, uint stride, uint group_count, uint tri_count) {
         return;
     }
 
-    mbg_order_groups(tid, stride, group_count);
+    mbg_order_groups(tid, stride, group_count, super_count);
 
     for (uint i = tid; i < n; i += stride) {
         vec3  d = mbg_to_world(mbg_px_to_dir(vec2(float(i % u_res), float(i / u_res))
@@ -606,38 +635,47 @@ void mbg_resolve_vis(uint tid, uint stride, uint group_count, uint tri_count) {
         // and so rediscovers the same scene; testing 65 group boxes before 4098
         // cluster boxes turns that from O(n) into O(sqrt n), and the distance
         // bound prunes at both levels.
-        for (uint gi = 0u; gi < group_count; ++gi) {
-            uint g = mbg_group_at(gi);
-            vec3 gq = max(max(groups[g].lo.xyz - g_P, vec3(0.0)),
-                          g_P - groups[g].hi.xyz);
-            MBG_TALLY(MBG_CT_GRP_TEST, 1u)
-            if (dot(gq, gq) > bestdist * bestdist) continue;
-            MBG_TALLY(MBG_CT_GRP_ENTER, 1u)
+        for (uint si = 0u; si < super_count; ++si) {
+            vec3 sq = max(max(supers[si].lo.xyz - g_P, vec3(0.0)),
+                          g_P - supers[si].hi.xyz);
+            if (dot(sq, sq) > bestdist * bestdist) continue;
 
-            uint cfirst = uint(groups[g].lo.w);
-            uint clast  = cfirst + uint(groups[g].hi.w);
-            for (uint c = cfirst; c < clast; ++c) {
-                if (!mbg_cl_live(c)) continue;
-                // Closest point of the box to the receiver, componentwise: zero
-                // on any axis the receiver is already between lo and hi.
-                vec3 q = max(max(clusters[c].lo.xyz - g_P, vec3(0.0)),
-                             g_P - clusters[c].hi.xyz);
-                MBG_TALLY(MBG_CT_CLU_TEST, 1u)
-                if (dot(q, q) > bestdist * bestdist) continue;
-                MBG_TALLY(MBG_CT_CLU_ENTER, 1u)
+            uint gfirst = uint(supers[si].lo.w);
+            uint glast  = gfirst + uint(supers[si].hi.w);
+            for (uint gi = gfirst; gi < glast; ++gi) {
+                uint g = mbg_group_at(gi);
+                vec3 gq = max(max(groups[g].lo.xyz - g_P, vec3(0.0)),
+                              g_P - groups[g].hi.xyz);
+                MBG_TALLY(MBG_CT_GRP_TEST, 1u)
+                if (dot(gq, gq) > bestdist * bestdist) continue;
+                MBG_TALLY(MBG_CT_GRP_ENTER, 1u)
 
-                uint first = uint(clusters[c].lo.w);
-                uint last  = first + uint(clusters[c].hi.w);
-                MBG_TALLY(MBG_CT_TRI_SETUP, last - first)
-                MBG_TALLY(MBG_CT_TEX_TEST, last - first)
-                for (uint t = first; t < last; ++t) {
-                    float tt;
-                    if (!mbg_tri_hit(t, d, tt)) continue;
-                    // Any-hit: the bound goes to zero, so every remaining box
-                    // fails its test and the two loops above unwind themselves.
-                    if (u_anyhit != 0u) { best = t; bestdist = 0.0; break; }
-                    float dist = tt * len_d;
-                    if (dist < bestdist) { bestdist = dist; best = t; }
+                uint cfirst = uint(groups[g].lo.w);
+                uint clast  = cfirst + uint(groups[g].hi.w);
+                for (uint c = cfirst; c < clast; ++c) {
+                    if (!mbg_cl_live(c)) continue;
+                    // Closest point of the box to the receiver, componentwise: zero
+                    // on any axis the receiver is already between lo and hi.
+                    vec3 q = max(max(clusters[c].lo.xyz - g_P, vec3(0.0)),
+                                 g_P - clusters[c].hi.xyz);
+                    MBG_TALLY(MBG_CT_CLU_TEST, 1u)
+                    if (dot(q, q) > bestdist * bestdist) continue;
+                    MBG_TALLY(MBG_CT_CLU_ENTER, 1u)
+
+                    uint first = uint(clusters[c].lo.w);
+                    uint last  = first + uint(clusters[c].hi.w);
+                    MBG_TALLY(MBG_CT_TRI_SETUP, last - first)
+                    MBG_TALLY(MBG_CT_TEX_TEST, last - first)
+                    for (uint t = first; t < last; ++t) {
+                        float tt;
+                        if (!mbg_tri_hit(t, d, tt)) continue;
+                        // Any-hit: the bound goes to zero, so every remaining box
+                        // fails its test and the two loops above unwind themselves.
+                        if (u_anyhit != 0u) { best = t; bestdist = 0.0; break; }
+                        float dist = tt * len_d;
+                        if (dist < bestdist) { bestdist = dist; best = t; }
+                    }
+                    if (u_anyhit != 0u && best != MBG_EMPTY) break;
                 }
                 if (u_anyhit != 0u && best != MBG_EMPTY) break;
             }

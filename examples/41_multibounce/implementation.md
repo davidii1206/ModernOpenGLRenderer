@@ -3073,6 +3073,87 @@ because those 570 are the ones that survived culling. Getting Bistro to
 realtime needs fewer cameras or fewer texels per camera -- which is
 `camera-reuse.md` §6(a) and §8.1, not a better cull.
 
+### 47. The third level works, buys nothing, and refutes finding 46's cost model
+
+Finding 46 ended on a recommendation: build a tier above the groups, because the
+group list is scanned in full by every camera-thread — 2056 boxes on Bistro
+against Sponza's 129, exactly `O(scene)` — and a two-point fit put that scan at
+**68% of Bistro's sweep**. It is built. The fit was wrong.
+
+`kSuperSize` groups get a box, the same shape as the two levels below them,
+scanned before the group list (`scene.hpp`, `raster.glsl`). `MBG_SUPER=0` puts
+every group in one super-group, which is the old traversal plus a single box
+test — so the A/B is built from the same code and cannot drift.
+
+**It is exactly conservative**, which is the first thing to check and the reason
+the rest of the table is trustworthy: at every super-group size, `grp_enter`
+(47.7), `clu_test` (3050.3), `clu_enter` (71.3) and `tri_setup` (570.39/texel)
+are **identical to the digit**. The only thing that changed is the scan.
+
+Bistro, 4 208 958 triangles, 512², one bounce, `MBG_COUNT=1 MBG_SOLVE=1`:
+
+| `MBG_SUPER` | group tests / camera-thread | ms per sweep |
+|---|---|---|
+| 0 (two levels) | 2056.0 | 5636.3 |
+| 64 | 910.2 | 5636.1 |
+| 32 | 591.4 | 5651.4 |
+| 16 | 395.1 | 5606.5 |
+| 8 | **242.1** | 5659.0 |
+
+**8.5× fewer box tests and the time does not move.** The 0.9% spread across the
+column has no trend and sits well inside the ~10% run-to-run variance. Cornell
+(126.5 → 126.7 ms) and Cornell+bunny (1770.6 → 1778.6 ms) do not regress either,
+so the level is free in both directions.
+
+#### Why the fit was wrong, stated plainly
+
+Finding 46 fitted `t = a·fetches + b·group_tests` to two sweeps. Two unknowns,
+two data points: **zero degrees of freedom, so it reproduced both inputs exactly
+by construction and had no predictive power at all.** It was labelled "an
+estimate with its inputs shown, not a measurement". It is now a measurement, and
+`b` is not 6.09e-6 ms per group test — it is indistinguishable from zero.
+
+The reading that replaces it: the group scan is a tight loop over a small
+contiguous buffer that sits in cache, and it runs in the shadow of the dependent
+memory latency the kernel is actually limited by. Removing 88% of it removes
+nothing that was on the critical path.
+
+That is the same conclusion findings 38, 41, 42 and 44 reached from the other
+side. This kernel is occupancy-bound: every change that bought occupancy by
+giving back shared memory moved the time, and every change that removed
+arithmetic did not. A tier above the groups removes arithmetic.
+
+#### What the time does respond to: texels
+
+Same scene, same camera count, same group structure, only the target size:
+
+| `MBG_RES` | texels per camera | texels per sweep | ms per sweep |
+|---|---|---|---|
+| 8 | 64 | 4.733e5 | **670.6** |
+| 16 | 256 | 1.893e6 | 5623.2 |
+| 32 | 1024 | 7.574e6 | 17164.4 |
+
+Texels are the lever, and they are not even linear: 64 → 256 costs **8.4×** for
+4× the texels, while 256 → 1024 costs 3.05×. The super-linear step is finding
+28's territory — at res 8 a thread carries ONE texel, so `worst` is that texel's
+own bound; at res 16 it carries four and `worst` is the max over all four, which
+loosens the distance bound for every one of them. The counters show it directly:
+521.38 triangles fetched per texel at res 8 against 570.39 at res 16.
+
+#### Kept, not reverted
+
+The tier stays. It is correct, it is free on every scene measured, and it caps a
+term that is genuinely `O(scene)` — 4.2M triangles is 2056 group tests, and a
+40M-triangle scene would be 20 560. That it is not on the critical path *today*
+is a statement about this GPU at this occupancy, not about the structure.
+
+The honest summary is that finding 46 identified a real asymmetry in the work
+column and then mis-priced it, and that the work column and the time column have
+now disagreed in both directions in this example: finding 22 found two versions
+within 3× on llvmpipe that an RTX 3060 ranked 124× apart, and here a 8.5× change
+in counted work produced no change in time at all. **Neither column is evidence
+on its own.**
+
 ## What this does not answer
 
 - **§8.1, the reuse radius experiment.** The gate the doc puts before everything

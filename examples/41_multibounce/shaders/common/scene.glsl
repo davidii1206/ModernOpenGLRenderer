@@ -114,6 +114,7 @@ MbgTri mbg_tri(uint i) {
 }
 layout(std430, binding = 11) readonly buffer MbgClusters { MbgCluster clusters[]; };
 layout(std430, binding = 12) readonly buffer MbgGroups   { MbgCluster groups[]; };
+layout(std430, binding = 17) readonly buffer MbgSupers   { MbgCluster supers[]; };
 layout(std430, binding = 2) readonly buffer MbgQuad { vec4   quad[]; };
 
 // Orthonormal basis around n. Duff et al. 2017, branchless and stable at both

@@ -82,6 +82,7 @@ uniform float u_rr;           // Russian-roulette throughput threshold; 0 = off
 uniform uint  u_importance;   // 1 = weight the continuation by the hit's radiance
 uniform uint  u_cluster_count;
 uniform uint  u_group_count;
+uniform uint  u_super_count;  // runs of groups; 1 == the old two-level traversal
 uniform uint  u_coop;
 uniform float u_bias;         // camera offset along its own normal, world units
 uniform float u_emissive;     // emissive scale
@@ -146,8 +147,8 @@ void main() {
 
     MBG_PF_T0(pf_trav);
     mbg_cull(tid, 64u, u_cluster_count);
-    if (u_coop != 0u) mbg_resolve_vis_coop(tid, 64u, u_group_count);
-    else              mbg_resolve_vis(tid, 64u, u_group_count, u_tri_count);
+    if (u_coop != 0u) mbg_resolve_vis_coop(tid, 64u, u_group_count, u_super_count);
+    else              mbg_resolve_vis(tid, 64u, u_group_count, u_super_count, u_tri_count);
     barrier();
     memoryBarrierShared();
     MBG_PF_END(MBG_PF_TRAVERSE, pf_trav);

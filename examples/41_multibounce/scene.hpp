@@ -80,6 +80,7 @@ enum Binding : uint32_t {
     kBindCounters = 14,    // traversal work counters; MBG_COUNT only
     kBindPerf     = 15,    // in-shader phase cycles; MBG_PERF only
     kBindEntered  = 16,    // per-camera entered-cluster bitmask; MBG_OVERLAP only
+    kBindSupers   = 17,    // bounds over RUNS of groups: the third level
 };
 
 // The GPU triangle, mirroring MbgTri in shaders/common/scene.glsl.
@@ -128,13 +129,16 @@ public:
     // Returns false if the set exceeds the 16-bit triangle index the packed
     // depth key allows (see hemi.glsl). That cap is a property of this
     // example's 32-bit key, not of the method.
-    bool build(const std::vector<Tri>& tris);
+    // `super_size` is groups per super-group; 0 puts every group in ONE
+    // super-group, which is the old two-level traversal plus a single box test.
+    bool build(const std::vector<Tri>& tris, uint32_t super_size = kSuperSize);
     void bind() const {
         buf_.bind_base(kBindTris);
         shade_.bind_base(kBindTriShade);
         emit_.bind_base(kBindEmitters);
         clusters_.bind_base(kBindClusters);
         groups_.bind_base(kBindGroups);
+        supers_.bind_base(kBindSupers);
     }
 
     uint32_t count() const { return count_; }
@@ -146,9 +150,29 @@ public:
     uint32_t emitter_count() const { return emitter_count_; }
     uint32_t cluster_count() const { return cluster_count_; }
     uint32_t group_count() const { return group_count_; }
+    uint32_t super_count() const { return super_count_; }
     // Clusters per group. Two levels of 64 cover 4096 clusters -- 262k
     // triangles -- in sqrt(n) tests instead of n, which is the whole point.
     static constexpr uint32_t kGroupSize = 64;
+    // GROUPS PER SUPER-GROUP, and the level finding 46 asked for.
+    //
+    // Two levels cover 262k triangles. Bistro has 4.21M, and above the groups
+    // there was nothing: every camera-thread scanned the WHOLE group list, every
+    // camera. The count is not approximate -- 4208958 / (32*64) = 2056, and the
+    // counter reads 2056.0; Sponza's is 262266/2048 = 129 and the counter reads
+    // 129.0. That scan is the one term in this kernel that grows linearly with
+    // scene size, and finding 46's two-point fit puts it at 68% of Bistro's
+    // sweep against 21% of Sponza's.
+    //
+    // A third flat list of boxes, scanned before the group list. No stack and no
+    // indexed local array, so finding 42's wall does not apply: this adds a
+    // level, not per-thread state.
+    //
+    // The tier is DATA-DRIVEN, not branched. One super-group covering every
+    // group reproduces the old traversal exactly, plus one box test -- which is
+    // what `MBG_SUPER=0` builds, and how the before/after is measured without a
+    // second code path in the kernel.
+    static constexpr uint32_t kSuperSize = 64;
     // Triangles per cluster. 64 matched the workgroup, which was the argument
     // while a cull step fed a thread-per-triangle pass -- but the traversal was
     // inverted (findings 22, 23) and nothing has been thread-per-triangle since.
@@ -175,8 +199,9 @@ private:
     gl::Buffer emit_{gl::BufferType::shader, gl::BufferUsage::static_draw};
     gl::Buffer clusters_{gl::BufferType::shader, gl::BufferUsage::static_draw};
     gl::Buffer groups_{gl::BufferType::shader, gl::BufferUsage::static_draw};
+    gl::Buffer supers_{gl::BufferType::shader, gl::BufferUsage::static_draw};
     uint32_t count_ = 0, emissive_ = 0, emitter_count_ = 0, cluster_count_ = 0,
-             group_count_ = 0;
+             group_count_ = 0, super_count_ = 0;
     double area_ = 0.0;
     Bounds bounds_;
 };
